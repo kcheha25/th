@@ -1,0 +1,19 @@
+import sif_parser
+import h5py
+import numpy as np
+
+sif_file = "chemin/vers/fichier.sif"
+h5_file = "chemin/vers/fichier.h5"
+
+data, info = sif_parser.np_open(sif_file)
+
+with h5py.File(h5_file, "w") as f:
+    dset = f.create_dataset("data", data=data, compression="gzip")
+    
+    for key, value in info.items():
+        try:
+            dset.attrs[key] = str(value) 
+        except Exception as e:
+            print(f"Impossible d'ajouter l'attribut {key} : {e}")
+
+print(f"Conversion terminée : {h5_file}")
