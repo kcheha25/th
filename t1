@@ -1,19 +1,52 @@
-import sif_parser
-import h5py
 import numpy as np
+import matplotlib.pyplot as plt
+import sif_parser  
+from sif_parser.utils import extract_calibration
 
-sif_file = "chemin/vers/fichier.sif"
-h5_file = "chemin/vers/fichier.h5"
+# ---------------------------
+# Charger les données
+# ---------------------------
+file_path = "chemin/vers/fichier.sif" 
+data, info = sif_parser.np_open(file_path)
 
-data, info = sif_parser.np_open(sif_file)
+# data.shape == (22500, 1, 2048)
+# Supprimer la dimension singleton
+data = data[:, 0, :]
+print("Shape after flattening:", data.shape)  # (22500, 2048)
 
-with h5py.File(h5_file, "w") as f:
-    dset = f.create_dataset("data", data=data, compression="gzip")
-    
-    for key, value in info.items():
-        try:
-            dset.attrs[key] = str(value) 
-        except Exception as e:
-            print(f"Impossible d'ajouter l'attribut {key} : {e}")
+# ---------------------------
+# Reformater le cube
+# ---------------------------
+height, width = 150, 150
+datacube = data.reshape(height, width, -1)
+print("Datacube shape:", datacube.shape)  # (150, 150, 2048)
 
-print(f"Conversion terminée : {h5_file}")
+# ---------------------------
+# Extraire la calibration
+# ---------------------------
+wavelengths = extract_calibration(info)
+if wavelengths is None:
+    raise ValueError("Aucune calibration trouvée dans le fichier SIF")
+
+# ---------------------------
+# Trouver l'indice correspondant à 266 nm
+# ---------------------------
+target_wl = 266.0
+idx = np.argmin(np.abs(wavelengths - target_wl))
+print(f"Indice correspondant à {target_wl} nm : {idx}, longueur d'onde exacte : {wavelengths[idx]:.2f} nm")
+
+# ---------------------------
+# Extraire la cartographie à 266 nm
+# ---------------------------
+image_266 = datacube[:, :, idx]
+
+# ---------------------------
+# Afficher la cartographie
+# ---------------------------
+plt.figure(figsize=(6, 5))
+plt.imshow(image_266, cmap='inferno')
+plt.colorbar(label='Intensité')
+plt.title(f'Cartographie à {wavelengths[idx]:.2f} nm')
+plt.xlabel('Pixel X')
+plt.ylabel('Pixel Y')
+plt.show()
