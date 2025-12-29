@@ -163,3 +163,129 @@ plt.title("Après correction")
 plt.colorbar()
 
 plt.show()
+
+
+##################3
+import numpy as np
+import matplotlib.pyplot as plt
+import sif_parser
+from sif_parser.utils import extract_calibration
+from numba import njit, prange
+
+# ---------------------------
+# Charger les données
+# ---------------------------
+file_path = "chemin/vers/fichier.sif"
+data, info = sif_parser.np_open(file_path)
+data = data[:, 0, :]  # Supprimer dimension singleton
+
+height, width = 150, 150
+datacube = data.reshape(height, width, -1)  # Cube H x W x Z
+
+wavelengths = extract_calibration(info)
+if wavelengths is None:
+    raise ValueError("Aucune calibration trouvée dans le fichier SIF")
+
+target_wl = 266.0
+idx = np.argmin(np.abs(wavelengths - target_wl))
+image_266 = datacube[:, :, idx]
+
+plt.figure(figsize=(6, 5))
+plt.imshow(image_266, cmap='inferno')
+plt.colorbar(label='Intensité')
+plt.title(f'Cartographie à {wavelengths[idx]:.2f} nm')
+plt.show()
+
+
+@njit
+def cross_correlation_numba(ImD, iLine, iShift, nMargin):
+    W = ImD.shape[1]
+    n = W - 2 * nMargin
+    if n < 1:
+        return 0.0
+
+    IMoyCur = 0.0
+    IMoyUD = 0.0
+    for i in range(nMargin, W - nMargin):
+        IMoyCur += ImD[iLine, i + iShift]
+        IMoyUD += ImD[iLine - 1, i] + ImD[iLine + 1, i]
+
+    IMoyCur /= n
+    IMoyUD /= n
+
+    SumNum = 0.0
+    SumCur = 0.0
+    SumUD = 0.0
+    for i in range(nMargin, W - nMargin):
+        xCur = ImD[iLine, i + iShift] - IMoyCur
+        xUD = (ImD[iLine - 1, i] + ImD[iLine + 1, i]) - IMoyUD
+        SumNum += xCur * xUD
+        SumCur += xCur * xCur
+        SumUD += xUD * xUD
+
+    return SumNum / np.sqrt(1e-30 + SumCur * SumUD)
+
+
+@njit(parallel=True)
+def find_line_offsets_iter_numba(ImD, nMargin):
+    H, W = ImD.shape
+    LineOff = np.zeros(H, dtype=np.int32)
+    ImDCor = ImD.copy()
+
+    for j in prange(1, H - 1):
+        CCk = np.empty(2 * nMargin + 1, dtype=np.float64)
+        for k in range(-nMargin, nMargin + 1):
+            CCk[k + nMargin] = cross_correlation_numba(ImD, j, k, nMargin)
+
+        CCMax = CCk.max()
+        kMax = np.argmax(CCk) - nMargin
+
+        if CCMax > 0.2:
+            LineOff[j] = kMax
+            for i in range(W):
+                src = (i + kMax) % W
+                ImDCor[j, i] = ImD[j, src]
+
+    return ImDCor, LineOff
+
+def find_line_offsets(ImD, maxIter, nMargin):
+    LineOffsets = np.zeros(ImD.shape[0], dtype=np.int32)
+    ImDCur = ImD.copy()
+    for _ in range(maxIter):
+        ImDCor, curOff = find_line_offsets_iter_numba(ImDCur, nMargin)
+        LineOffsets += curOff
+        if np.all(curOff == 0):
+            break
+        ImDCur = ImDCor
+    return LineOffsets
+
+@njit(parallel=True)
+def correct_datacube_numba(datacube, LineOffsets):
+    H, W, Z = datacube.shape
+    corrected = np.empty_like(datacube)
+    for j in prange(H):
+        kMax = LineOffsets[j]
+        for i in range(W):
+            src = (i + kMax) % W
+            corrected[j, i, :] = datacube[j, src, :]
+    return corrected
+
+nMargin = 3
+maxIter = 10
+
+LineOffsets = find_line_offsets(image_266, maxIter, nMargin)
+datacube_corrected = correct_datacube_numba(datacube, LineOffsets)
+
+image_266_cor = datacube_corrected[:, :, idx]
+
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.imshow(image_266, cmap='inferno')
+plt.title("Avant correction")
+plt.colorbar()
+
+plt.subplot(1, 2, 2)
+plt.imshow(image_266_cor, cmap='inferno')
+plt.title("Après correction")
+plt.colorbar()
+plt.show()
