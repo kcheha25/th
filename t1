@@ -50,3 +50,116 @@ plt.title(f'Cartographie à {wavelengths[idx]:.2f} nm')
 plt.xlabel('Pixel X')
 plt.ylabel('Pixel Y')
 plt.show()
+##########################################################################
+class F2D:
+    def __init__(self, data):
+        self.data = np.array(data, dtype=float)
+        self.H, self.W = self.data.shape
+
+    def __call__(self, y, x):
+        return self.data[y, x]
+
+    def set(self, y, x, v):
+        self.data[y, x] = v
+
+    def copy(self):
+        return F2D(self.data.copy())
+ImD = F2D(image_266)
+
+def cross_correlation(ImD, iLine, iShift, nMargin):
+    W = ImD.W
+    n = W - 2 * nMargin
+    if n < 1:
+        return 0.0
+
+    IMoyCur = 0.0
+    IMoyUD = 0.0
+
+    for i in range(nMargin, W - nMargin):
+        IMoyCur += ImD(iLine, i + iShift)
+        IMoyUD += ImD(iLine - 1, i) + ImD(iLine + 1, i)
+
+    IMoyCur /= n
+    IMoyUD /= n
+
+    SumNum = SumCur = SumUD = 0.0
+
+    for i in range(nMargin, W - nMargin):
+        xCur = ImD(iLine, i + iShift) - IMoyCur
+        xUD = (ImD(iLine - 1, i) + ImD(iLine + 1, i)) - IMoyUD
+        SumNum += xCur * xUD
+        SumCur += xCur * xCur
+        SumUD += xUD * xUD
+
+    return SumNum / np.sqrt(1e-30 + SumCur * SumUD)
+def find_line_offsets_iter(ImD, nMargin):
+    W, H = ImD.W, ImD.H
+    ImDCor = ImD.copy()
+    LineOff = np.zeros(H, dtype=int)
+    sumOffset = 0
+
+    for j in range(1, H - 1):
+        CCk = []
+
+        for k in range(-nMargin, nMargin + 1):
+            CCk.append(cross_correlation(ImD, j, k, nMargin))
+
+        CCk = np.array(CCk)
+        CCMax = CCk.max()
+        kMax = np.where(CCk == CCMax)[0][0] - nMargin
+
+        if CCMax > 0.2:
+            LineOff[j] = kMax
+            sumOffset += abs(kMax)
+
+            for i in range(W):
+                src = (i + kMax) % W
+                ImDCor.set(j, i, ImD(j, src))
+
+    return ImDCor, LineOff, sumOffset
+def find_line_offsets(ImD, maxIter, nMargin):
+    H = ImD.H
+    LineOffsets = np.zeros(H, dtype=int)
+    ImDCur = ImD.copy()
+
+    for _ in range(maxIter):
+        ImDCor, curOff, nUpdate = find_line_offsets_iter(ImDCur, nMargin)
+        LineOffsets += curOff
+        ImDCur = ImDCor
+        if nUpdate == 0:
+            break
+
+    return LineOffsets
+nMargin = 5
+maxIter = 10
+
+LineOffsets = find_line_offsets(ImD, maxIter, nMargin)
+def correct_datacube(datacube, LineOffsets):
+    H, W, Z = datacube.shape
+    corrected = datacube.copy()
+
+    for j in range(H):
+        kMax = LineOffsets[j]
+        for i in range(W):
+            src = (i + kMax) % W
+            corrected[j, i, :] = datacube[j, src, :]
+
+    return corrected
+
+datacube_corrected = correct_datacube(datacube, LineOffsets)
+
+image_266_cor = datacube_corrected[:, :, idx]
+
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 2, 1)
+plt.imshow(image_266, cmap='inferno')
+plt.title("Avant correction")
+plt.colorbar()
+
+plt.subplot(1, 2, 2)
+plt.imshow(image_266_cor, cmap='inferno')
+plt.title("Après correction")
+plt.colorbar()
+
+plt.show()
