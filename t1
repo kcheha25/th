@@ -905,67 +905,52 @@ plt.title("Pixels les plus votés par IFF")
 plt.colorbar()
 plt.show()
 
-# =========================
-# Visualisation PCA des spectres
-# =========================
-def visualize_iff_results(datacube, iff: IFFAlgorithm, group=False):
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import numpy as np
+
+def visualize_iff_results(datacube, iff, group=False):
     H, W, Z = datacube.shape
     pixels = datacube.reshape(-1, Z)  # (npix, n_channels)
 
-    # PCA pour réduire en 2D
-    pca = PCA(n_components=2)
-    pixels_2d = pca.fit_transform(pixels)
+    # PCA pour réduire à 4 composantes principales
+    pca = PCA(n_components=4)
+    pixels_pca = pca.fit_transform(pixels)  # shape (npix, 4)
 
-    plt.figure(figsize=(8,6))
-    plt.scatter(pixels_2d[:,0], pixels_2d[:,1], c='lightgray', alpha=0.5, label='Non sélectionnés')
+    # Définir les couples de composantes à afficher
+    pc_pairs = [(0,1), (0,2), (0,3), (1,2), (1,3), (2,3)]
+    n_pairs = len(pc_pairs)
 
-    if group:
-        colors = plt.cm.get_cmap('tab10', len(iff.freq_grouped))
-        for i, (group_indices, total_votes) in enumerate(iff.freq_grouped):
-            coords = pixels_2d[group_indices]
-            plt.scatter(coords[:,0], coords[:,1], color=colors(i), s=50, label=f'Groupe {i+1}')
-    else:
-        selected_indices, _ = iff.get_freq()
-        plt.scatter(pixels_2d[selected_indices,0], pixels_2d[selected_indices,1],
-                    c='red', s=50, label='Pixels sélectionnés')
+    plt.figure(figsize=(15, 10))
 
-    plt.title("Visualisation des spectres via PCA")
-    plt.xlabel("Composante principale 1")
-    plt.ylabel("Composante principale 2")
-    plt.legend()
-    plt.grid(True)
+    for i, (pcx, pcy) in enumerate(pc_pairs):
+        plt.subplot(2, 3, i+1)
+        # Afficher tous les pixels en gris
+        plt.scatter(pixels_pca[:, pcx], pixels_pca[:, pcy], c='lightgray', alpha=0.5, label='Non sélectionnés')
+
+        if group:
+            # Afficher les groupes
+            colors = plt.cm.get_cmap('tab10', len(iff.freq_grouped))
+            for j, (group_indices, total_votes) in enumerate(iff.freq_grouped):
+                coords = pixels_pca[group_indices]
+                plt.scatter(coords[:, pcx], coords[:, pcy], color=colors(j), s=20, label=f'Groupe {j+1}')
+        else:
+            # Afficher les pixels sélectionnés
+            selected_indices, _ = iff.get_freq()
+            plt.scatter(pixels_pca[selected_indices, pcx], pixels_pca[selected_indices, pcy],
+                        c='red', s=20, label='Pixels sélectionnés')
+
+        plt.xlabel(f'PC {pcx+1}')
+        plt.ylabel(f'PC {pcy+1}')
+        plt.title(f'PC{pcx+1} vs PC{pcy+1}')
+        plt.grid(True)
+
+    plt.tight_layout()
     plt.show()
+
 
 # Visualiser pixels sélectionnés
 visualize_iff_results(datacube, iff, group=False)
 
 # Visualiser groupes
 visualize_iff_results(datacube, iff, group=True)
-
-# =========================
-# Visualiser les spectres comme un nuage de points
-# =========================
-def plot_spectra_selection(iff: IFFAlgorithm, title="Spectres sélectionnés par IFF"):
-    npix = iff.npix
-    votes = iff.votes
-
-    # Créer un masque pour les pixels sélectionnés
-    selected_mask = votes > 0
-
-    # Coordonnées des points
-    x = np.arange(npix)
-    y = votes  # ou pixels.max(axis=1) pour intensité max du spectre
-
-    plt.figure(figsize=(10, 4))
-    plt.scatter(x[~selected_mask], y[~selected_mask], c='blue', label='Non sélectionnés', alpha=0.5)
-    plt.scatter(x[selected_mask], y[selected_mask], c='green', label='Sélectionnés par IFF', alpha=0.7)
-
-    plt.xlabel("Indice du pixel")
-    plt.ylabel("Votes IFF")
-    plt.title(title)
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-# Appeler la fonction
-plot_spectra_selection(iff)
