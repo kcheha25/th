@@ -340,3 +340,113 @@ plt.legend()
 plt.title("Comparaison spectre moyen")
 plt.show()
 
+
+def calc_average_spectrum(datacube):
+    mean_spectrum = datacube.mean(axis=(0, 1))
+    return mean_spectrum
+
+def crop_datacube_spectral(datacube, wavelengths, wl_min, wl_max):
+    mask = (wavelengths >= wl_min) & (wavelengths <= wl_max)
+    cropped_cube = datacube[:, :, mask]
+    cropped_wl = wavelengths[mask]
+    return cropped_cube, cropped_wl
+
+import tkinter as tk
+from tkinter import messagebox
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def show_mean_spectrum_tk(datacube, wavelengths):
+    mean_spectrum = calc_average_spectrum(datacube)
+
+    root = tk.Tk()
+    root.title("Spectre moyen LIBS – Zoom & Crop")
+
+    # ---------------- FIGURE ----------------
+    fig, ax = plt.subplots(figsize=(8, 4))
+    line, = ax.plot(wavelengths, mean_spectrum, color="blue")
+    ax.set_xlabel("Longueur d'onde (nm)")
+    ax.set_ylabel("Intensité moyenne")
+    ax.set_title("Spectre moyen hyperspectral")
+    ax.grid(True)
+
+    canvas = FigureCanvasTkAgg(fig, master=root)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    # 🔍 Toolbar = zoom / pan natif
+    toolbar = NavigationToolbar2Tk(canvas, root)
+    toolbar.update()
+
+    # ---------------- CONTROLS ----------------
+    frame = tk.Frame(root)
+    frame.pack(pady=5)
+
+    tk.Label(frame, text="λ min (nm)").grid(row=0, column=0)
+    entry_min = tk.Entry(frame, width=10)
+    entry_min.grid(row=0, column=1)
+    entry_min.insert(0, f"{wavelengths.min():.1f}")
+
+    tk.Label(frame, text="λ max (nm)").grid(row=0, column=2)
+    entry_max = tk.Entry(frame, width=10)
+    entry_max.grid(row=0, column=3)
+    entry_max.insert(0, f"{wavelengths.max():.1f}")
+
+    # ---------------- ACTIONS ----------------
+    def apply_crop():
+        try:
+            wl_min = float(entry_min.get())
+            wl_max = float(entry_max.get())
+        except ValueError:
+            messagebox.showerror("Erreur", "Valeurs non valides")
+            return
+
+        mask = (wavelengths >= wl_min) & (wavelengths <= wl_max)
+        if not np.any(mask):
+            messagebox.showwarning("Attention", "Aucune longueur d'onde dans cet intervalle")
+            return
+
+        ax.clear()
+        ax.plot(wavelengths[mask], mean_spectrum[mask], color="red")
+        ax.set_xlim(wl_min, wl_max)
+        ax.set_xlabel("Longueur d'onde (nm)")
+        ax.set_ylabel("Intensité moyenne")
+        ax.set_title("Spectre moyen (coupé)")
+        ax.grid(True)
+        canvas.draw()
+
+    def save_cropped_cube():
+        try:
+            wl_min = float(entry_min.get())
+            wl_max = float(entry_max.get())
+        except ValueError:
+            messagebox.showerror("Erreur", "Valeurs non valides")
+            return
+
+        cropped_cube, cropped_wl = crop_datacube_spectral(
+            datacube, wavelengths, wl_min, wl_max
+        )
+
+        np.savez(
+            "datacube_cropped.npz",
+            datacube=cropped_cube,
+            wavelengths=cropped_wl
+        )
+
+        messagebox.showinfo(
+            "Sauvegarde",
+            f"Cube sauvegardé\nZ = {cropped_cube.shape[2]} longueurs d’onde"
+        )
+
+    # ---------------- BUTTONS ----------------
+    tk.Button(frame, text="Appliquer crop / zoom", command=apply_crop)\
+        .grid(row=1, column=0, columnspan=2, pady=5)
+
+    tk.Button(frame, text="Sauvegarder cube coupé", command=save_cropped_cube)\
+        .grid(row=1, column=2, columnspan=2, pady=5)
+
+    root.mainloop()
+
+show_mean_spectrum_tk(datacube_corrected, wavelengths)
