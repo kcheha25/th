@@ -596,12 +596,10 @@ class IFF:
         return self._data_centered[index]
 
 
-import numpy as np
-from numba import njit
 
-# ===================================
-# Classe IFF optimisée
-# ===================================
+# =========================
+# Algorithme IFF
+# =========================
 class IFFAlgorithm:
     def __init__(self, data, n_samples, random_gen=0):
         """
@@ -609,11 +607,11 @@ class IFFAlgorithm:
         n_samples: number of Monte Carlo iterations
         random_gen: 0 = Schnabel & Janke, 1 = Wu et al.
         """
-        self.data = data.astype(np.float32)
+        self.data = data
         self.npix, self.ncha = data.shape
         self.n_samples = n_samples
         self.random_gen = random_gen
-        self.votes = np.zeros(self.npix, dtype=np.int32)
+        self.votes = np.zeros(self.npix, dtype=int)
         self.data_centered = np.zeros_like(self.data)
         self.freq = []
         self.freq_grouped = []
@@ -622,27 +620,48 @@ class IFFAlgorithm:
         self.random_gen = choice
 
     def center_data(self):
-        """Center all spectra (vectorized)"""
+        """Center all spectra"""
         self.data_centered = self.data - self.data.mean(axis=1, keepdims=True)
 
     def compute(self):
-        """Compute IFF algorithm"""
+        """Compute the IFF algorithm"""
         self.center_data()
-        if self.random_gen == 0:
-            self._mc_steps_bs_numba(self.data_centered, self.n_samples, self.votes)
-        else:
-            self._mc_steps_wu_numba(self.data_centered, self.n_samples, self.votes)
+        for i in range(self.n_samples):
+            if self.random_gen == 0:
+                self.mc_step_bs()
+            else:
+                self.mc_step_wu()
         self.sort_votes()
 
+    def mc_step_bs(self):
+        """Monte Carlo step Schnabel & Janke"""
+        rnd_vec = self.rand_vect_bs()
+        proj = self.data_centered @ rnd_vec
+        imin = np.argmin(proj)
+        imax = np.argmax(proj)
+        self.votes[imin] += 1
+        self.votes[imax] += 1
+
+    def mc_step_wu(self):
+        """Monte Carlo step Wu et al."""
+        rnd_vec = self.rand_vect_mu()
+        proj = self.data_centered @ rnd_vec
+        imin = np.argmin(proj)
+        imax = np.argmax(proj)
+        self.votes[imin] += 1
+        self.votes[imax] += 1
+
     def sort_votes(self):
+        """Sort by descending frequency"""
         idx = np.nonzero(self.votes)[0]
         freq = self.votes[idx]
         sorted_idx = np.argsort(-freq)
         self.freq = [(int(idx[i]), int(freq[i])) for i in sorted_idx]
 
     def get_freq(self):
+        """Return indices and frequencies"""
         if not self.freq:
-            return np.array([], dtype=int), np.array([], dtype=int)
+            return np.array([]), np.array([])
         indices, freqs = zip(*self.freq)
         return np.array(indices, dtype=int), np.array(freqs, dtype=int)
 
@@ -650,15 +669,14 @@ class IFFAlgorithm:
         """Group spectra with correlation > correlconf"""
         grouped = []
         remaining = self.freq.copy()
-        data = self.data
         while remaining:
             ref_idx, ref_freq = remaining.pop(0)
-            ref_spec = data[ref_idx]
+            ref_spec = self.data[ref_idx]
             group = [ref_idx]
             total_freq = ref_freq
             to_remove = []
             for i, (idx, freq) in enumerate(remaining):
-                corr = self.correl_coef(ref_spec, data[idx])
+                corr = self.correl_coef(ref_spec, self.data[idx])
                 if corr > correlconf:
                     group.append(idx)
                     total_freq += freq
@@ -671,66 +689,49 @@ class IFFAlgorithm:
 
     @staticmethod
     def correl_coef(sp1, sp2):
+        """Correlation coefficient between two spectra"""
         return np.dot(sp1, sp2) / (np.linalg.norm(sp1) * np.linalg.norm(sp2))
 
-    @staticmethod
-    @njit(fastmath=True)
-    def _mc_steps_bs_numba(data_centered, n_samples, votes):
-        npix, ncha = data_centered.shape
-        for _ in range(n_samples):
-            vec = np.random.normal(0, 1, ncha)
-            vec /= np.linalg.norm(vec)
-            proj = data_centered @ vec
-            imin = np.argmin(proj)
-            imax = np.argmax(proj)
-            votes[imin] += 1
-            votes[imax] += 1
+    def rand_vect_mu(self):
+        """Random vector uniform in [-1,1]"""
+        return np.random.uniform(-1, 1, self.ncha)
 
-    @staticmethod
-    @njit(fastmath=True)
-    def _mc_steps_wu_numba(data_centered, n_samples, votes):
-        npix, ncha = data_centered.shape
-        for _ in range(n_samples):
-            vec = np.random.uniform(-1, 1, ncha)
-            proj = data_centered @ vec
-            imin = np.argmin(proj)
-            imax = np.argmax(proj)
-            votes[imin] += 1
-            votes[imax] += 1
+    def rand_vect_bs(self):
+        """Random vector on unit sphere (approx.)"""
+        vec = np.random.normal(0, 1, self.ncha)
+        return vec / np.linalg.norm(vec)
 
 
-# ===================================
-# Fonction pour appliquer IFF sur cube hyperspectral
-# ===================================
-def apply_iff_to_datacube(datacube, n_samples=500, random_gen=0, correlconf=0.9):
-    H, W, Z = datacube.shape
-    data_2d = datacube.reshape(-1, Z)  # (pixels, channels)
-    iff = IFFAlgorithm(data_2d, n_samples=n_samples, random_gen=random_gen)
-    iff.compute()
-    indices, votes = iff.get_freq()
-    iff.group_vertices(correlconf=correlconf)
-    
-    # Mapper les votes sur l’image spatiale
-    vote_map = np.zeros(H*W, dtype=int)
-    vote_map[indices] = votes
-    vote_map = vote_map.reshape(H, W)
-    
-    return iff, vote_map
+# =========================
+# Préparer les données pour IFF
+# =========================
+H, W, Z = datacube_corrected.shape
+data_2D = datacube_corrected.reshape(H*W, Z)  # mise en 2D (pixels x canaux)
+print("Shape pour IFF:", data_2D.shape)
 
+# =========================
+# Appliquer IFF
+# =========================
+iff = IFFAlgorithm(data_2D, n_samples=500, random_gen=0)
+iff.compute()
 
+indices, freqs = iff.get_freq()
+print("Indices top 10 trouvés:", indices[:10])
+print("Votes correspondants:", freqs[:10])
 
-if __name__ == "__main__":
-    import matplotlib.pyplot as plt
+iff.group_vertices(correlconf=0.9)
+print("Nombre de groupes formés:", len(iff.freq_grouped))
 
-    # Supposons datacube_corrected = (H, W, Z) déjà préparé
-    H, W, Z = datacube_corrected.shape
-    iff, vote_map = apply_iff_to_datacube(datacube_corrected, n_samples=500, random_gen=0, correlconf=0.9)
+# =========================
+# Visualiser les pixels les plus votés sur l'image
+# =========================
+top_pixels = indices[:20]  # par exemple top 20
+mask = np.zeros(H*W, dtype=bool)
+mask[top_pixels] = True
+vote_map = mask.reshape(H, W)
 
-    print("Nombre de pixels sélectionnés:", len(iff.freq))
-    print("Nombre de groupes formés:", len(iff.freq_grouped))
-
-    plt.figure(figsize=(6, 5))
-    plt.imshow(vote_map, cmap="inferno")
-    plt.colorbar(label="Votes IFF")
-    plt.title("Carte des votes IFF")
-    plt.show()
+plt.figure(figsize=(6,5))
+plt.imshow(vote_map, cmap='hot')
+plt.title("Pixels les plus votés par IFF")
+plt.colorbar()
+plt.show()
