@@ -941,3 +941,31 @@ visualize_iff_results(datacube, iff, group=False)
 
 # Visualiser groupes
 visualize_iff_results(datacube, iff, group=True)
+
+# =========================
+# Visualiser les spectres comme un nuage de points
+# =========================
+def plot_spectra_selection(iff: IFFAlgorithm, title="Spectres sélectionnés par IFF"):
+    npix = iff.npix
+    votes = iff.votes
+
+    # Créer un masque pour les pixels sélectionnés
+    selected_mask = votes > 0
+
+    # Coordonnées des points
+    x = np.arange(npix)
+    y = votes  # ou pixels.max(axis=1) pour intensité max du spectre
+
+    plt.figure(figsize=(10, 4))
+    plt.scatter(x[~selected_mask], y[~selected_mask], c='blue', label='Non sélectionnés', alpha=0.5)
+    plt.scatter(x[selected_mask], y[selected_mask], c='green', label='Sélectionnés par IFF', alpha=0.7)
+
+    plt.xlabel("Indice du pixel")
+    plt.ylabel("Votes IFF")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+# Appeler la fonction
+plot_spectra_selection(iff)
