@@ -735,3 +735,209 @@ plt.imshow(vote_map, cmap='hot')
 plt.title("Pixels les plus votés par IFF")
 plt.colorbar()
 plt.show()
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+import sif_parser
+from sif_parser.utils import extract_calibration
+from sklearn.decomposition import PCA
+
+# =========================
+# Chargement des données
+# =========================
+file_path = "chemin/vers/fichier.sif"
+data, info = sif_parser.np_open(file_path)
+data = data[:, 0, :]  # Supprimer dimension singleton
+print("Shape after flattening:", data.shape)  # (22500, 2048)
+
+# ---------------------------
+# Reformater le cube
+# ---------------------------
+height, width = 150, 150
+datacube = data.reshape(height, width, -1)
+print("Datacube shape:", datacube.shape)  # (150, 150, 2048)
+
+# ---------------------------
+# Extraire la calibration
+# ---------------------------
+wavelengths = extract_calibration(info)
+if wavelengths is None:
+    raise ValueError("Aucune calibration trouvée dans le fichier SIF")
+
+# ---------------------------
+# Trouver l'indice correspondant à 266 nm
+# ---------------------------
+target_wl = 266.0
+idx = np.argmin(np.abs(wavelengths - target_wl))
+print(f"Indice correspondant à {target_wl} nm : {idx}, longueur d'onde exacte : {wavelengths[idx]:.2f} nm")
+
+# ---------------------------
+# Extraire la cartographie à 266 nm
+# ---------------------------
+image_266 = datacube[:, :, idx]
+
+plt.figure(figsize=(6, 5))
+plt.imshow(image_266, cmap='inferno')
+plt.colorbar(label='Intensité')
+plt.title(f'Cartographie à {wavelengths[idx]:.2f} nm')
+plt.show()
+
+# =========================
+# Algorithme IFF
+# =========================
+class IFFAlgorithm:
+    def __init__(self, data, n_samples, random_gen=0):
+        self.data = data
+        self.npix, self.ncha = data.shape
+        self.n_samples = n_samples
+        self.random_gen = random_gen
+        self.votes = np.zeros(self.npix, dtype=int)
+        self.data_centered = np.zeros_like(self.data)
+        self.freq = []
+        self.freq_grouped = []
+
+    def set_random_gen(self, choice):
+        self.random_gen = choice
+
+    def center_data(self):
+        self.data_centered = self.data - self.data.mean(axis=1, keepdims=True)
+
+    def compute(self):
+        self.center_data()
+        for i in range(self.n_samples):
+            if self.random_gen == 0:
+                self.mc_step_bs()
+            else:
+                self.mc_step_wu()
+        self.sort_votes()
+
+    def mc_step_bs(self):
+        rnd_vec = self.rand_vect_bs()
+        proj = self.data_centered @ rnd_vec
+        imin = np.argmin(proj)
+        imax = np.argmax(proj)
+        self.votes[imin] += 1
+        self.votes[imax] += 1
+
+    def mc_step_wu(self):
+        rnd_vec = self.rand_vect_mu()
+        proj = self.data_centered @ rnd_vec
+        imin = np.argmin(proj)
+        imax = np.argmax(proj)
+        self.votes[imin] += 1
+        self.votes[imax] += 1
+
+    def sort_votes(self):
+        idx = np.nonzero(self.votes)[0]
+        freq = self.votes[idx]
+        sorted_idx = np.argsort(-freq)
+        self.freq = [(int(idx[i]), int(freq[i])) for i in sorted_idx]
+
+    def get_freq(self):
+        if not self.freq:
+            return np.array([]), np.array([])
+        indices, freqs = zip(*self.freq)
+        return np.array(indices, dtype=int), np.array(freqs, dtype=int)
+
+    def group_vertices(self, correlconf=0.9):
+        grouped = []
+        remaining = self.freq.copy()
+        while remaining:
+            ref_idx, ref_freq = remaining.pop(0)
+            ref_spec = self.data[ref_idx]
+            group = [ref_idx]
+            total_freq = ref_freq
+            to_remove = []
+            for i, (idx, freq) in enumerate(remaining):
+                corr = self.correl_coef(ref_spec, self.data[idx])
+                if corr > correlconf:
+                    group.append(idx)
+                    total_freq += freq
+                    to_remove.append(i)
+            for i in reversed(to_remove):
+                remaining.pop(i)
+            grouped.append((group, total_freq))
+        grouped.sort(key=lambda x: -x[1])
+        self.freq_grouped = grouped
+
+    @staticmethod
+    def correl_coef(sp1, sp2):
+        return np.dot(sp1, sp2) / (np.linalg.norm(sp1) * np.linalg.norm(sp2))
+
+    def rand_vect_mu(self):
+        return np.random.uniform(-1, 1, self.ncha)
+
+    def rand_vect_bs(self):
+        vec = np.random.normal(0, 1, self.ncha)
+        return vec / np.linalg.norm(vec)
+
+# =========================
+# Préparer les données pour IFF
+# =========================
+H, W, Z = datacube.shape
+data_2D = datacube.reshape(H*W, Z)
+print("Shape pour IFF:", data_2D.shape)
+
+# =========================
+# Appliquer IFF
+# =========================
+iff = IFFAlgorithm(data_2D, n_samples=500, random_gen=0)
+iff.compute()
+indices, freqs = iff.get_freq()
+print("Indices top 10 trouvés:", indices[:10])
+print("Votes correspondants:", freqs[:10])
+
+iff.group_vertices(correlconf=0.9)
+print("Nombre de groupes formés:", len(iff.freq_grouped))
+
+# =========================
+# Visualiser pixels les plus votés
+# =========================
+top_pixels = indices[:20]
+mask = np.zeros(H*W, dtype=bool)
+mask[top_pixels] = True
+vote_map = mask.reshape(H, W)
+
+plt.figure(figsize=(6,5))
+plt.imshow(vote_map, cmap='hot')
+plt.title("Pixels les plus votés par IFF")
+plt.colorbar()
+plt.show()
+
+# =========================
+# Visualisation PCA des spectres
+# =========================
+def visualize_iff_results(datacube, iff: IFFAlgorithm, group=False):
+    H, W, Z = datacube.shape
+    pixels = datacube.reshape(-1, Z)  # (npix, n_channels)
+
+    # PCA pour réduire en 2D
+    pca = PCA(n_components=2)
+    pixels_2d = pca.fit_transform(pixels)
+
+    plt.figure(figsize=(8,6))
+    plt.scatter(pixels_2d[:,0], pixels_2d[:,1], c='lightgray', alpha=0.5, label='Non sélectionnés')
+
+    if group:
+        colors = plt.cm.get_cmap('tab10', len(iff.freq_grouped))
+        for i, (group_indices, total_votes) in enumerate(iff.freq_grouped):
+            coords = pixels_2d[group_indices]
+            plt.scatter(coords[:,0], coords[:,1], color=colors(i), s=50, label=f'Groupe {i+1}')
+    else:
+        selected_indices, _ = iff.get_freq()
+        plt.scatter(pixels_2d[selected_indices,0], pixels_2d[selected_indices,1],
+                    c='red', s=50, label='Pixels sélectionnés')
+
+    plt.title("Visualisation des spectres via PCA")
+    plt.xlabel("Composante principale 1")
+    plt.ylabel("Composante principale 2")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+# Visualiser pixels sélectionnés
+visualize_iff_results(datacube, iff, group=False)
+
+# Visualiser groupes
+visualize_iff_results(datacube, iff, group=True)
