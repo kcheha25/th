@@ -289,3 +289,54 @@ plt.imshow(image_266_cor, cmap='inferno')
 plt.title("Après correction")
 plt.colorbar()
 plt.show()
+
+
+def calc_average_spectrum(datacube):
+    """
+    datacube : (H, W, Z)
+    """
+    mean_spectrum = datacube.mean(axis=(0, 1))
+    max_intensity = mean_spectrum.max()
+    return mean_spectrum, 
+
+import tkinter as tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+def show_mean_spectrum_tk(datacube, wavelengths):
+    mean_spectrum, max_intensity = calc_average_spectrum(datacube)
+
+    root = tk.Tk()
+    root.title("Spectre moyen LIBS")
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(wavelengths, mean_spectrum, color="blue")
+    ax.set_xlabel("Longueur d'onde (nm)")
+    ax.set_ylabel("Intensité moyenne")
+    ax.set_title("Spectre moyen hyperspectral")
+    ax.grid(True)
+
+    # affichage de l'intensité max
+    ax.text(
+        0.02, 0.95,
+        f"Max = {max_intensity:.2f}",
+        transform=ax.transAxes,
+        verticalalignment='top'
+    )
+
+    canvas = FigureCanvasTkAgg(fig, master=root)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    root.mainloop()
+
+show_mean_spectrum_tk(datacube, wavelengths)
+mean_before, _ = calc_average_spectrum(datacube)
+mean_after, _ = calc_average_spectrum(datacube_corrected)
+
+plt.figure()
+plt.plot(wavelengths, mean_before, label="Avant")
+plt.plot(wavelengths, mean_after, label="Après")
+plt.legend()
+plt.title("Comparaison spectre moyen")
+plt.show()
+
