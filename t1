@@ -1113,43 +1113,97 @@ def get_freq(self):
     return indices, freqs
 
 import numpy as np
+from scipy.signal import convolve
 
-def group_vertices(self, correlconf=0.9):
-    """
-    Regroupe les indices de self.freq selon la corrélation de leurs spectres.
-    Même logique que l'original Python, mais plus rapide pour grands volumes.
-    """
-    if not self.freq:
+class BkgCalculator:
+    def __init__(self, ncha, width=5, niter=5, kernel_type=1):
+        self.ncha = ncha
+        self.width = width
+        self.niter = niter
+        self.kernel_type = kernel_type
+        self._widthkernel = None
+        self._midkernel = None
+        self.kernel = self.calc_kernel()
+
+    def calc_kernel(self):
+        if self.kernel_type > 0:
+            # Gaussien
+            self._widthkernel = 6 * self.width + 1
+            self._midkernel = 3 * self.width + 1
+            x = np.arange(self._widthkernel) - self._midkernel
+            kernel = np.exp(-0.5 * (x / self.width) ** 2)
+        else:
+            # Constante
+            self._widthkernel = 2 * self.width + 1
+            self._midkernel = self.width + 1
+            kernel = np.ones(self._widthkernel, dtype=np.float32)
+        return kernel / kernel.sum()
+
+    def F_alpha(self, spec):
+        conv = convolve(spec, self.kernel, mode='same')
+        return np.minimum(spec, conv)
+
+    def CalcBackground(self, spec):
+        spec = np.array(spec, dtype=np.float32)
+        for _ in range(self.niter):
+            spec = self.F_alpha(spec)
+        return convolve(spec, self.kernel, mode='same')
+
+    def removebaseline(self, spec):
+        spec = np.array(spec, dtype=np.float32)
+        return spec - self.CalcBackground(spec)
+
+
+class IFF:
+    def __init__(self, freq, data, ncha):
+        self.freq = freq
+        self.data = data
+        self.ncha = ncha
         self.freq_grouped = []
-        return
 
-    remaining_indices = np.arange(len(self.freq))  # indices des éléments restants
-    freq_array = np.array([f[1] for f in self.freq], dtype=int)  # fréquences
-    indices_array = np.array([f[0] for f in self.freq], dtype=int)  # indices correspondants
+    def getspectrum(self, idx):
+        return self.data[idx]
 
-    grouped = []
+    def batch_correl(self, ref_spec, specs):
+        ref = ref_spec - ref_spec.mean()
+        specs = specs - specs.mean(axis=1, keepdims=True)
+        denom = np.sqrt((ref**2).sum() * (specs**2).sum(axis=1))
+        corr = (specs @ ref) / denom
+        return corr
 
-    # Boucle principale
-    while remaining_indices.size > 0:
-        ref_idx = remaining_indices[0]
-        ref_spec = self.data[indices_array[ref_idx]]
-        group = [indices_array[ref_idx]]
-        total_freq = freq_array[ref_idx]
+    def group_vertices(self, correlconf=0.9, kernel=0, width=5, niter=5):
+        self.freq_grouped = []
+        toprocess = self.freq.copy()
 
-        # Comparaison vectorisée pour les éléments restants
-        to_remove = []
-        for i in remaining_indices[1:]:
-            corr = self.correl_coef(ref_spec, self.data[indices_array[i]])
-            if corr > correlconf:
-                group.append(indices_array[i])
-                total_freq += freq_array[i]
-                to_remove.append(i)
+        if not toprocess:
+            return
 
-        # Supprimer les indices regroupés
-        remaining_indices = np.setdiff1d(remaining_indices, [ref_idx] + to_remove, assume_unique=True)
+        if kernel > 0:
+            bkgc = BkgCalculator(self.ncha, width, niter, kernel)
 
-        grouped.append((group, total_freq))
+        while toprocess:
+            ref_idx, ref_freq = toprocess.pop(0)
+            ref_spec = self.getspectrum(ref_idx)
+            ref_spec = bkgc.removebaseline(ref_spec) if kernel > 0 else ref_spec
 
-    # Tri par fréquence totale décroissante
-    grouped.sort(key=lambda x: -x[1])
-    self.freq_grouped = grouped
+            if not toprocess:
+                self.freq_grouped.append(([ref_idx], ref_freq))
+                continue
+
+            indices, freqs = zip(*toprocess)
+            specs_stack = np.array([self.getspectrum(i) for i in indices])
+            if kernel > 0:
+                specs_stack = np.array([bkgc.removebaseline(s) for s in specs_stack])
+
+            corrs = self.batch_correl(ref_spec, specs_stack)
+            mask = corrs > correlconf
+
+            group_indices = [ref_idx] + [indices[i] for i, m in enumerate(mask) if m]
+            total_freq = ref_freq + sum(freqs[i] for i, m in enumerate(mask) if m)
+
+            toprocess = [(i, f) for i, f in toprocess if i not in group_indices]
+
+            self.freq_grouped.append((group_indices, total_freq))
+
+        self.freq_grouped.sort(key=lambda x: -x[1])
+
