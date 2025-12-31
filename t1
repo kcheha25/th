@@ -1096,25 +1096,18 @@ visualize_iff_results(datacube, iff, group=True)
 
 
 
-
 import numpy as np
 
-def get_freq_fast(freq):
-    """
-    freq : liste de tuples (index, freq) ou vide
-    Retourne deux arrays NumPy int rapidement.
-    """
-    n = len(freq)
-    if n == 0:
-        return np.empty(0, dtype=int), np.empty(0, dtype=int)
+def get_freq(self):
+    if not self.freq:
+        return np.array([]), np.array([])
 
-    # Pré-allocation des tableaux
+    n = len(self.freq)
     indices = np.empty(n, dtype=int)
     freqs = np.empty(n, dtype=int)
 
-    # Remplissage par indexation directe
-    for i, (idx, f) in enumerate(freq):
-        indices[i] = idx
-        freqs[i] = f
+    for i, f in enumerate(self.freq):
+        indices[i] = f[0]
+        freqs[i] = f[1]
 
     return indices, freqs
