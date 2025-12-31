@@ -976,42 +976,56 @@ import numpy as np
 import numpy as np
 from numba import njit
 
-BUCKET_SIZE = 64  # Assurez-vous que BUCKET_SIZE est défini
+BUCKET_SIZE = 64  # Ajustable selon la taille de n
 
 @njit
-def _rand_vec_bs_odd_numba(n, rng_state):
+def rand_vec_bs_odd_numba(n):
+    assert n % 2 == 1, "n doit être impair"
     nb = 1 + n // BUCKET_SIZE
-    twoDpts = [[] for _ in range(nb)]
+    max_points = n // 2
+
+    # Tableaux pour stocker les points par bucket
+    # shape = (nb, max_points, 3) pour (a,b,s)
+    buckets = np.zeros((nb, max_points, 3))
+    counts = np.zeros(nb, dtype=np.int64)
 
     # Étape 1 : génération disque unité
-    for _ in range(n // 2):
-        while True:
-            a = 2.0 * np.random.rand() - 1.0
-            b = 2.0 * np.random.rand() - 1.0
-            s = a*a + b*b
-            if s <= 1.0:
-                break
-        bucket = int(s * nb)
-        if bucket >= nb:
-            bucket = nb - 1
-        twoDpts[bucket].append((a, b, s))
+    filled = 0
+    while filled < max_points:
+        a = 2.0 * np.random.rand() - 1.0
+        b = 2.0 * np.random.rand() - 1.0
+        s = a*a + b*b
+        if s <= 1.0:
+            bucket = int(s * nb)
+            if bucket >= nb:
+                bucket = nb - 1
+            idx = counts[bucket]
+            buckets[bucket, idx, 0] = a
+            buckets[bucket, idx, 1] = b
+            buckets[bucket, idx, 2] = s
+            counts[bucket] += 1
+            filled += 1
 
-    # Étape 2 : tri par s
+    # Étape 2 : tri par s dans chaque bucket
     for b in range(nb):
-        twoDpts[b] = sorted(twoDpts[b], key=lambda x: x[2])
+        c = counts[b]
+        if c > 1:
+            s_vals = buckets[b, :c, 2]
+            idx_sort = np.argsort(s_vals)
+            buckets[b, :c, :] = buckets[b, idx_sort, :]
 
-    # Étape 3 : trouver last_bucket et first_bucket
-    last_bucket = nb - 1
-    while last_bucket > 0 and len(twoDpts[last_bucket]) == 0:
-        last_bucket -= 1
-
+    # Étape 3 : trouver first et last bucket non vides
     first_bucket = 0
-    while first_bucket < nb and len(twoDpts[first_bucket]) == 0:
+    while first_bucket < nb and counts[first_bucket] == 0:
         first_bucket += 1
 
-    a0, b0, s0 = twoDpts[first_bucket][0]
+    last_bucket = nb - 1
+    while last_bucket > 0 and counts[last_bucket] == 0:
+        last_bucket -= 1
 
-    s = 1.0 / twoDpts[last_bucket][-1][2]
+    # Étape 4 : initialisation
+    a0, b0, s0 = buckets[first_bucket, 0, 0], buckets[first_bucket, 0, 1], buckets[first_bucket, 0, 2]
+    s = 1.0 / buckets[last_bucket, counts[last_bucket]-1, 2]
     s = s / (1.0 - s * a0 * a0)
 
     v = np.zeros(n, dtype=np.float64)
@@ -1019,71 +1033,82 @@ def _rand_vec_bs_odd_numba(n, rng_state):
 
     S_II = s0
     idx = 1
-    j = 1
 
     # Étape 5 : remplissage cumulatif
-    for b in range(first_bucket, last_bucket + 1):
-        bucket = twoDpts[b]
-        while j < len(bucket):
-            a, b_, s_ = bucket[j]
+    for b in range(first_bucket, last_bucket+1):
+        for j in range(1, counts[b]):
+            a, b_, s_ = buckets[b, j, 0], buckets[b, j, 1], buckets[b, j, 2]
             S_I = S_II
             S_II += s_
             t = np.sqrt((1.0 - S_I / S_II) * s)
             v[idx] = a * t
-            v[idx + 1] = b_ * t
+            v[idx+1] = b_ * t
             idx += 2
-            j += 1
-        j = 0
-        bucket.clear()
 
     return v
 
 
 @njit
-def _rand_vec_bs_even_numba(n, rng_state):
+def rand_vec_bs_even_numba(n):
+    assert n % 2 == 0, "n doit être pair"
     nb = 1 + n // BUCKET_SIZE
-    twoDpts = [[] for _ in range(nb)]
+    max_points = n // 2
 
-    for _ in range(n // 2):
-        while True:
-            a = 2.0 * np.random.rand() - 1.0
-            b = 2.0 * np.random.rand() - 1.0
-            s = a*a + b*b
-            if s <= 1.0:
-                break
-        bucket = int(s * nb)
-        if bucket >= nb:
-            bucket = nb - 1
-        twoDpts[bucket].append((a, b, s))
+    buckets = np.zeros((nb, max_points, 3))
+    counts = np.zeros(nb, dtype=np.int64)
 
+    # Étape 1 : génération disque unité
+    filled = 0
+    while filled < max_points:
+        a = 2.0 * np.random.rand() - 1.0
+        b = 2.0 * np.random.rand() - 1.0
+        s = a*a + b*b
+        if s <= 1.0:
+            bucket = int(s * nb)
+            if bucket >= nb:
+                bucket = nb - 1
+            idx = counts[bucket]
+            buckets[bucket, idx, 0] = a
+            buckets[bucket, idx, 1] = b
+            buckets[bucket, idx, 2] = s
+            counts[bucket] += 1
+            filled += 1
+
+    # Étape 2 : tri par s dans chaque bucket
     for b in range(nb):
-        twoDpts[b] = sorted(twoDpts[b], key=lambda x: x[2])
+        c = counts[b]
+        if c > 1:
+            s_vals = buckets[b, :c, 2]
+            idx_sort = np.argsort(s_vals)
+            buckets[b, :c, :] = buckets[b, idx_sort, :]
 
+    # Étape 3 : trouver last bucket non vide
     last_bucket = nb - 1
-    while last_bucket > 0 and len(twoDpts[last_bucket]) == 0:
+    while last_bucket > 0 and counts[last_bucket] == 0:
         last_bucket -= 1
 
-    s = 1.0 / twoDpts[last_bucket][-1][2]
+    s = 1.0 / buckets[last_bucket, counts[last_bucket]-1, 2]
 
+    # Étape 4 : remplissage cumulatif
     v = np.zeros(n, dtype=np.float64)
     idx = 0
     S_II = 0.0
 
-    for b in range(last_bucket + 1):
-        for a, b_, s_ in twoDpts[b]:
+    for b in range(last_bucket+1):
+        for j in range(counts[b]):
+            a, b_, s_ = buckets[b, j, 0], buckets[b, j, 1], buckets[b, j, 2]
             S_I = S_II
             S_II += s_
             t = np.sqrt((1.0 - S_I / S_II) * s)
             v[idx] = a * t
-            v[idx + 1] = b_ * t
+            v[idx+1] = b_ * t
             idx += 2
-        twoDpts[b].clear()
 
     return v
 
 
 def rand_vect_bs(n):
     if n % 2 == 1:
-        return _rand_vec_bs_odd_numba(n, None)
+        return rand_vec_bs_odd_numba(n)
     else:
-        return _rand_vec_bs_even_numba(n, None)
+        return rand_vec_bs_even_numba(n)
