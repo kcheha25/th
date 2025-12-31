@@ -1111,3 +1111,45 @@ def get_freq(self):
         freqs[i] = f[1]
 
     return indices, freqs
+
+import numpy as np
+
+def group_vertices(self, correlconf=0.9):
+    """
+    Regroupe les indices de self.freq selon la corrélation de leurs spectres.
+    Même logique que l'original Python, mais plus rapide pour grands volumes.
+    """
+    if not self.freq:
+        self.freq_grouped = []
+        return
+
+    remaining_indices = np.arange(len(self.freq))  # indices des éléments restants
+    freq_array = np.array([f[1] for f in self.freq], dtype=int)  # fréquences
+    indices_array = np.array([f[0] for f in self.freq], dtype=int)  # indices correspondants
+
+    grouped = []
+
+    # Boucle principale
+    while remaining_indices.size > 0:
+        ref_idx = remaining_indices[0]
+        ref_spec = self.data[indices_array[ref_idx]]
+        group = [indices_array[ref_idx]]
+        total_freq = freq_array[ref_idx]
+
+        # Comparaison vectorisée pour les éléments restants
+        to_remove = []
+        for i in remaining_indices[1:]:
+            corr = self.correl_coef(ref_spec, self.data[indices_array[i]])
+            if corr > correlconf:
+                group.append(indices_array[i])
+                total_freq += freq_array[i]
+                to_remove.append(i)
+
+        # Supprimer les indices regroupés
+        remaining_indices = np.setdiff1d(remaining_indices, [ref_idx] + to_remove, assume_unique=True)
+
+        grouped.append((group, total_freq))
+
+    # Tri par fréquence totale décroissante
+    grouped.sort(key=lambda x: -x[1])
+    self.freq_grouped = grouped
