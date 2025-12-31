@@ -973,26 +973,21 @@ _BUCKET_SIZE = 16
 
 import numpy as np
 
-BUCKET_SIZE = 32
+import numpy as np
+from numba import njit
 
-def rand_vec_bs_odd(n, rng=np.random):
-    """
-    Équivalent Python fidèle de IFF::rand_vec_bs_odd (C++)
-    Génère un vecteur uniforme sur la sphère unité en dimension impaire
-    """
+BUCKET_SIZE = 64  # Assurez-vous que BUCKET_SIZE est défini
 
-    assert n % 2 == 1, "n doit être impair"
-
+@njit
+def _rand_vec_bs_odd_numba(n, rng_state):
     nb = 1 + n // BUCKET_SIZE
     twoDpts = [[] for _ in range(nb)]
 
-    # -----------------------------
     # Étape 1 : génération disque unité
-    # -----------------------------
     for _ in range(n // 2):
         while True:
-            a = 2.0 * rng.random() - 1.0
-            b = 2.0 * rng.random() - 1.0
+            a = 2.0 * np.random.rand() - 1.0
+            b = 2.0 * np.random.rand() - 1.0
             s = a*a + b*b
             if s <= 1.0:
                 break
@@ -1001,15 +996,11 @@ def rand_vec_bs_odd(n, rng=np.random):
             bucket = nb - 1
         twoDpts[bucket].append((a, b, s))
 
-    # -----------------------------
     # Étape 2 : tri par s
-    # -----------------------------
     for b in range(nb):
-        twoDpts[b].sort(key=lambda x: x[2])
+        twoDpts[b] = sorted(twoDpts[b], key=lambda x: x[2])
 
-    # -----------------------------
-    # Étape 3 : trouver last_bucket
-    # -----------------------------
+    # Étape 3 : trouver last_bucket et first_bucket
     last_bucket = nb - 1
     while last_bucket > 0 and len(twoDpts[last_bucket]) == 0:
         last_bucket -= 1
@@ -1018,9 +1009,6 @@ def rand_vec_bs_odd(n, rng=np.random):
     while first_bucket < nb and len(twoDpts[first_bucket]) == 0:
         first_bucket += 1
 
-    # -----------------------------
-    # Étape 4 : initialisation
-    # -----------------------------
     a0, b0, s0 = twoDpts[first_bucket][0]
 
     s = 1.0 / twoDpts[last_bucket][-1][2]
@@ -1033,9 +1021,7 @@ def rand_vec_bs_odd(n, rng=np.random):
     idx = 1
     j = 1
 
-    # -----------------------------
     # Étape 5 : remplissage cumulatif
-    # -----------------------------
     for b in range(first_bucket, last_bucket + 1):
         bucket = twoDpts[b]
         while j < len(bucket):
@@ -1052,16 +1038,16 @@ def rand_vec_bs_odd(n, rng=np.random):
 
     return v
 
-def rand_vec_bs_even(n, rng=np.random):
-    assert n % 2 == 0, "n doit être pair"
 
+@njit
+def _rand_vec_bs_even_numba(n, rng_state):
     nb = 1 + n // BUCKET_SIZE
     twoDpts = [[] for _ in range(nb)]
 
     for _ in range(n // 2):
         while True:
-            a = 2.0 * rng.random() - 1.0
-            b = 2.0 * rng.random() - 1.0
+            a = 2.0 * np.random.rand() - 1.0
+            b = 2.0 * np.random.rand() - 1.0
             s = a*a + b*b
             if s <= 1.0:
                 break
@@ -1071,7 +1057,7 @@ def rand_vec_bs_even(n, rng=np.random):
         twoDpts[bucket].append((a, b, s))
 
     for b in range(nb):
-        twoDpts[b].sort(key=lambda x: x[2])
+        twoDpts[b] = sorted(twoDpts[b], key=lambda x: x[2])
 
     last_bucket = nb - 1
     while last_bucket > 0 and len(twoDpts[last_bucket]) == 0:
@@ -1094,9 +1080,10 @@ def rand_vec_bs_even(n, rng=np.random):
         twoDpts[b].clear()
 
     return v
+
+
 def rand_vect_bs(n):
     if n % 2 == 1:
-        return rand_vec_bs_odd(n)
+        return _rand_vec_bs_odd_numba(n, None)
     else:
-        return rand_vec_bs_even(n)
-
+        return _rand_vec_bs_even_numba(n, None)
