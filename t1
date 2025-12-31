@@ -954,3 +954,146 @@ visualize_iff_results(datacube, iff, group=False)
 
 # Visualiser groupes
 visualize_iff_results(datacube, iff, group=True)
+
+
+from dataclasses import dataclass
+
+@dataclass(order=True)
+class Triple:
+    S: float
+    a: float
+    b: float
+def randomnum():
+    return np.random.random()
+
+import numpy as np
+import math
+
+_BUCKET_SIZE = 16   
+
+def rand_vect_bs_even(n):
+    nb = 1 + n // _BUCKET_SIZE
+    twoDpts = [[] for _ in range(nb)]
+
+    # -----------------------------
+    # Génération des points 2D
+    # -----------------------------
+    for _ in range(n // 2):
+        while True:
+            a = 2.0 * randomnum() - 1.0
+            b = 2.0 * randomnum() - 1.0
+            S = a*a + b*b
+            if S <= 1.0:
+                break
+
+        bid = int(S * nb)
+        if bid >= nb:
+            bid = nb - 1
+
+        twoDpts[bid].append(Triple(S, a, b))
+
+    # -----------------------------
+    # Tri par S
+    # -----------------------------
+    for b in range(nb):
+        twoDpts[b].sort()
+
+    # -----------------------------
+    # Dernier bucket non vide
+    # -----------------------------
+    last_bucket = nb - 1
+    while last_bucket > 0 and not twoDpts[last_bucket]:
+        last_bucket -= 1
+
+    # -----------------------------
+    # Construction du vecteur
+    # -----------------------------
+    v = np.zeros(n, dtype=float)
+
+    s = 1.0 / twoDpts[last_bucket][-1].S
+    i = 0
+    S_II = 0.0
+
+    for b in range(last_bucket + 1):
+        for tr in twoDpts[b]:
+            S_I = S_II
+            S_II += tr.S
+            t = np.sqrt((1.0 - S_I / S_II) * s)
+            v[i]   = tr.a * t
+            v[i+1] = tr.b * t
+            i += 2
+
+        twoDpts[b].clear()
+
+    return v
+
+def rand_vect_bs_odd(n):
+    nb = 1 + n // _BUCKET_SIZE
+    twoDpts = [[] for _ in range(nb)]
+
+    # -----------------------------
+    # Génération des points 2D
+    # -----------------------------
+    for _ in range(n // 2):
+        while True:
+            a = 2.0 * randomnum() - 1.0
+            b = 2.0 * randomnum() - 1.0
+            S = a*a + b*b
+            if S <= 1.0:
+                break
+
+        bid = int(S * nb)
+        if bid >= nb:
+            bid = nb - 1
+
+        twoDpts[bid].append(Triple(S, a, b))
+
+    # -----------------------------
+    # Tri par S
+    # -----------------------------
+    for b in range(nb):
+        twoDpts[b].sort()
+
+    # -----------------------------
+    # Buckets utiles
+    # -----------------------------
+    last_bucket = nb - 1
+    while last_bucket > 0 and not twoDpts[last_bucket]:
+        last_bucket -= 1
+
+    first_bucket = 0
+    while first_bucket < nb and not twoDpts[first_bucket]:
+        first_bucket += 1
+
+    # -----------------------------
+    # Construction du vecteur
+    # -----------------------------
+    v = np.zeros(n, dtype=float)
+
+    s = 1.0 / twoDpts[last_bucket][-1].S
+    s = s / (1.0 - s * twoDpts[first_bucket][0].a**2)
+
+    v[0] = twoDpts[first_bucket][0].a * np.sqrt(s)
+    S_II = twoDpts[first_bucket][0].S
+
+    i = 1
+    j = 1
+
+    for b in range(first_bucket, last_bucket + 1):
+        pts = twoDpts[b]
+        while j < len(pts):
+            S_I = S_II
+            S_II += pts[j].S
+            t = np.sqrt((1.0 - S_I / S_II) * s)
+            v[i]   = pts[j].a * t
+            v[i+1] = pts[j].b * t
+            i += 2
+            j += 1
+        j = 0
+        pts.clear()
+
+    return v
+
+def rand_vect_bs(n):
+    return rand_vect_bs_odd(n) if (n & 1) else rand_vect_bs_even(n)
+
