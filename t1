@@ -1113,47 +1113,89 @@ def get_freq(self):
     return indices, freqs
 
 import numpy as np
-from scipy.signal import convolve
+from numba import njit, prange
 
+# -------------------------------
+# Fonctions numba pour le calcul
+# -------------------------------
+
+@njit
+def F_alpha_numba(spec, kernel, niter):
+    n = spec.size
+    w = kernel.size
+    mid = w // 2
+    out = np.empty_like(spec)
+    temp = spec.copy()
+
+    for _ in range(niter):
+        for i in range(n):
+            sumval = 0.0
+            for j in range(w):
+                k = i - j + mid
+                if k < 0:
+                    k = 0
+                elif k >= n:
+                    k = n - 1
+                sumval += temp[k] * kernel[j]
+            out[i] = temp[i] if temp[i] < sumval else sumval
+        temp, out = out, temp  # swap
+    return temp
+
+@njit
+def remove_baseline_numba(spec, kernel, niter):
+    bkg = F_alpha_numba(spec, kernel, niter)
+    return spec - bkg
+
+@njit(parallel=True)
+def batch_correlation_numba(ref_spec, specs):
+    n_specs = specs.shape[0]
+    n_chan = specs.shape[1]
+    corr = np.empty(n_specs, dtype=np.float32)
+
+    ref_mean = ref_spec.mean()
+    ref_std = ref_spec.std()
+    ref_centered = ref_spec - ref_mean
+
+    for i in prange(n_specs):
+        s = specs[i]
+        s_mean = s.mean()
+        s_std = s.std()
+        if s_std == 0.0 or ref_std == 0.0:
+            corr[i] = 0.0
+        else:
+            s_centered = s - s_mean
+            corr[i] = np.sum(ref_centered * s_centered) / (ref_std * s_std * n_chan)
+    return corr
+
+# -------------------------------
+# Classe BkgCalculator
+# -------------------------------
 class BkgCalculator:
     def __init__(self, ncha, width=5, niter=5, kernel_type=1):
         self.ncha = ncha
         self.width = width
         self.niter = niter
         self.kernel_type = kernel_type
-        self._widthkernel = None
-        self._midkernel = None
-        self.kernel = self.calc_kernel()
-
-    def calc_kernel(self):
-        if self.kernel_type > 0:
+        if kernel_type > 0:
             # Gaussien
-            self._widthkernel = 6 * self.width + 1
-            self._midkernel = 3 * self.width + 1
+            self._widthkernel = 6 * width + 1
+            self._midkernel = 3 * width + 1
             x = np.arange(self._widthkernel) - self._midkernel
-            kernel = np.exp(-0.5 * (x / self.width) ** 2)
+            kernel = np.exp(-0.5 * (x / width) ** 2)
         else:
             # Constante
-            self._widthkernel = 2 * self.width + 1
-            self._midkernel = self.width + 1
+            self._widthkernel = 2 * width + 1
+            self._midkernel = width + 1
             kernel = np.ones(self._widthkernel, dtype=np.float32)
-        return kernel / kernel.sum()
-
-    def F_alpha(self, spec):
-        conv = convolve(spec, self.kernel, mode='same')
-        return np.minimum(spec, conv)
-
-    def CalcBackground(self, spec):
-        spec = np.array(spec, dtype=np.float32)
-        for _ in range(self.niter):
-            spec = self.F_alpha(spec)
-        return convolve(spec, self.kernel, mode='same')
+        self.kernel = kernel.astype(np.float32) / kernel.sum()
 
     def removebaseline(self, spec):
         spec = np.array(spec, dtype=np.float32)
-        return spec - self.CalcBackground(spec)
+        return remove_baseline_numba(spec, self.kernel, self.niter)
 
-
+# -------------------------------
+# Classe IFF
+# -------------------------------
 class IFF:
     def __init__(self, freq, data, ncha):
         self.freq = freq
@@ -1163,13 +1205,6 @@ class IFF:
 
     def getspectrum(self, idx):
         return self.data[idx]
-
-    def batch_correl(self, ref_spec, specs):
-        ref = ref_spec - ref_spec.mean()
-        specs = specs - specs.mean(axis=1, keepdims=True)
-        denom = np.sqrt((ref**2).sum() * (specs**2).sum(axis=1))
-        corr = (specs @ ref) / denom
-        return corr
 
     def group_vertices(self, correlconf=0.9, kernel=0, width=5, niter=5):
         self.freq_grouped = []
@@ -1191,18 +1226,17 @@ class IFF:
                 continue
 
             indices, freqs = zip(*toprocess)
-            specs_stack = np.array([self.getspectrum(i) for i in indices])
+            specs_stack = np.array([self.getspectrum(i) for i in indices], dtype=np.float32)
             if kernel > 0:
-                specs_stack = np.array([bkgc.removebaseline(s) for s in specs_stack])
+                specs_stack = np.array([bkgc.removebaseline(s) for s in specs_stack], dtype=np.float32)
 
-            corrs = self.batch_correl(ref_spec, specs_stack)
+            corrs = batch_correlation_numba(ref_spec, specs_stack)
             mask = corrs > correlconf
 
             group_indices = [ref_idx] + [indices[i] for i, m in enumerate(mask) if m]
             total_freq = ref_freq + sum(freqs[i] for i, m in enumerate(mask) if m)
 
             toprocess = [(i, f) for i, f in toprocess if i not in group_indices]
-
             self.freq_grouped.append((group_indices, total_freq))
 
         self.freq_grouped.sort(key=lambda x: -x[1])
