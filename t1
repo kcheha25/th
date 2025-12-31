@@ -971,129 +971,132 @@ import math
 
 _BUCKET_SIZE = 16   
 
-def rand_vect_bs_even(n):
-    nb = 1 + n // _BUCKET_SIZE
+import numpy as np
+
+BUCKET_SIZE = 32
+
+def rand_vec_bs_odd(n, rng=np.random):
+    """
+    Équivalent Python fidèle de IFF::rand_vec_bs_odd (C++)
+    Génère un vecteur uniforme sur la sphère unité en dimension impaire
+    """
+
+    assert n % 2 == 1, "n doit être impair"
+
+    nb = 1 + n // BUCKET_SIZE
     twoDpts = [[] for _ in range(nb)]
 
     # -----------------------------
-    # Génération des points 2D
+    # Étape 1 : génération disque unité
     # -----------------------------
     for _ in range(n // 2):
         while True:
-            a = 2.0 * randomnum() - 1.0
-            b = 2.0 * randomnum() - 1.0
-            S = a*a + b*b
-            if S <= 1.0:
+            a = 2.0 * rng.random() - 1.0
+            b = 2.0 * rng.random() - 1.0
+            s = a*a + b*b
+            if s <= 1.0:
                 break
-
-        bid = int(S * nb)
-        if bid >= nb:
-            bid = nb - 1
-
-        twoDpts[bid].append(Triple(S, a, b))
+        bucket = int(s * nb)
+        if bucket >= nb:
+            bucket = nb - 1
+        twoDpts[bucket].append((a, b, s))
 
     # -----------------------------
-    # Tri par S
+    # Étape 2 : tri par s
     # -----------------------------
     for b in range(nb):
-        twoDpts[b].sort()
+        twoDpts[b].sort(key=lambda x: x[2])
 
     # -----------------------------
-    # Dernier bucket non vide
-    # -----------------------------
-    last_bucket = nb - 1
-    while last_bucket > 0 and not twoDpts[last_bucket]:
-        last_bucket -= 1
-
-    # -----------------------------
-    # Construction du vecteur
-    # -----------------------------
-    v = np.zeros(n, dtype=float)
-
-    s = 1.0 / twoDpts[last_bucket][-1].S
-    i = 0
-    S_II = 0.0
-
-    for b in range(last_bucket + 1):
-        for tr in twoDpts[b]:
-            S_I = S_II
-            S_II += tr.S
-            t = np.sqrt((1.0 - S_I / S_II) * s)
-            v[i]   = tr.a * t
-            v[i+1] = tr.b * t
-            i += 2
-
-        twoDpts[b].clear()
-
-    return v
-
-def rand_vect_bs_odd(n):
-    nb = 1 + n // _BUCKET_SIZE
-    twoDpts = [[] for _ in range(nb)]
-
-    # -----------------------------
-    # Génération des points 2D
-    # -----------------------------
-    for _ in range(n // 2):
-        while True:
-            a = 2.0 * randomnum() - 1.0
-            b = 2.0 * randomnum() - 1.0
-            S = a*a + b*b
-            if S <= 1.0:
-                break
-
-        bid = int(S * nb)
-        if bid >= nb:
-            bid = nb - 1
-
-        twoDpts[bid].append(Triple(S, a, b))
-
-    # -----------------------------
-    # Tri par S
-    # -----------------------------
-    for b in range(nb):
-        twoDpts[b].sort()
-
-    # -----------------------------
-    # Buckets utiles
+    # Étape 3 : trouver last_bucket
     # -----------------------------
     last_bucket = nb - 1
-    while last_bucket > 0 and not twoDpts[last_bucket]:
+    while last_bucket > 0 and len(twoDpts[last_bucket]) == 0:
         last_bucket -= 1
 
     first_bucket = 0
-    while first_bucket < nb and not twoDpts[first_bucket]:
+    while first_bucket < nb and len(twoDpts[first_bucket]) == 0:
         first_bucket += 1
 
     # -----------------------------
-    # Construction du vecteur
+    # Étape 4 : initialisation
     # -----------------------------
-    v = np.zeros(n, dtype=float)
+    a0, b0, s0 = twoDpts[first_bucket][0]
 
-    s = 1.0 / twoDpts[last_bucket][-1].S
-    s = s / (1.0 - s * twoDpts[first_bucket][0].a**2)
+    s = 1.0 / twoDpts[last_bucket][-1][2]
+    s = s / (1.0 - s * a0 * a0)
 
-    v[0] = twoDpts[first_bucket][0].a * np.sqrt(s)
-    S_II = twoDpts[first_bucket][0].S
+    v = np.zeros(n, dtype=np.float64)
+    v[0] = a0 * np.sqrt(s)
 
-    i = 1
+    S_II = s0
+    idx = 1
     j = 1
 
+    # -----------------------------
+    # Étape 5 : remplissage cumulatif
+    # -----------------------------
     for b in range(first_bucket, last_bucket + 1):
-        pts = twoDpts[b]
-        while j < len(pts):
+        bucket = twoDpts[b]
+        while j < len(bucket):
+            a, b_, s_ = bucket[j]
             S_I = S_II
-            S_II += pts[j].S
+            S_II += s_
             t = np.sqrt((1.0 - S_I / S_II) * s)
-            v[i]   = pts[j].a * t
-            v[i+1] = pts[j].b * t
-            i += 2
+            v[idx] = a * t
+            v[idx + 1] = b_ * t
+            idx += 2
             j += 1
         j = 0
-        pts.clear()
+        bucket.clear()
 
     return v
 
+def rand_vec_bs_even(n, rng=np.random):
+    assert n % 2 == 0, "n doit être pair"
+
+    nb = 1 + n // BUCKET_SIZE
+    twoDpts = [[] for _ in range(nb)]
+
+    for _ in range(n // 2):
+        while True:
+            a = 2.0 * rng.random() - 1.0
+            b = 2.0 * rng.random() - 1.0
+            s = a*a + b*b
+            if s <= 1.0:
+                break
+        bucket = int(s * nb)
+        if bucket >= nb:
+            bucket = nb - 1
+        twoDpts[bucket].append((a, b, s))
+
+    for b in range(nb):
+        twoDpts[b].sort(key=lambda x: x[2])
+
+    last_bucket = nb - 1
+    while last_bucket > 0 and len(twoDpts[last_bucket]) == 0:
+        last_bucket -= 1
+
+    s = 1.0 / twoDpts[last_bucket][-1][2]
+
+    v = np.zeros(n, dtype=np.float64)
+    idx = 0
+    S_II = 0.0
+
+    for b in range(last_bucket + 1):
+        for a, b_, s_ in twoDpts[b]:
+            S_I = S_II
+            S_II += s_
+            t = np.sqrt((1.0 - S_I / S_II) * s)
+            v[idx] = a * t
+            v[idx + 1] = b_ * t
+            idx += 2
+        twoDpts[b].clear()
+
+    return v
 def rand_vect_bs(n):
-    return rand_vect_bs_odd(n) if (n & 1) else rand_vect_bs_even(n)
+    if n % 2 == 1:
+        return rand_vec_bs_odd(n)
+    else:
+        return rand_vec_bs_even(n)
 
