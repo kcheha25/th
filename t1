@@ -1000,13 +1000,24 @@ class BkgCalculator:
     def removebaseline(self, spec):
         spec = np.array(spec, dtype=np.float32)
         return remove_baseline_numba(spec, self.kernel, self.niter)
+@njit(parallel=True)
+def block_projection(block, rnd_vec):
+    n_pixels, n_chan = block.shape
+    proj = np.empty(n_pixels, dtype=np.float32)
+    for i in prange(n_pixels):
+        s = 0.0
+        for j in range(n_chan):
+            s += block[i, j] * rnd_vec[j]
+        proj[i] = s
+    return proj
 
 class IFFAlgorithm:
-    def __init__(self, data, n_samples, random_gen=0):
+    def __init__(self, data, n_samples, random_gen=0, block_size=131072):
         self.data = data
         self.npix, self.ncha = data.shape
         self.n_samples = n_samples
         self.random_gen = random_gen
+        self.block_size = block_size
         self.votes = np.zeros(self.npix, dtype=int)
         self.data_centered = np.zeros_like(self.data)
         self.freq = []
@@ -1019,12 +1030,39 @@ class IFFAlgorithm:
         self.data_centered = self.data - self.data.mean(axis=1, keepdims=True)
 
     def compute(self):
-        self.center_data()
-        for i in range(self.n_samples):
+        for _ in range(self.n_samples):
             if self.random_gen == 0:
-                self.mc_step_bs()
+                rnd_vec = self.rand_vect_bs()
             else:
-                self.mc_step_wu()
+                rnd_vec = self.rand_vect_mu()
+
+            gmin = 1e30
+            gmax = -1e30
+            gmin_idx = 0
+            gmax_idx = 0
+
+            # Stream par blocs
+            for i in range(0, self.npix, self.block_size):
+                block = self.data[i:i+self.block_size].astype(np.float32)
+                block -= block.mean(axis=1, keepdims=True)  # centrage par pixel
+
+                # Projection parallèle
+                proj = block_projection(block, rnd_vec)
+
+                # Min / max global
+                imin = np.argmin(proj)
+                imax = np.argmax(proj)
+
+                if proj[imin] < gmin:
+                    gmin = proj[imin]
+                    gmin_idx = i + imin
+                if proj[imax] > gmax:
+                    gmax = proj[imax]
+                    gmax_idx = i + imax
+
+            self.votes[gmin_idx] += 1
+            self.votes[gmax_idx] += 1
+
         self.sort_votes()
 
     def mc_step_bs(self):
@@ -1419,3 +1457,49 @@ class IFFAlgorithmStreamingParallel:
         return self.data[idx].astype(np.float32)
 
 
+import cupy as cp  # GPU array
+
+class IFFAlgorithmGPU(IFFAlgorithm):
+    def compute(self):
+        for _ in range(self.n_samples):
+            # Génération du vecteur aléatoire BS ou MU
+            if self.random_gen == 0:
+                rnd_vec = self.rand_vect_bs()  # utilise tes fonctions CPU
+            else:
+                rnd_vec = self.rand_vect_mu()
+
+            rnd_vec = rnd_vec.astype(np.float32)
+            rnd_vec_gpu = cp.asarray(rnd_vec)  # envoyer sur GPU
+
+            gmin = 1e30
+            gmax = -1e30
+            gmin_idx = 0
+            gmax_idx = 0
+
+            # Streaming par blocs pour limiter la mémoire GPU
+            for i in range(0, self.npix, self.block_size):
+                block = self.data[i:i+self.block_size].astype(np.float32)
+                block_gpu = cp.asarray(block)
+
+                # Centrage par pixel
+                block_gpu -= cp.mean(block_gpu, axis=1, keepdims=True)
+
+                # Projection (GPU)
+                proj_gpu = block_gpu @ rnd_vec_gpu
+
+                # Min / max global
+                imin = int(cp.argmin(proj_gpu))
+                imax = int(cp.argmax(proj_gpu))
+
+                if proj_gpu[imin] < gmin:
+                    gmin = proj_gpu[imin]
+                    gmin_idx = i + imin
+                if proj_gpu[imax] > gmax:
+                    gmax = proj_gpu[imax]
+                    gmax_idx = i + imax
+
+            # Votes CPU (petit tableau, reste sur CPU)
+            self.votes[gmin_idx] += 1
+            self.votes[gmax_idx] += 1
+
+        self.sort_votes()
