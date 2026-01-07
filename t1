@@ -1209,4 +1209,118 @@ def get_freq(self):
     return indices, freqs
 
 
+class IFFAlgorithmStreaming:
+    def __init__(self, data, n_samples, random_gen=0, block_size=4096):
+        self.data = data                # memmap ou ndarray
+        self.npix, self.ncha = data.shape
+        self.n_samples = n_samples
+        self.random_gen = random_gen
+        self.block_size = block_size
+        self.votes = np.zeros(self.npix, dtype=np.int32)
+        self.freq = []
+
+    # -------------------------
+    # Générateurs aléatoires
+    # -------------------------
+    def rand_vect_bs(self):
+        if self.ncha % 2 == 1:
+            return rand_vec_bs_odd_numba(self.ncha)
+        else:
+            return rand_vec_bs_even_numba(self.ncha)
+
+    def rand_vect_mu(self):
+        v = np.random.normal(0, 1, self.ncha)
+        return v / np.linalg.norm(v)
+
+    # -------------------------
+    # IFF streaming
+    # -------------------------
+    def compute(self):
+        for _ in range(self.n_samples):
+            if self.random_gen == 0:
+                rnd_vec = self.rand_vect_bs()
+            else:
+                rnd_vec = self.rand_vect_mu()
+
+            gmin = 1e30
+            gmax = -1e30
+            gmin_idx = 0
+            gmax_idx = 0
+
+            # 🔥 STREAMING ICI
+            for i in range(0, self.npix, self.block_size):
+                block = self.data[i:i + self.block_size]
+
+                # centrage local (sans stocker data_centered)
+                block = block - block.mean(axis=1, keepdims=True)
+
+                proj = block @ rnd_vec   # petit tableau
+
+                imin = np.argmin(proj)
+                imax = np.argmax(proj)
+
+                if proj[imin] < gmin:
+                    gmin = proj[imin]
+                    gmin_idx = i + imin
+
+                if proj[imax] > gmax:
+                    gmax = proj[imax]
+                    gmax_idx = i + imax
+
+            self.votes[gmin_idx] += 1
+            self.votes[gmax_idx] += 1
+
+        self.sort_votes()
+
+    # -------------------------
+    # Post-traitement
+    # -------------------------
+    def sort_votes(self):
+        idx = np.nonzero(self.votes)[0]
+        freq = self.votes[idx]
+        order = np.argsort(-freq)
+        self.freq = [(int(idx[i]), int(freq[i])) for i in order]
+
+    def get_freq(self):
+        if not self.freq:
+            return np.array([]), np.array([])
+        indices, freqs = zip(*self.freq)
+        return np.array(indices), np.array(freqs)
+
+    def getspectrum(self, idx):
+        return self.data[idx]
+
+def group_vertices(self, correlconf=0.9):
+    self.freq_grouped = []
+    toprocess = self.freq.copy()
+
+    while toprocess:
+        ref_idx, ref_freq = toprocess.pop(0)
+        ref_spec = self.getspectrum(ref_idx)
+        ref_spec = ref_spec - ref_spec.mean()
+
+        group = [ref_idx]
+        total_freq = ref_freq
+
+        remaining = []
+
+        for idx, freq in toprocess:
+            spec = self.getspectrum(idx)
+            spec = spec - spec.mean()
+
+            corr = np.dot(ref_spec, spec) / (
+                np.linalg.norm(ref_spec) * np.linalg.norm(spec) + 1e-12
+            )
+
+            if corr > correlconf:
+                group.append(idx)
+                total_freq += freq
+            else:
+                remaining.append((idx, freq))
+
+        self.freq_grouped.append((group, total_freq))
+        toprocess = remaining
+
+    self.freq_grouped.sort(key=lambda x: -x[1])
+
 
