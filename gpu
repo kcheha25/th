@@ -1,0 +1,192 @@
+import cupy as cp
+import matplotlib.pyplot as plt
+import sif_parser
+from sif_parser.utils import extract_calibration
+
+file_path = "chemin/vers/fichier.sif"
+data, info = sif_parser.np_open(file_path)
+data = data[:, 0, :]
+print("Shape after flattening:", data.shape)
+
+height, width = 1280, 1280
+datacube = cp.array(data.reshape(height, width, -1), dtype=cp.float32)
+print("Datacube shape:", datacube.shape)
+
+wavelengths = extract_calibration(info)
+if wavelengths is None:
+    raise ValueError("Aucune calibration trouvée dans le fichier SIF")
+
+target_wl = 266.0
+idx = int(cp.argmin(cp.abs(cp.array(wavelengths) - target_wl)))
+print(f"Indice correspondant à {target_wl} nm : {idx}, longueur d'onde exacte : {wavelengths[idx]:.2f} nm")
+
+image_266 = cp.asnumpy(datacube[:, :, idx])
+plt.figure(figsize=(6, 5))
+plt.imshow(image_266, cmap='inferno')
+plt.colorbar(label='Intensité')
+plt.title(f'Cartographie à {wavelengths[idx]:.2f} nm')
+plt.show()
+
+BUCKET_SIZE = 16
+
+def rand_vec_bs(n):
+    nb = 1 + n // BUCKET_SIZE
+    max_points = n // 2
+    buckets = cp.zeros((nb, max_points, 3), dtype=cp.float32)
+    counts = cp.zeros(nb, dtype=cp.int32)
+    filled = 0
+    while filled < max_points:
+        a = 2.0 * cp.random.random() - 1.0
+        b = 2.0 * cp.random.random() - 1.0
+        s = a*a + b*b
+        if s <= 1.0:
+            bucket = int(s * nb)
+            if bucket >= nb:
+                bucket = nb - 1
+            idxb = counts[bucket]
+            buckets[bucket, idxb, 0] = a
+            buckets[bucket, idxb, 1] = b
+            buckets[bucket, idxb, 2] = s
+            counts[bucket] += 1
+            filled += 1
+    first_bucket = 0
+    while first_bucket < nb and counts[first_bucket] == 0:
+        first_bucket += 1
+    last_bucket = nb - 1
+    while last_bucket > 0 and counts[last_bucket] == 0:
+        last_bucket -= 1
+    a0, b0, s0 = buckets[first_bucket, 0, 0], buckets[first_bucket, 0, 1], buckets[first_bucket, 0, 2]
+    s = 1.0 / buckets[last_bucket, counts[last_bucket]-1, 2]
+    s = s / (1.0 - s * a0 * a0)
+    v = cp.zeros(n, dtype=cp.float32)
+    v[0] = a0 * cp.sqrt(s)
+    S_II = s0
+    idxv = 1
+    for b in range(first_bucket, last_bucket+1):
+        for j in range(1, counts[b]):
+            a, b_, s_ = buckets[b, j, 0], buckets[b, j, 1], buckets[b, j, 2]
+            S_I = S_II
+            S_II += s_
+            t = cp.sqrt((1.0 - S_I / S_II) * s)
+            v[idxv] = a * t
+            v[idxv+1] = b_ * t
+            idxv += 2
+    return v
+
+def remove_baseline_gpu(spec, width=5, niter=5):
+    w = 6*width + 1
+    mid = 3*width + 1
+    x = cp.arange(w) - mid
+    kernel = cp.exp(-0.5 * (x / width) ** 2)
+    kernel = kernel / cp.sum(kernel)
+    temp = spec.copy()
+    n = spec.size
+    for _ in range(niter):
+        out = cp.empty_like(spec)
+        for i in range(n):
+            kidx = cp.clip(cp.arange(i - mid, i - mid + w), 0, n-1)
+            conv = cp.sum(temp[kidx] * kernel)
+            out[i] = temp[i] if temp[i] < conv else conv
+        temp = out
+    return spec - temp
+
+def batch_correlation_gpu(ref_spec, specs):
+    ref_mean = cp.mean(ref_spec)
+    ref_std = cp.std(ref_spec)
+    ref_centered = ref_spec - ref_mean
+    specs_mean = cp.mean(specs, axis=1)
+    specs_std = cp.std(specs, axis=1)
+    specs_centered = specs - specs_mean[:, None]
+    corr = cp.sum(ref_centered * specs_centered, axis=1) / (ref_std * specs_std * specs.shape[1])
+    corr[specs_std == 0] = 0.0
+    corr[ref_std == 0] = 0.0
+    return corr
+
+class BkgCalculatorGPU:
+    def __init__(self, ncha, width=5, niter=5, kernel_type=1):
+        self.ncha = ncha
+        self.width = width
+        self.niter = niter
+        if kernel_type > 0:
+            w = 6*width + 1
+            mid = 3*width + 1
+            x = cp.arange(w) - mid
+            kernel = cp.exp(-0.5*(x/width)**2)
+        else:
+            w = 2*width + 1
+            kernel = cp.ones(w, dtype=cp.float32)
+        self.kernel = kernel / cp.sum(kernel)
+        self.kernel_type = kernel_type
+
+    def removebaseline(self, spec):
+        spec = cp.array(spec, dtype=cp.float32)
+        return remove_baseline_gpu(spec, self.width, self.niter)
+
+class IFFAlgorithmGPU:
+    def __init__(self, data, n_samples, random_gen=0):
+        self.data = data
+        self.npix, self.ncha = data.shape
+        self.n_samples = n_samples
+        self.random_gen = random_gen
+        self.votes = cp.zeros(self.npix, dtype=cp.int32)
+        self.data_centered = cp.zeros_like(self.data)
+        self.freq = []
+        self.freq_grouped = []
+
+    def center_data(self):
+        self.data_centered = self.data - cp.mean(self.data, axis=1, keepdims=True)
+
+    def compute(self):
+        self.center_data()
+        for i in range(self.n_samples):
+            rnd_vec = rand_vec_bs(self.ncha)
+            proj = self.data_centered @ rnd_vec
+            imin = int(cp.argmin(proj))
+            imax = int(cp.argmax(proj))
+            self.votes[imin] += 1
+            self.votes[imax] += 1
+        self.sort_votes()
+
+    def sort_votes(self):
+        idx = cp.nonzero(self.votes)[0]
+        freq = self.votes[idx]
+        sorted_idx = cp.argsort(-freq)
+        self.freq = [(int(idx[i]), int(freq[i])) for i in sorted_idx]
+
+    def getspectrum(self, idx):
+        return self.data[idx]
+
+    def group_vertices(self, correlconf=0.9, kernel=0, width=5, niter=5):
+        self.freq_grouped = []
+        toprocess = self.freq.copy()
+        if not toprocess:
+            return
+        if kernel > 0:
+            bkgc = BkgCalculatorGPU(self.ncha, width, niter, kernel)
+        while toprocess:
+            ref_idx, ref_freq = toprocess.pop(0)
+            ref_spec = self.getspectrum(ref_idx)
+            if kernel > 0:
+                ref_spec = bkgc.removebaseline(ref_spec)
+            if not toprocess:
+                self.freq_grouped.append(([ref_idx], ref_freq))
+                continue
+            indices, freqs = zip(*toprocess)
+            specs_stack = cp.stack([self.getspectrum(i) for i in indices])
+            if kernel > 0:
+                specs_stack = cp.stack([bkgc.removebaseline(s) for s in specs_stack])
+            corrs = batch_correlation_gpu(ref_spec, specs_stack)
+            mask = corrs > correlconf
+            group_indices = [ref_idx] + [indices[i] for i, m in enumerate(mask) if m]
+            total_freq = ref_freq + sum(freqs[i] for i, m in enumerate(mask) if m)
+            toprocess = [(i, f) for i, f in toprocess if i not in group_indices]
+            self.freq_grouped.append((group_indices, total_freq))
+        self.freq_grouped.sort(key=lambda x: -x[1])
+
+H, W, Z = datacube.shape
+data_2D = datacube.reshape(H*W, Z)
+iff_gpu = IFFAlgorithmGPU(data_2D, n_samples=500)
+iff_gpu.compute()
+print("Top votes GPU:", iff_gpu.freq[:10])
+iff_gpu.group_vertices(correlconf=0.9, kernel=1)
+print("Nombre de groupes formés GPU:", len(iff_gpu.freq_grouped))

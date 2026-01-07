@@ -1,0 +1,307 @@
+import numpy as np
+import cupy as cp
+import matplotlib.pyplot as plt
+import sif_parser
+from sif_parser.utils import extract_calibration
+from sklearn.decomposition import PCA
+
+file_path = "chemin/vers/fichier.sif"
+data, info = sif_parser.np_open(file_path)
+data = data[:, 0, :]
+print("Shape after flattening:", data.shape)
+
+height, width = 1280, 1280
+datacube = data.reshape(height, width, -1)
+print("Datacube shape:", datacube.shape)
+
+wavelengths = extract_calibration(info)
+if wavelengths is None:
+    raise ValueError("Aucune calibration trouvée dans le fichier SIF")
+
+target_wl = 266.0
+idx = np.argmin(np.abs(wavelengths - target_wl))
+print(f"Indice correspondant à {target_wl} nm : {idx}, longueur d'onde exacte : {wavelengths[idx]:.2f} nm")
+
+image_266 = datacube[:, :, idx]
+plt.figure(figsize=(6, 5))
+plt.imshow(image_266, cmap='inferno')
+plt.colorbar(label='Intensité')
+plt.title(f'Cartographie à {wavelengths[idx]:.2f} nm')
+plt.show()
+
+BUCKET_SIZE = 16
+import numpy as np
+from numba import njit, prange
+
+@njit
+def rand_vec_bs_odd_numba(n):
+    assert n % 2 == 1, "n doit être impair"
+    nb = 1 + n // BUCKET_SIZE
+    max_points = n // 2
+    buckets = np.zeros((nb, max_points, 3))
+    counts = np.zeros(nb, dtype=np.int64)
+    filled = 0
+    while filled < max_points:
+        a = 2.0 * np.random.rand() - 1.0
+        b = 2.0 * np.random.rand() - 1.0
+        s = a*a + b*b
+        if s <= 1.0:
+            bucket = int(s * nb)
+            if bucket >= nb:
+                bucket = nb - 1
+            idx = counts[bucket]
+            buckets[bucket, idx, 0] = a
+            buckets[bucket, idx, 1] = b
+            buckets[bucket, idx, 2] = s
+            counts[bucket] += 1
+            filled += 1
+    for b in range(nb):
+        c = counts[b]
+        if c > 1:
+            s_vals = buckets[b, :c, 2]
+            idx_sort = np.argsort(s_vals)
+            buckets[b, :c, :] = buckets[b, idx_sort, :]
+    first_bucket = 0
+    while first_bucket < nb and counts[first_bucket] == 0:
+        first_bucket += 1
+    last_bucket = nb - 1
+    while last_bucket > 0 and counts[last_bucket] == 0:
+        last_bucket -= 1
+    a0, b0, s0 = buckets[first_bucket, 0, 0], buckets[first_bucket, 0, 1], buckets[first_bucket, 0, 2]
+    s = 1.0 / buckets[last_bucket, counts[last_bucket]-1, 2]
+    s = s / (1.0 - s * a0 * a0)
+    v = np.zeros(n, dtype=np.float64)
+    v[0] = a0 * np.sqrt(s)
+    S_II = s0
+    idx = 1
+    for b in range(first_bucket, last_bucket+1):
+        for j in range(1, counts[b]):
+            a, b_, s_ = buckets[b, j, 0], buckets[b, j, 1], buckets[b, j, 2]
+            S_I = S_II
+            S_II += s_
+            t = np.sqrt((1.0 - S_I / S_II) * s)
+            v[idx] = a * t
+            v[idx+1] = b_ * t
+            idx += 2
+    return v
+
+@njit
+def rand_vec_bs_even_numba(n):
+    assert n % 2 == 0, "n doit être pair"
+    nb = 1 + n // BUCKET_SIZE
+    max_points = n // 2
+    buckets = np.zeros((nb, max_points, 3))
+    counts = np.zeros(nb, dtype=np.int64)
+    filled = 0
+    while filled < max_points:
+        a = 2.0 * np.random.rand() - 1.0
+        b = 2.0 * np.random.rand() - 1.0
+        s = a*a + b*b
+        if s <= 1.0:
+            bucket = int(s * nb)
+            if bucket >= nb:
+                bucket = nb - 1
+            idx = counts[bucket]
+            buckets[bucket, idx, 0] = a
+            buckets[bucket, idx, 1] = b
+            buckets[bucket, idx, 2] = s
+            counts[bucket] += 1
+            filled += 1
+    for b in range(nb):
+        c = counts[b]
+        if c > 1:
+            s_vals = buckets[b, :c, 2]
+            idx_sort = np.argsort(s_vals)
+            buckets[b, :c, :] = buckets[b, idx_sort, :]
+    last_bucket = nb - 1
+    while last_bucket > 0 and counts[last_bucket] == 0:
+        last_bucket -= 1
+    s = 1.0 / buckets[last_bucket, counts[last_bucket]-1, 2]
+    v = np.zeros(n, dtype=np.float64)
+    idx = 0
+    S_II = 0.0
+    for b in range(last_bucket+1):
+        for j in range(counts[b]):
+            a, b_, s_ = buckets[b, j, 0], buckets[b, j, 1], buckets[b, j, 2]
+            S_I = S_II
+            S_II += s_
+            t = np.sqrt((1.0 - S_I / S_II) * s)
+            v[idx] = a * t
+            v[idx+1] = b_ * t
+            idx += 2
+    return v
+
+@njit
+def F_alpha_numba(spec, kernel, niter):
+    n = spec.size
+    w = kernel.size
+    mid = w // 2
+    out = np.empty_like(spec)
+    temp = spec.copy()
+    for _ in range(niter):
+        for i in range(n):
+            sumval = 0.0
+            for j in range(w):
+                k = i - j + mid
+                if k < 0:
+                    k = 0
+                elif k >= n:
+                    k = n - 1
+                sumval += temp[k] * kernel[j]
+            out[i] = temp[i] if temp[i] < sumval else sumval
+        temp, out = out, temp
+    return temp
+
+@njit
+def remove_baseline_numba(spec, kernel, niter):
+    bkg = F_alpha_numba(spec, kernel, niter)
+    return spec - bkg
+
+@njit(parallel=True)
+def batch_correlation_numba(ref_spec, specs):
+    n_specs = specs.shape[0]
+    n_chan = specs.shape[1]
+    corr = np.empty(n_specs, dtype=np.float32)
+    ref_mean = ref_spec.mean()
+    ref_std = ref_spec.std()
+    ref_centered = ref_spec - ref_mean
+    for i in prange(n_specs):
+        s = specs[i]
+        s_mean = s.mean()
+        s_std = s.std()
+        if s_std == 0.0 or ref_std == 0.0:
+            corr[i] = 0.0
+        else:
+            s_centered = s - s_mean
+            corr[i] = np.sum(ref_centered * s_centered) / (ref_std * s_std * n_chan)
+    return corr
+
+class BkgCalculator:
+    def __init__(self, ncha, width=5, niter=5, kernel_type=1):
+        self.ncha = ncha
+        self.width = width
+        self.niter = niter
+        self.kernel_type = kernel_type
+        if kernel_type > 0:
+            self._widthkernel = 6 * width + 1
+            self._midkernel = 3 * width + 1
+            x = np.arange(self._widthkernel) - self._midkernel
+            kernel = np.exp(-0.5 * (x / width) ** 2)
+        else:
+            self._widthkernel = 2 * width + 1
+            self._midkernel = width + 1
+            kernel = np.ones(self._widthkernel, dtype=np.float32)
+        self.kernel = kernel.astype(np.float32) / kernel.sum()
+
+    def removebaseline(self, spec):
+        spec = np.array(spec, dtype=np.float32)
+        return remove_baseline_numba(spec, self.kernel, self.niter)
+
+class IFFAlgorithm:
+    def __init__(self, data, n_samples, random_gen=0):
+        self.data = data
+        self.npix, self.ncha = data.shape
+        self.n_samples = n_samples
+        self.random_gen = random_gen
+        self.votes = np.zeros(self.npix, dtype=int)
+        self.data_centered = np.zeros_like(self.data)
+        self.freq = []
+        self.freq_grouped = []
+
+    def set_random_gen(self, choice):
+        self.random_gen = choice
+
+    def center_data(self):
+        self.data_centered = self.data - self.data.mean(axis=1, keepdims=True)
+
+    def compute(self):
+        self.center_data()
+        for i in range(self.n_samples):
+            if self.random_gen == 0:
+                self.mc_step_bs()
+            else:
+                self.mc_step_wu()
+        self.sort_votes()
+
+    def mc_step_bs(self):
+        rnd_vec = self.rand_vect_bs()
+        proj = self.data_centered @ rnd_vec
+        imin = np.argmin(proj)
+        imax = np.argmax(proj)
+        self.votes[imin] += 1
+        self.votes[imax] += 1
+
+    def mc_step_wu(self):
+        rnd_vec = self.rand_vect_mu()
+        proj = self.data_centered @ rnd_vec
+        imin = np.argmin(proj)
+        imax = np.argmax(proj)
+        self.votes[imin] += 1
+        self.votes[imax] += 1
+
+    def sort_votes(self):
+        idx = np.nonzero(self.votes)[0]
+        freq = self.votes[idx]
+        sorted_idx = np.argsort(-freq)
+        self.freq = [(int(idx[i]), int(freq[i])) for i in sorted_idx]
+
+    def get_freq(self):
+        if not self.freq:
+            return np.array([]), np.array([])
+        indices, freqs = zip(*self.freq)
+        return np.array(indices, dtype=int), np.array(freqs, dtype=int)
+
+    def getspectrum(self, idx):
+        return self.data[idx]
+
+    def group_vertices(self, correlconf=0.9, kernel=0, width=5, niter=5):
+        self.freq_grouped = []
+        toprocess = self.freq.copy()
+        if not toprocess:
+            return
+        if kernel > 0:
+            bkgc = BkgCalculator(self.ncha, width, niter, kernel)
+        while toprocess:
+            ref_idx, ref_freq = toprocess.pop(0)
+            ref_spec = self.getspectrum(ref_idx)
+            ref_spec = bkgc.removebaseline(ref_spec) if kernel > 0 else ref_spec
+            if not toprocess:
+                self.freq_grouped.append(([ref_idx], ref_freq))
+                continue
+            indices, freqs = zip(*toprocess)
+            specs_stack = np.array([self.getspectrum(i) for i in indices], dtype=np.float32)
+            if kernel > 0:
+                specs_stack = np.array([bkgc.removebaseline(s) for s in specs_stack], dtype=np.float32)
+            corrs = batch_correlation_numba(ref_spec, specs_stack)
+            mask = corrs > correlconf
+            group_indices = [ref_idx] + [indices[i] for i, m in enumerate(mask) if m]
+            total_freq = ref_freq + sum(freqs[i] for i, m in enumerate(mask) if m)
+            toprocess = [(i, f) for i, f in toprocess if i not in group_indices]
+            self.freq_grouped.append((group_indices, total_freq))
+        self.freq_grouped.sort(key=lambda x: -x[1])
+
+    @staticmethod
+    def correl_coef(sp1, sp2):
+        return np.dot(sp1, sp2) / (np.linalg.norm(sp1) * np.linalg.norm(sp2))
+
+    def rand_vect_mu(self):
+        return np.random.uniform(-1, 1, self.ncha)
+
+    def rand_vect_bs(n):
+        if n % 2 == 1:
+            return rand_vec_bs_odd_numba(n)
+        else:
+            return rand_vec_bs_even_numba(n)
+
+H, W, Z = datacube.shape
+data_2D = datacube.reshape(H*W, Z)
+print("Shape pour IFF:", data_2D.shape)
+
+iff = IFFAlgorithm(data_2D, n_samples=500, random_gen=0)
+iff.compute()
+indices, freqs = iff.get_freq()
+print("Indices top 10 trouvés:", indices[:10])
+print("Votes correspondants:", freqs[:10])
+
+iff.group_vertices(correlconf=0.9)
+print("Nombre de groupes formés:", len(iff.freq_grouped))
