@@ -1,59 +1,77 @@
-La majorité des techniques de fusion, qu’elles soient classiques ou basées sur l’IA, ont été utilisées dans le domaine de la télédétection.
+https://pubmed.ncbi.nlm.nih.gov/41140601/#:~:text=Accurate%20classification%20of%20wolfberry%20geographical,over%20conventional%20methods%2C%20demonstrating%20its
 
-Il faudra réfléchir à l’adaptabilité de notre base de données par rapport aux différentes architectures présentées. Il faudra aussi se demander s’il est nécessaire d’ajouter des blocs de prétraitement et combien d’étapes de prétraitement sont nécessaires. Ces points devront être pris en compte pendant le développement.
+https://www.nature.com/articles/s41598-021-99220-0#:~:text=to%20verify%20the%20image%20registration,on%20the%20targeted%20classification%20problem
 
-Dans un premier temps, l’idée est de développer les modèles de classification, puis d’ajouter au fur et à mesure des blocs de prétraitement supplémentaires selon les besoins identifiés, pour améliorer les performances.
+https://www.mdpi.com/2304-8158/12/19/3621
 
-Il faudra également penser à se comparer à d’autres modèles existants, on pourra ainsi se situer en termes de performances par rapport aux techniques de transfert de connaissance qui traitent la fusion des données LiBS avec HSI-NIR (diapo 12).
+https://www.mdpi.com/2072-4292/13/21/4219
 
-Les architectures présentées utilisent plutôt une approche de classification à l’échelle du pixel (segmentation). On est dans un cas similaire.
+https://www.mdpi.com/2072-4292/17/6/1011
 
-En termes de résolution des données, on est d’environ 200 microns pour le NIR et à 1 mégapixel pour la LiBS.
+https://levir.buaa.edu.cn/static/pdfs/2023_bin_pan_unsupervised.pdf#:~:text=content,modal%20images%20and%20achieve%20nonrigid
+Unsupervised Multimodal Remote Sensing Image
+Registration via Domain Adaptation
 
-Un paramètre important à prendre en compte est la taille des images : si elles ne sont pas assez grandes, il est difficile d’aller loin avec les convolutions.
+https://www.mdpi.com/2072-4292/16/16/3082?utm_source=chatgpt.com
 
-En ce qui concerne la base de données, une grande partie des échantillons est prête (une quarantaine de plots sont prêts, il en reste une dizaine).
+https://www.sciencedirect.com/science/article/pii/S004896972406786X?utm_source=chatgpt.com
 
-Pour la LiBS, on aura environ 1 500 longueurs d’onde pertinentes par détecteur.
+https://www.nature.com/articles/s41597-024-03974-x?utm_source=chatgpt.com
 
-Si dans la littérature, les travaux marchent bien avec moins de longueurs d’onde que les nôtres, ça peut poser des limites côté coût de calcul. Comme on a plus de longueurs d’onde, on pourrait être limités de ce côté-là.
+https://arxiv.org/pdf/2507.23673
 
-Une faible résolution des images peut être un frein pour certaines pistes.
+https://arxiv.org/pdf/2502.17255
 
-Un bloc d’alignement et de correspondance pixel à pixel est obligatoire si on veut faire de la segmentation. 
+https://www.sciencedirect.com/science/article/abs/pii/S0956053X2500265X#:~:text=along%20with%20Linear%20Discriminant%20Analysis,ones%20also%20appears%20quite%20successful
 
-On pourra mieux discuter des blocs d’alignement une fois que les données seront entre nos mains et analysées.
+https://www.mdpi.com/2072-4292/17/5/938
 
-On a le choix entre deux options : soit faire des convolutions 3D, mais c’est très lourd, soit ajouter une couche 3D au début de l’extracteur de caractéristiques pour réduire la dimensionnalité, puis continuer avec des convolutions 2D.
+https://www.frontiersin.org/journals/ecology-and-evolution/articles/10.3389/fevo.2023.1201125/full
 
-Développer des modèles indépendants pour chaque modalité peut nous donner plus d’intuition sur la façon de décider comment fusionner les données.
+https://link.springer.com/article/10.1007/s10791-025-09774-0#:~:text=structures%20in%20remote%20sensing%20images,model%20for%20instance%20segmentation%2C%20where
 
-Pour valoriser la recherche bibliographique, l’objectif est de la soumettre sous forme de revue en se concentrant sur les modèles de fusion. Ce sera une revue de ce qui existe sur la fusion, et non pas un travail de benchmarking.
+https://academic.oup.com/bib/article/25/2/bbae029/7628265?login=false
 
-En termes d’organisation, Marwa, la directrice de thèse, pilotera toute la partie administrative et assurera la relecture des articles. Amine et Aurélie s’occuperont de l’orientation technique sur le Deep Learning et la Computer Vision. Charles sera en charge des analyses élémentaires et apportera son expertise dans le recyclage des plastiques. Loïc gérera la partie technique de la LiBS. Enfin, Marion gérera la partie HSI-NIR et assurera un suivi général sur toute la thèse.
+https://www.mdpi.com/2072-4292/17/13/2160
 
-Il a été décidé de faire un point IA avec Marion, Amine et Aurélie toutes les 2 à 3 semaines, et un point avec toute l’équipe toutes les 5 à 6 semaines.
+https://www.sciencedirect.com/science/article/abs/pii/S156625352400681X#:~:text=%E2%80%A2%20We%20propose%20an%20end,perception%2C%20even%20surpassing%20manual%20registration
 
-#####################################################################
+https://pmc.ncbi.nlm.nih.gov/articles/PMC8340619/#:~:text=approach%20leverages%20the%20deformation%20fields,can%20be%20summarized%20as%20follows
 
-Faire un état de l’art concernant les métriques
-Fournir des informations sur la taille des images (nombre de pixels) pour le HSI-NIR et la LiBS
-Vérifier si la volumétrie des données dans les publications est comparable à nos données, en se comparant au nombre de canaux.
-Préciser le nombre de longueurs d’onde dans les données HSI-NIR
-Voir comment accéder aux données HSI-NIR et comment en extraire les spectres.
-Regarder dans la littérature comment les problèmes d’alignement sont traités et comment les auteurs les résolvent.
-Faire une veille sur les modèles qui traitent la segmentation d’instances.
-Rediscuter de la revue : venir avec des idées et des propositions de plan, et faire les démarches pour identifier et contacter les journaux.
-Voir avec Marion pour l’organisation de la réunion de suivi de mars, afin de la programmer le même jour que le séminaire.
-Mettre à jour la zone Extranet en déposant les rapports, documents, comptes rendus, articles… (tout au long de la thèse)
-Faire une demande pour accéder au supercalculateur Orion.
-Voir avec Vincent Le Coq comment s’organiser pour l’utilisation des serveurs R05.
-Essayer de voir s’il serait possible de participer au workshop SCAI.
-Se renseigner sur les formations imposées par l’école doctorale et sur d’éventuels changements cette année.
-Essayer de voir avec l’école doctorale s’il y a des financements possible pour les écoles d’été.
-nvoyer un mail a CESI pour vérifier qu’ils acceptent les étudiants en PhD.
-Ajouter le CSI sur le Gantt.
-Trouver des noms et penser à les solliciter début été.
-Rediscuter de la stratégie de rédaction des articles.
-Ajouter la labellisation des données dans le Gantt.
-Finaliser la préparation des échantillons côté LiBS.
+https://www.sciencedirect.com/science/article/pii/S1566253525005615#:~:text=complementary%20attributes%20effectively,late%20fusion%20stage%20leverages%20a
+
+https://arxiv.org/pdf/2412.00302?#:~:text=Abstract%E2%80%94The%20integration%20of%20hyperspectral%20imaging,The%20proposed%20method
+
+https://www.mdpi.com/2072-4292/17/17/2923
+
+https://www.sciencedirect.com/science/article/abs/pii/S1566253524001039#:~:text=An%20unsupervised%20method%20named%20PLRDiff,is%20proposed%20for%20hyperspectral%20pansharpening
+
+https://www.sciencedirect.com/science/article/pii/S1569843225005709#:~:text=to%20these%20challenges%2C%20our%20proposed,BPD%29%2C%20which%20enables%20hierarchical
+
+https://www.nature.com/articles/s41598-024-51668-6?error=cookies_not_supported&code=72007219-1fcd-4e3c-90f0-57593af23e9f#:~:text=based%20on%20the%20downsampling%20technology,compared%20to%20the%20distinct
+
+https://www.frontiersin.org/journals/plant-science/articles/10.3389/fpls.2022.1098864/full
+
+https://www.mdpi.com/2072-4292/16/23/4389?utm_source=chatgpt.com
+
+https://arxiv.org/abs/2409.02675?utm_source=chatgpt.com
+
+https://arxiv.org/abs/2508.08183?utm_source=chatgpt.com
+
+https://arxiv.org/abs/2203.02503?utm_source=chatgpt.com
+
+https://www.sciencedirect.com/science/article/pii/S1569843224003091?utm_source=chatgpt.com
+
+https://dl.acm.org/doi/10.1145/3654823.3654908?utm_source=chatgpt.com
+
+https://www.sciencedirect.com/science/article/pii/S2590005625001572?utm_source=chatgpt.com
+
+https://arxiv.org/html/2407.01355v2?utm_source=chatgpt.com
+
+https://www.mdpi.com/2072-4292/13/24/5128?utm_source=chatgpt.com
+
+https://arxiv.org/abs/2006.06325?utm_source=chatgpt.com
+
+https://arxiv.org/abs/2003.08073?utm_source=chatgpt.com
+
+https://www.sciencedirect.com/science/article/abs/pii/S1566253523000441?utm_source=chatgpt.com
