@@ -326,3 +326,344 @@ print("Votes correspondants:", freqs[:10])
 
 iff.group_vertices(correlconf=0.9)
 print("Nombre de groupes formés:", len(iff.freq_grouped))
+
+
+
+3#################################
+use_gpu = torch.cuda.is_available()
+device = torch.device("cuda" if use_gpu else "cpu")
+data_2D = torch.tensor(data_2D, dtype=torch.float32, device="cpu")
+
+class IFFAlgorithm:
+    def __init__(self, data, n_samples=100, random_gen=0, batch_size=20):
+        self.data_cpu = data                      # CPU
+        self.npix, self.ncha = data.shape
+        self.n_samples = n_samples                # ⬅ réduit
+        self.random_gen = random_gen
+        self.batch_size = batch_size
+
+        self.votes = torch.zeros(self.npix, dtype=torch.int32)
+        self.freq = []
+        self.freq_grouped = []
+
+        # -------- Pré-génération des vecteurs aléatoires --------
+        self.random_vectors = []
+        for _ in range(n_samples):
+            if random_gen == 0:
+                v = self.rand_vect_bs()
+            else:
+                v = self.rand_vect_mu()
+            self.random_vectors.append(v)
+
+    # ---------------------------
+    def center_data(self):
+        mean = self.data_cpu.mean(dim=1, keepdim=True)
+        self.data_centered_cpu = self.data_cpu - mean
+
+    # ---------------------------
+    def compute(self):
+        self.center_data()
+
+        with torch.no_grad():   # 🔥 CRITIQUE
+            for i in range(0, self.n_samples, self.batch_size):
+
+                vecs = self.random_vectors[i:i+self.batch_size]
+                V = torch.stack(vecs).to(device)           # (B, Z)
+
+                data_gpu = self.data_centered_cpu.to(device)
+                proj = data_gpu @ V.T                      # (Npix, B)
+
+                imin = torch.argmin(proj, dim=0)
+                imax = torch.argmax(proj, dim=0)
+
+                for j in range(len(imin)):
+                    self.votes[imin[j]] += 1
+                    self.votes[imax[j]] += 1
+
+                del proj, data_gpu, V
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        self.sort_votes()
+
+    # ---------------------------
+    def sort_votes(self):
+        idx = torch.nonzero(self.votes).squeeze()
+        freq = self.votes[idx]
+        order = torch.argsort(-freq)
+        self.freq = [(int(idx[i]), int(freq[i])) for i in order]
+
+    # ---------------------------
+    def get_freq(self):
+        if not self.freq:
+            return torch.tensor([]), torch.tensor([])
+        i, f = zip(*self.freq)
+        return torch.tensor(i), torch.tensor(f)
+
+    # ---------------------------
+    def getspectrum(self, idx):
+        return self.data_cpu[idx]
+
+    # ---------------------------
+    def rand_vect_mu(self):
+        return 2 * torch.rand(self.ncha) - 1
+
+    def rand_vect_bs(self):
+        if self.ncha % 2 == 1:
+            return rand_vec_bs_odd(self.ncha).cpu()
+        else:
+            return rand_vec_bs_even(self.ncha).cpu()
+
+def group_vertices(self, correlconf=0.9, kernel=0, width=5, niter=5):
+    self.freq_grouped = []
+    toprocess = self.freq.copy()
+    if not toprocess:
+        return
+
+    if kernel > 0:
+        bkgc = BkgCalculator(self.ncha, width, niter, kernel)
+
+    with torch.no_grad():
+        while toprocess:
+            ref_idx, ref_freq = toprocess.pop(0)
+            ref_spec = self.getspectrum(ref_idx)
+
+            if kernel > 0:
+                ref_spec = bkgc.removebaseline(ref_spec)
+
+            if not toprocess:
+                self.freq_grouped.append(([ref_idx], ref_freq))
+                continue
+
+            indices, freqs = zip(*toprocess)
+            specs = torch.stack([self.getspectrum(i) for i in indices])
+
+            if kernel > 0:
+                specs = torch.stack([bkgc.removebaseline(s) for s in specs])
+
+            ref_c = ref_spec - ref_spec.mean()
+            specs_c = specs - specs.mean(dim=1, keepdim=True)
+
+            ref_std = ref_c.norm()
+            specs_std = specs_c.norm(dim=1)
+
+            corrs = (specs_c @ ref_c) / (specs_std * ref_std)
+            mask = corrs > correlconf
+
+            group_indices = [ref_idx] + [indices[i] for i,m in enumerate(mask) if m]
+            total_freq = ref_freq + sum(freqs[i] for i,m in enumerate(mask) if m)
+
+            group_set = set(group_indices)
+            toprocess = [(i,f) for i,f in toprocess if i not in group_set]
+
+            self.freq_grouped.append((group_indices, total_freq))
+
+    self.freq_grouped.sort(key=lambda x: -x[1])
+
+
+
+import torch
+
+# ============================================================
+# Configuration device
+# ============================================================
+use_gpu = torch.cuda.is_available()
+device = torch.device("cuda" if use_gpu else "cpu")
+
+# ⚠️ data_2D DOIT rester sur CPU (obligatoire pour gros cubes)
+data_2D = torch.tensor(data_2D, dtype=torch.float32, device="cpu", pin_memory=True)
+
+# ============================================================
+# IFF Algorithm (optimisé, sans changer la mathématique)
+# ============================================================
+class IFFAlgorithm:
+    def __init__(
+        self,
+        data,
+        n_samples=100,
+        random_gen=0,
+        batch_size_vec=20,
+        batch_size_pix=100_000,
+        use_fp16=True
+    ):
+        # -------- Données --------
+        self.data_cpu = data                      # CPU uniquement
+        self.npix, self.ncha = data.shape
+
+        # -------- Paramètres IFF --------
+        self.n_samples = n_samples
+        self.random_gen = random_gen
+        self.batch_size_vec = batch_size_vec
+        self.batch_size_pix = batch_size_pix
+        self.use_fp16 = use_fp16 and use_gpu
+
+        # -------- Votes --------
+        self.votes = torch.zeros(self.npix, dtype=torch.int32)
+        self.freq = []
+        self.freq_grouped = []
+
+        # -------- Pré-génération des vecteurs aléatoires (CPU) --------
+        self.random_vectors = []
+        for _ in range(n_samples):
+            if random_gen == 0:
+                v = self.rand_vect_bs()
+            else:
+                v = self.rand_vect_mu()
+            self.random_vectors.append(v)
+
+    # ============================================================
+    # Centrage spectral (CPU)
+    # ============================================================
+    def center_data(self):
+        mean = self.data_cpu.mean(dim=1, keepdim=True)
+        self.data_centered_cpu = self.data_cpu - mean
+
+        if self.use_fp16:
+            self.data_centered_cpu = self.data_centered_cpu.half()
+
+    # ============================================================
+    # IFF principal (streaming GPU, OOM safe)
+    # ============================================================
+    def compute(self):
+        self.center_data()
+
+        dtype_gpu = torch.float16 if self.use_fp16 else torch.float32
+
+        with torch.no_grad():
+            for i in range(0, self.n_samples, self.batch_size_vec):
+
+                # -------- Batch de vecteurs --------
+                vecs = self.random_vectors[i:i + self.batch_size_vec]
+                V = torch.stack(vecs).to(device, dtype=dtype_gpu)  # (B, Z)
+
+                # -------- Min / Max globaux --------
+                B = V.shape[0]
+                min_val = torch.full((B,), float("inf"), device=device)
+                max_val = torch.full((B,), -float("inf"), device=device)
+                imin_global = torch.zeros(B, dtype=torch.long, device=device)
+                imax_global = torch.zeros(B, dtype=torch.long, device=device)
+
+                # -------- Streaming pixels --------
+                for p in range(0, self.npix, self.batch_size_pix):
+                    block = self.data_centered_cpu[p:p + self.batch_size_pix]
+                    block = block.to(device, non_blocking=True)
+
+                    proj = block @ V.T  # (P, B)
+
+                    vmin, imin = proj.min(dim=0)
+                    vmax, imax = proj.max(dim=0)
+
+                    mask = vmin < min_val
+                    min_val[mask] = vmin[mask]
+                    imin_global[mask] = imin[mask] + p
+
+                    mask = vmax > max_val
+                    max_val[mask] = vmax[mask]
+                    imax_global[mask] = imax[mask] + p
+
+                    del proj, block
+
+                # -------- Votes --------
+                for j in range(B):
+                    self.votes[imin_global[j].item()] += 1
+                    self.votes[imax_global[j].item()] += 1
+
+                del V, min_val, max_val, imin_global, imax_global
+
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        self.sort_votes()
+
+    # ============================================================
+    # Tri des votes
+    # ============================================================
+    def sort_votes(self):
+        idx = torch.nonzero(self.votes).squeeze()
+        freq = self.votes[idx]
+        order = torch.argsort(-freq)
+        self.freq = [(int(idx[i]), int(freq[i])) for i in order]
+
+    # ============================================================
+    def get_freq(self):
+        if not self.freq:
+            return torch.tensor([]), torch.tensor([])
+        i, f = zip(*self.freq)
+        return torch.tensor(i), torch.tensor(f)
+
+    # ============================================================
+    def getspectrum(self, idx):
+        return self.data_cpu[idx]
+
+    # ============================================================
+    # Générateurs aléatoires (INCHANGÉS mathématiquement)
+    # ============================================================
+    def rand_vect_mu(self):
+        return 2 * torch.rand(self.ncha) - 1
+
+    def rand_vect_bs(self):
+        if self.ncha % 2 == 1:
+            return rand_vec_bs_odd(self.ncha).cpu()
+        else:
+            return rand_vec_bs_even(self.ncha).cpu()
+
+    # ============================================================
+    # Groupement (batché CPU, OOM safe)
+    # ============================================================
+    def group_vertices(self, correlconf=0.9, kernel=0, width=5, niter=5):
+        self.freq_grouped = []
+        toprocess = self.freq.copy()
+        if not toprocess:
+            return
+
+        if kernel > 0:
+            bkgc = BkgCalculator(self.ncha, width, niter, kernel)
+
+        BATCH = 256  # batch corrélation
+
+        with torch.no_grad():
+            while toprocess:
+                ref_idx, ref_freq = toprocess.pop(0)
+                ref_spec = self.getspectrum(ref_idx)
+
+                if kernel > 0:
+                    ref_spec = bkgc.removebaseline(ref_spec)
+
+                if not toprocess:
+                    self.freq_grouped.append(([ref_idx], ref_freq))
+                    continue
+
+                group_indices = [ref_idx]
+                total_freq = ref_freq
+
+                ref_c = ref_spec - ref_spec.mean()
+                ref_std = ref_c.norm()
+
+                remaining = []
+
+                for i in range(0, len(toprocess), BATCH):
+                    chunk = toprocess[i:i + BATCH]
+                    indices, freqs = zip(*chunk)
+
+                    specs = torch.stack([self.getspectrum(j) for j in indices])
+
+                    if kernel > 0:
+                        specs = torch.stack([bkgc.removebaseline(s) for s in specs])
+
+                    specs_c = specs - specs.mean(dim=1, keepdim=True)
+                    specs_std = specs_c.norm(dim=1)
+
+                    corrs = (specs_c @ ref_c) / (specs_std * ref_std)
+                    mask = corrs > correlconf
+
+                    for j, m in enumerate(mask):
+                        if m:
+                            group_indices.append(indices[j])
+                            total_freq += freqs[j]
+                        else:
+                            remaining.append((indices[j], freqs[j]))
+
+                self.freq_grouped.append((group_indices, total_freq))
+                toprocess = remaining
+
+        self.freq_grouped.sort(key=lambda x: -x[1])
