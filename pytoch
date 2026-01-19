@@ -759,3 +759,1070 @@ conda --version
 conda env create --prefix /home/user/envs/mon_env --file /home/user/mon_env.yml --offline
 conda activate /home/user/envs/mon_env
 python -c "import numpy, pandas; print(numpy.__version__, pandas.__version__)"
+
+
+import torch
+import matplotlib.pyplot as plt
+import sif_parser
+from sif_parser.utils import extract_calibration
+
+# ============================================================
+# CONFIG
+# ============================================================
+BUCKET_SIZE = 16
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.manual_seed(0)
+
+# ============================================================
+# CHARGEMENT DES DONNÉES
+# ============================================================
+file_path = "chemin/vers/fichier.sif"
+data, info = sif_parser.np_open(file_path)
+data = data[:, 0, :]
+
+H, W = 150, 150
+datacube = torch.tensor(data.reshape(H, W, -1), dtype=torch.float32)
+H, W, Z = datacube.shape
+data_2D = datacube.reshape(H * W, Z).to(device)
+
+wavelengths = extract_calibration(info)
+target_wl = 266.0
+idx = torch.argmin(torch.abs(torch.tensor(wavelengths) - target_wl)).item()
+
+plt.imshow(datacube[:, :, idx], cmap="inferno")
+plt.colorbar()
+plt.title(f"{wavelengths[idx]:.2f} nm")
+plt.show()
+
+# ============================================================
+# RANDOM VECTOR BS (FIDÈLE NUMBA)
+# ============================================================
+def rand_vec_bs(n):
+    nb = 1 + n // BUCKET_SIZE
+    max_points = n // 2
+
+    buckets = torch.zeros((nb, max_points, 3), device=device)
+    counts = torch.zeros(nb, dtype=torch.int64, device=device)
+
+    filled = 0
+    while filled < max_points:
+        a = 2 * torch.rand((), device=device) - 1
+        b = 2 * torch.rand((), device=device) - 1
+        s = a * a + b * b
+        if s <= 1:
+            bucket = min(int(s.item() * nb), nb - 1)
+            idx = counts[bucket]
+            buckets[bucket, idx, 0] = a
+            buckets[bucket, idx, 1] = b
+            buckets[bucket, idx, 2] = s
+            counts[bucket] += 1
+            filled += 1
+
+    for b in range(nb):
+        c = counts[b]
+        if c > 1:
+            svals = buckets[b, :c, 2]
+            order = torch.argsort(svals)
+            buckets[b, :c] = buckets[b, order]
+
+    last_bucket = nb - 1
+    while last_bucket > 0 and counts[last_bucket] == 0:
+        last_bucket -= 1
+
+    s = 1.0 / buckets[last_bucket, counts[last_bucket] - 1, 2]
+
+    v = torch.zeros(n, device=device)
+    idx = 0
+    S_II = 0.0
+
+    for b in range(last_bucket + 1):
+        for j in range(counts[b]):
+            a, b_, s_ = buckets[b, j]
+            S_I = S_II
+            S_II += s_
+            t = torch.sqrt((1.0 - S_I / S_II) * s)
+            v[idx] = a * t
+            v[idx + 1] = b_ * t
+            idx += 2
+
+    return v
+
+# ============================================================
+# IFF GPU
+# ============================================================
+class IFFAlgorithm:
+    def __init__(self, data, n_samples=500):
+        self.data = data
+        self.npix, self.ncha = data.shape
+        self.n_samples = n_samples
+        self.votes = torch.zeros(self.npix, dtype=torch.int32, device=device)
+        self.freq = []
+        self.freq_grouped = []
+
+    def center_data(self):
+        self.data_centered = self.data - self.data.mean(dim=1, keepdim=True)
+
+    def compute(self):
+        self.center_data()
+
+        with torch.no_grad():
+            for _ in range(self.n_samples):
+                v = rand_vec_bs(self.ncha)
+                proj = self.data_centered @ v
+                imin = torch.argmin(proj)
+                imax = torch.argmax(proj)
+                self.votes[imin] += 1
+                self.votes[imax] += 1
+
+        self.sort_votes()
+
+    def sort_votes(self):
+        idx = torch.nonzero(self.votes).squeeze()
+        freq = self.votes[idx]
+        order = torch.argsort(-freq)
+        self.freq = [(int(idx[i]), int(freq[i])) for i in order]
+
+    def get_freq(self):
+        if not self.freq:
+            return torch.tensor([]), torch.tensor([])
+        i, f = zip(*self.freq)
+        return torch.tensor(i), torch.tensor(f)
+
+    def getspectrum(self, idx):
+        return self.data[idx]
+
+    # ========================================================
+    # GROUP VERTICES (RIGOUREUSEMENT IDENTIQUE NUMBA)
+    # ========================================================
+    def group_vertices(self, correlconf=0.9):
+        self.freq_grouped = []
+        toprocess = self.freq.copy()
+
+        while toprocess:
+            ref_idx, ref_freq = toprocess.pop(0)
+            ref = self.getspectrum(ref_idx)
+            ref_c = ref - ref.mean()
+            ref_std = ref_c.std()
+
+            if not toprocess:
+                self.freq_grouped.append(([ref_idx], ref_freq))
+                continue
+
+            indices, freqs = zip(*toprocess)
+            specs = torch.stack([self.getspectrum(i) for i in indices])
+
+            specs_c = specs - specs.mean(dim=1, keepdim=True)
+            specs_std = specs_c.std(dim=1)
+
+            corrs = (specs_c @ ref_c) / (ref_std * specs_std * self.ncha)
+            mask = corrs > correlconf
+
+            group_idx = [ref_idx] + [indices[i] for i, m in enumerate(mask) if m]
+            total_freq = ref_freq + sum(freqs[i] for i, m in enumerate(mask) if m)
+
+            group_set = set(group_idx)
+            toprocess = [(i, f) for i, f in toprocess if i not in group_set]
+
+            self.freq_grouped.append((group_idx, total_freq))
+
+        self.freq_grouped.sort(key=lambda x: -x[1])
+
+# ============================================================
+# EXECUTION
+# ============================================================
+iff = IFFAlgorithm(data_2D, n_samples=500)
+iff.compute()
+
+indices, freqs = iff.get_freq()
+print("Top 10 indices:", indices[:10])
+print("Top 10 votes:", freqs[:10])
+
+iff.group_vertices(correlconf=0.9)
+print("Nombre de groupes:", len(iff.freq_grouped))
+
+
+
+##############################################33
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import sif_parser
+from sif_parser.utils import extract_calibration
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BUCKET_SIZE = 16
+
+def rand_vec_bs_odd(n):
+    assert n % 2 == 1
+    nb = 1 + n // BUCKET_SIZE
+    max_points = n // 2
+
+    buckets = torch.zeros((nb, max_points, 3), device=device)
+    counts = torch.zeros(nb, dtype=torch.long, device=device)
+
+    filled = 0
+    while filled < max_points:
+        a = 2.0 * torch.rand((), device=device) - 1.0
+        b = 2.0 * torch.rand((), device=device) - 1.0
+        s = a * a + b * b
+        if s <= 1.0:
+            bucket = min(int(s.item() * nb), nb - 1)
+            idx = counts[bucket]
+            buckets[bucket, idx, 0] = a
+            buckets[bucket, idx, 1] = b
+            buckets[bucket, idx, 2] = s
+            counts[bucket] += 1
+            filled += 1
+
+    for b in range(nb):
+        c = counts[b]
+        if c > 1:
+            order = torch.argsort(buckets[b, :c, 2])
+            buckets[b, :c] = buckets[b, order]
+
+    first_bucket = 0
+    while first_bucket < nb and counts[first_bucket] == 0:
+        first_bucket += 1
+
+    last_bucket = nb - 1
+    while last_bucket > 0 and counts[last_bucket] == 0:
+        last_bucket -= 1
+
+    a0, b0, s0 = buckets[first_bucket, 0]
+    s = 1.0 / buckets[last_bucket, counts[last_bucket]-1, 2]
+    s = s / (1.0 - s * a0 * a0)
+
+    v = torch.zeros(n, device=device)
+    v[0] = a0 * torch.sqrt(s)
+
+    S_II = s0
+    idx = 1
+    for b in range(first_bucket, last_bucket + 1):
+        for j in range(1, counts[b]):
+            a, b_, s_ = buckets[b, j]
+            S_I = S_II
+            S_II += s_
+            t = torch.sqrt((1.0 - S_I / S_II) * s)
+            v[idx] = a * t
+            v[idx + 1] = b_ * t
+            idx += 2
+
+    return v
+
+def rand_vec_bs_even(n):
+    assert n % 2 == 0
+    nb = 1 + n // BUCKET_SIZE
+    max_points = n // 2
+
+    buckets = torch.zeros((nb, max_points, 3), device=device)
+    counts = torch.zeros(nb, dtype=torch.long, device=device)
+
+    filled = 0
+    while filled < max_points:
+        a = 2.0 * torch.rand((), device=device) - 1.0
+        b = 2.0 * torch.rand((), device=device) - 1.0
+        s = a * a + b * b
+        if s <= 1.0:
+            bucket = min(int(s.item() * nb), nb - 1)
+            idx = counts[bucket]
+            buckets[bucket, idx, 0] = a
+            buckets[bucket, idx, 1] = b
+            buckets[bucket, idx, 2] = s
+            counts[bucket] += 1
+            filled += 1
+
+    for b in range(nb):
+        c = counts[b]
+        if c > 1:
+            order = torch.argsort(buckets[b, :c, 2])
+            buckets[b, :c] = buckets[b, order]
+
+    last_bucket = nb - 1
+    while last_bucket > 0 and counts[last_bucket] == 0:
+        last_bucket -= 1
+
+    s = 1.0 / buckets[last_bucket, counts[last_bucket]-1, 2]
+
+    v = torch.zeros(n, device=device)
+    idx = 0
+    S_II = 0.0
+
+    for b in range(last_bucket + 1):
+        for j in range(counts[b]):
+            a, b_, s_ = buckets[b, j]
+            S_I = S_II
+            S_II += s_
+            t = torch.sqrt((1.0 - S_I / S_II) * s)
+            v[idx] = a * t
+            v[idx + 1] = b_ * t
+            idx += 2
+
+    return v
+
+class IFFAlgorithm:
+    def __init__(self, data, n_samples, random_gen=0):
+        self.data = data.to(device)
+        self.npix, self.ncha = data.shape
+        self.n_samples = n_samples
+        self.random_gen = random_gen
+        self.votes = torch.zeros(self.npix, dtype=torch.int32, device=device)
+        self.freq = []
+
+    def center_data(self):
+        self.data_centered = self.data - self.data.mean(dim=1, keepdim=True)
+
+    def rand_vect_bs(self):
+        return rand_vec_bs_odd(self.ncha) if self.ncha % 2 else rand_vec_bs_even(self.ncha)
+
+    def rand_vect_mu(self):
+        return 2 * torch.rand(self.ncha, device=device) - 1
+
+    def compute(self):
+        self.center_data()
+        with torch.no_grad():
+            for _ in range(self.n_samples):
+                v = self.rand_vect_bs() if self.random_gen == 0 else self.rand_vect_mu()
+                proj = self.data_centered @ v
+                self.votes[torch.argmin(proj)] += 1
+                self.votes[torch.argmax(proj)] += 1
+        self.sort_votes()
+
+    def sort_votes(self):
+        idx = torch.nonzero(self.votes).squeeze()
+        freq = self.votes[idx]
+        order = torch.argsort(-freq)
+        self.freq = [(int(idx[i]), int(freq[i])) for i in order]
+####################################3
+
+import torch
+import matplotlib.pyplot as plt
+import sif_parser
+from sif_parser.utils import extract_calibration
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BUCKET_SIZE = 16
+
+# =========================
+# Fonctions Monte-Carlo BS odd/even
+# =========================
+def rand_vec_bs_odd(n):
+    assert n % 2 == 1, "n doit être impair"
+    nb = 1 + n // BUCKET_SIZE
+    max_points = n // 2
+
+    buckets = torch.zeros((nb, max_points, 3), device=device)
+    counts = torch.zeros(nb, dtype=torch.long, device=device)
+
+    filled = 0
+    while filled < max_points:
+        a = 2*torch.rand((), device=device)-1
+        b = 2*torch.rand((), device=device)-1
+        s = a**2 + b**2
+        if s <= 1.0:
+            bucket = min(int((s*nb).item()), nb-1)
+            idx = counts[bucket]
+            buckets[bucket, idx, 0] = a
+            buckets[bucket, idx, 1] = b
+            buckets[bucket, idx, 2] = s
+            counts[bucket] += 1
+            filled += 1
+
+    # Tri par s dans chaque bucket
+    for b in range(nb):
+        c = counts[b]
+        if c > 1:
+            order = torch.argsort(buckets[b,:c,2])
+            buckets[b,:c,:] = buckets[b, order, :]
+
+    # First et last bucket non vide
+    first_bucket = 0
+    while first_bucket<nb and counts[first_bucket]==0:
+        first_bucket+=1
+    last_bucket = nb-1
+    while last_bucket>0 and counts[last_bucket]==0:
+        last_bucket-=1
+
+    a0,b0,s0 = buckets[first_bucket,0]
+    s = 1.0 / buckets[last_bucket, counts[last_bucket]-1,2]
+    s = s / (1.0 - s*a0**2)
+
+    v = torch.zeros(n, device=device)
+    v[0] = a0 * torch.sqrt(s)
+
+    S_II = s0
+    idx = 1
+    for b in range(first_bucket,last_bucket+1):
+        for j in range(1, counts[b]):
+            a_,b_,s_ = buckets[b,j]
+            S_I = S_II
+            S_II += s_
+            t = torch.sqrt((1-S_I/S_II)*s)
+            v[idx] = a_ * t
+            v[idx+1] = b_ * t
+            idx += 2
+    return v
+
+def rand_vec_bs_even(n):
+    assert n % 2 == 0, "n doit être pair"
+    nb = 1 + n // BUCKET_SIZE
+    max_points = n // 2
+
+    buckets = torch.zeros((nb, max_points, 3), device=device)
+    counts = torch.zeros(nb, dtype=torch.long, device=device)
+
+    filled = 0
+    while filled < max_points:
+        a = 2*torch.rand((), device=device)-1
+        b = 2*torch.rand((), device=device)-1
+        s = a**2 + b**2
+        if s <= 1.0:
+            bucket = min(int((s*nb).item()), nb-1)
+            idx = counts[bucket]
+            buckets[bucket, idx, 0] = a
+            buckets[bucket, idx, 1] = b
+            buckets[bucket, idx, 2] = s
+            counts[bucket] += 1
+            filled += 1
+
+    # Tri par s dans chaque bucket
+    for b in range(nb):
+        c = counts[b]
+        if c > 1:
+            order = torch.argsort(buckets[b,:c,2])
+            buckets[b,:c,:] = buckets[b, order, :]
+
+    # Last bucket non vide
+    last_bucket = nb-1
+    while last_bucket>0 and counts[last_bucket]==0:
+        last_bucket-=1
+
+    s = 1.0 / buckets[last_bucket, counts[last_bucket]-1,2]
+
+    v = torch.zeros(n, device=device)
+    idx = 0
+    S_II = 0.0
+    for b in range(last_bucket+1):
+        for j in range(counts[b]):
+            a_,b_,s_ = buckets[b,j]
+            S_I = S_II
+            S_II += s_
+            t = torch.sqrt((1-S_I/S_II)*s)
+            v[idx] = a_ * t
+            v[idx+1] = b_ * t
+            idx += 2
+    return v
+
+# =========================
+# Baseline / kernel GPU
+# =========================
+class BkgCalculator:
+    def __init__(self, ncha, width=5, niter=5, kernel_type=1):
+        self.ncha = ncha
+        self.width = width
+        self.niter = niter
+        self.kernel_type = kernel_type
+        if kernel_type>0:
+            self._widthkernel = 6*width+1
+            self._midkernel = 3*width+1
+            x = torch.arange(self._widthkernel, device=device) - self._midkernel
+            kernel = torch.exp(-0.5*(x/width)**2)
+        else:
+            self._widthkernel = 2*width+1
+            self._midkernel = width+1
+            kernel = torch.ones(self._widthkernel, device=device)
+        self.kernel = kernel / kernel.sum()
+
+    def removebaseline(self, spec):
+        spec = spec.to(device)
+        temp = spec.clone()
+        for _ in range(self.niter):
+            out = torch.zeros_like(spec)
+            for i in range(spec.size(0)):
+                sumval = 0.0
+                for j in range(self.kernel.size(0)):
+                    k = i - j + self._midkernel
+                    k = min(max(k.item(),0), spec.size(0)-1)
+                    sumval += temp[k]*self.kernel[j]
+                out[i] = temp[i] if temp[i]<sumval else sumval
+            temp = out
+        return spec-temp
+
+# =========================
+# Classe IFF GPU
+# =========================
+class IFFAlgorithm:
+    def __init__(self, data, n_samples, random_gen=0):
+        self.data = data.to(device)
+        self.npix, self.ncha = data.shape
+        self.n_samples = n_samples
+        self.random_gen = random_gen
+        self.votes = torch.zeros(self.npix, dtype=torch.int32, device=device)
+        self.data_centered = torch.zeros_like(self.data)
+        self.freq = []
+        self.freq_grouped = []
+
+    def set_random_gen(self, choice):
+        self.random_gen = choice
+
+    def center_data(self):
+        self.data_centered = self.data - self.data.mean(dim=1, keepdim=True)
+
+    def rand_vect_bs(self):
+        return rand_vec_bs_odd(self.ncha) if self.ncha%2==1 else rand_vec_bs_even(self.ncha)
+
+    def rand_vect_mu(self):
+        return 2*torch.rand(self.ncha, device=device)-1
+
+    # --------------------------
+    # Monte-Carlo
+    # --------------------------
+    def mc_step_bs(self):
+        rnd_vec = self.rand_vect_bs()
+        proj = self.data_centered @ rnd_vec
+        self.votes[torch.argmin(proj)] += 1
+        self.votes[torch.argmax(proj)] += 1
+
+    def mc_step_wu(self):
+        rnd_vec = self.rand_vect_mu()
+        proj = self.data_centered @ rnd_vec
+        self.votes[torch.argmin(proj)] += 1
+        self.votes[torch.argmax(proj)] += 1
+
+    # --------------------------
+    # Compute
+    # --------------------------
+    def compute(self):
+        self.center_data()
+        with torch.no_grad():
+            for _ in range(self.n_samples):
+                if self.random_gen==0:
+                    self.mc_step_bs()
+                else:
+                    self.mc_step_wu()
+        self.sort_votes()
+
+    def sort_votes(self):
+        idx = torch.nonzero(self.votes).squeeze()
+        freq = self.votes[idx]
+        order = torch.argsort(-freq)
+        self.freq = [(int(idx[i]), int(freq[i])) for i in order]
+
+    def get_freq(self):
+        if not self.freq:
+            return torch.tensor([]), torch.tensor([])
+        indices, freqs = zip(*self.freq)
+        return torch.tensor(indices, device=device), torch.tensor(freqs, device=device)
+
+    def getspectrum(self, idx):
+        return self.data[idx]
+
+    # --------------------------
+    # group_vertices (corrcoef)
+    # --------------------------
+    def group_vertices(self, correlconf=0.9, kernel=0, width=5, niter=5):
+        self.freq_grouped = []
+        toprocess = self.freq.copy()
+        if not toprocess:
+            return
+        if kernel>0:
+            bkgc = BkgCalculator(self.ncha, width, niter, kernel)
+
+        while toprocess:
+            ref_idx, ref_freq = toprocess.pop(0)
+            ref_spec = self.getspectrum(ref_idx)
+            if kernel>0:
+                ref_spec = bkgc.removebaseline(ref_spec)
+
+            if not toprocess:
+                self.freq_grouped.append(([ref_idx], ref_freq))
+                continue
+
+            indices, freqs = zip(*toprocess)
+            specs_stack = torch.stack([self.getspectrum(i) for i in indices])
+            if kernel>0:
+                specs_stack = torch.stack([bkgc.removebaseline(s) for s in specs_stack])
+
+            ref_c = ref_spec - ref_spec.mean()
+            specs_c = specs_stack - specs_stack.mean(dim=1, keepdim=True)
+            ref_std = ref_c.norm()
+            specs_std = specs_c.norm(dim=1)
+            corrs = (specs_c @ ref_c) / (specs_std * ref_std * self.ncha)
+            mask = corrs > correlconf
+
+            group_indices = [ref_idx] + [indices[i] for i,m in enumerate(mask) if m]
+            total_freq = ref_freq + sum(freqs[i] for i,m in enumerate(mask) if m)
+            toprocess = [(i,f) for i,f in toprocess if i not in group_indices]
+            self.freq_grouped.append((group_indices, total_freq))
+
+        self.freq_grouped.sort(key=lambda x:-x[1])
+#########################################################333
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BUCKET_SIZE = 16
+BATCH_SIZE = 512  # batch pour group_vertices et baseline
+
+# =========================
+# Monte-Carlo BS odd/even
+# =========================
+def rand_vec_bs_odd(n):
+    # identique, reste sur GPU car vecteur unique → pas d'OOM
+    nb = 1 + n // BUCKET_SIZE
+    max_points = n // 2
+    buckets = torch.zeros((nb, max_points, 3), device=device)
+    counts = torch.zeros(nb, dtype=torch.long, device=device)
+    filled = 0
+    while filled < max_points:
+        a = 2*torch.rand((), device=device)-1
+        b = 2*torch.rand((), device=device)-1
+        s = a**2 + b**2
+        if s <= 1.0:
+            bucket = min(int((s*nb).item()), nb-1)
+            idx = counts[bucket]
+            buckets[bucket, idx] = torch.tensor([a,b,s], device=device)
+            counts[bucket] += 1
+            filled += 1
+    for b in range(nb):
+        c = counts[b]
+        if c>1:
+            order = torch.argsort(buckets[b,:c,2])
+            buckets[b,:c,:] = buckets[b, order, :]
+    first_bucket = 0
+    while first_bucket<nb and counts[first_bucket]==0: first_bucket+=1
+    last_bucket = nb-1
+    while last_bucket>0 and counts[last_bucket]==0: last_bucket-=1
+    a0,b0,s0 = buckets[first_bucket,0]
+    s = 1.0 / buckets[last_bucket, counts[last_bucket]-1,2]
+    s = s / (1.0 - s*a0**2)
+    v = torch.zeros(n, device=device)
+    v[0] = a0 * torch.sqrt(s)
+    S_II = s0
+    idx = 1
+    for b in range(first_bucket,last_bucket+1):
+        for j in range(1, counts[b]):
+            a_,b_,s_ = buckets[b,j]
+            S_I = S_II
+            S_II += s_
+            t = torch.sqrt((1-S_I/S_II)*s)
+            v[idx] = a_*t
+            v[idx+1] = b_*t
+            idx += 2
+    return v
+
+def rand_vec_bs_even(n):
+    nb = 1 + n // BUCKET_SIZE
+    max_points = n // 2
+    buckets = torch.zeros((nb, max_points, 3), device=device)
+    counts = torch.zeros(nb, dtype=torch.long, device=device)
+    filled = 0
+    while filled < max_points:
+        a = 2*torch.rand((), device=device)-1
+        b = 2*torch.rand((), device=device)-1
+        s = a**2 + b**2
+        if s <= 1.0:
+            bucket = min(int((s*nb).item()), nb-1)
+            idx = counts[bucket]
+            buckets[bucket, idx] = torch.tensor([a,b,s], device=device)
+            counts[bucket] += 1
+            filled += 1
+    for b in range(nb):
+        c = counts[b]
+        if c>1:
+            order = torch.argsort(buckets[b,:c,2])
+            buckets[b,:c,:] = buckets[b, order, :]
+    last_bucket = nb-1
+    while last_bucket>0 and counts[last_bucket]==0: last_bucket-=1
+    s = 1.0 / buckets[last_bucket, counts[last_bucket]-1,2]
+    v = torch.zeros(n, device=device)
+    idx = 0
+    S_II = 0.0
+    for b in range(last_bucket+1):
+        for j in range(counts[b]):
+            a_,b_,s_ = buckets[b,j]
+            S_I = S_II
+            S_II += s_
+            t = torch.sqrt((1-S_I/S_II)*s)
+            v[idx] = a_*t
+            v[idx+1] = b_*t
+            idx += 2
+    return v
+
+# =========================
+# Baseline CPU/GPU hybride
+# =========================
+class BkgCalculator:
+    def __init__(self, ncha, width=5, niter=5, kernel_type=1):
+        self.ncha = ncha
+        self.width = width
+        self.niter = niter
+        self.kernel_type = kernel_type
+        if kernel_type>0:
+            self._widthkernel = 6*width+1
+            self._midkernel = 3*width+1
+            x = torch.arange(self._widthkernel, device=device) - self._midkernel
+            kernel = torch.exp(-0.5*(x/width)**2)
+        else:
+            self._widthkernel = 2*width+1
+            self._midkernel = width+1
+            kernel = torch.ones(self._widthkernel, device=device)
+        self.kernel = kernel / kernel.sum()
+
+    def removebaseline(self, spec):
+        # spec reste CPU → on balance sur GPU par spectre
+        spec_gpu = spec.to(device)
+        temp = spec_gpu.clone()
+        for _ in range(self.niter):
+            out = torch.zeros_like(spec_gpu)
+            for i in range(spec_gpu.size(0)):
+                k = torch.clamp(i - self._midkernel + torch.arange(self._widthkernel), 0, spec_gpu.size(0)-1)
+                out[i] = torch.min(temp[i], (temp[k]*self.kernel).sum())
+            temp = out
+        return (spec_gpu-temp).cpu()  # renvoie CPU
+
+# =========================
+# Classe IFF CPU/GPU hybride
+# =========================
+class IFFAlgorithm:
+    def __init__(self, data, n_samples, random_gen=0):
+        self.data = data  # stocké CPU
+        self.npix, self.ncha = data.shape
+        self.n_samples = n_samples
+        self.random_gen = random_gen
+        self.votes = torch.zeros(self.npix, dtype=torch.int32)  # CPU
+        self.data_centered = torch.zeros_like(self.data)  # CPU
+        self.freq = []
+        self.freq_grouped = []
+
+    def set_random_gen(self, choice):
+        self.random_gen = choice
+
+    def center_data(self):
+        # calcul CPU
+        mean = self.data.mean(dim=1, keepdim=True)
+        self.data_centered = self.data - mean
+
+    def rand_vect_bs(self):
+        return rand_vec_bs_odd(self.ncha) if self.ncha%2==1 else rand_vec_bs_even(self.ncha)
+
+    def rand_vect_mu(self):
+        return 2*torch.rand(self.ncha, device=device)-1
+
+    # --------------------------
+    # Monte-Carlo
+    # --------------------------
+    def mc_step_bs(self):
+        rnd_vec = self.rand_vect_bs()
+        # projection CPU/GPU hybride
+        proj = (self.data_centered.to(device) @ rnd_vec).cpu()
+        self.votes[torch.argmin(proj)] += 1
+        self.votes[torch.argmax(proj)] += 1
+
+    def mc_step_wu(self):
+        rnd_vec = self.rand_vect_mu()
+        proj = (self.data_centered.to(device) @ rnd_vec).cpu()
+        self.votes[torch.argmin(proj)] += 1
+        self.votes[torch.argmax(proj)] += 1
+
+    # --------------------------
+    # Compute
+    # --------------------------
+    def compute(self):
+        self.center_data()
+        with torch.no_grad():
+            for _ in range(self.n_samples):
+                if self.random_gen==0:
+                    self.mc_step_bs()
+                else:
+                    self.mc_step_wu()
+        self.sort_votes()
+
+    def sort_votes(self):
+        idx = torch.nonzero(self.votes).squeeze()
+        freq = self.votes[idx]
+        order = torch.argsort(-freq)
+        self.freq = [(int(idx[i]), int(freq[i])) for i in order]
+
+    def get_freq(self):
+        if not self.freq:
+            return torch.tensor([]), torch.tensor([])
+        indices, freqs = zip(*self.freq)
+        return torch.tensor(indices), torch.tensor(freqs)
+
+    def getspectrum(self, idx):
+        return self.data[idx]
+
+    # --------------------------
+    # group_vertices (CPU/GPU batch)
+    # --------------------------
+    def group_vertices(self, correlconf=0.9, kernel=0, width=5, niter=5):
+        self.freq_grouped = []
+        toprocess = self.freq.copy()
+        if not toprocess: return
+        bkgc = BkgCalculator(self.ncha, width, niter, kernel) if kernel>0 else None
+
+        while toprocess:
+            ref_idx, ref_freq = toprocess.pop(0)
+            ref_spec = self.getspectrum(ref_idx)
+            if bkgc: ref_spec = bkgc.removebaseline(ref_spec).to(device)
+            else: ref_spec = ref_spec.to(device)
+
+            if not toprocess:
+                self.freq_grouped.append(([ref_idx], ref_freq))
+                continue
+
+            indices, freqs = zip(*toprocess)
+            group_indices, total_freq = [], ref_freq
+            for start in range(0, len(indices), BATCH_SIZE):
+                end = min(start+BATCH_SIZE, len(indices))
+                batch_idx = indices[start:end]
+                batch_specs = torch.stack([self.getspectrum(i).to(device) for i in batch_idx])
+                if bkgc:
+                    batch_specs = torch.stack([bkgc.removebaseline(s).to(device) for s in batch_specs])
+                # corrcoef
+                ref_c = ref_spec - ref_spec.mean()
+                specs_c = batch_specs - batch_specs.mean(dim=1, keepdim=True)
+                ref_std = ref_c.norm()
+                specs_std = specs_c.norm(dim=1)
+                corrs = (specs_c @ ref_c) / (specs_std * ref_std * self.ncha)
+                mask = corrs > correlconf
+                group_indices += [batch_idx[i] for i,m in enumerate(mask) if m]
+                total_freq += sum(freqs[start+i] for i,m in enumerate(mask) if m)
+
+            group_indices = [ref_idx]+group_indices
+            total_freq = ref_freq+total_freq-ref_freq
+            toprocess = [(i,f) for i,f in toprocess if i not in group_indices]
+            self.freq_grouped.append((group_indices, total_freq))
+
+        self.freq_grouped.sort(key=lambda x:-x[1])
+#############################################################3
+import torch
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BUCKET_SIZE = 16
+BATCH_SIZE = 512  # batch pour group_vertices et baseline
+
+# =========================
+# Monte-Carlo BS odd/even
+# =========================
+def rand_vec_bs_odd(n):
+    nb = 1 + n // BUCKET_SIZE
+    max_points = n // 2
+    buckets = torch.zeros((nb, max_points, 3), device=device, dtype=torch.float64)
+    counts = torch.zeros(nb, dtype=torch.long, device=device)
+    filled = 0
+    while filled < max_points:
+        a = 2*torch.rand((), device=device, dtype=torch.float64)-1
+        b = 2*torch.rand((), device=device, dtype=torch.float64)-1
+        s = a**2 + b**2
+        if s <= 1.0:
+            bucket = min(int((s*nb).item()), nb-1)
+            idx = counts[bucket]
+            buckets[bucket, idx] = torch.tensor([a,b,s], device=device, dtype=torch.float64)
+            counts[bucket] += 1
+            filled += 1
+    for b in range(nb):
+        c = counts[b]
+        if c>1:
+            order = torch.argsort(buckets[b,:c,2])
+            buckets[b,:c,:] = buckets[b, order, :]
+    first_bucket = 0
+    while first_bucket<nb and counts[first_bucket]==0: first_bucket+=1
+    last_bucket = nb-1
+    while last_bucket>0 and counts[last_bucket]==0: last_bucket-=1
+    a0,b0,s0 = buckets[first_bucket,0]
+    s = 1.0 / buckets[last_bucket, counts[last_bucket]-1,2]
+    s = s / (1.0 - s*a0**2)
+    v = torch.zeros(n, device=device, dtype=torch.float64)
+    v[0] = a0 * torch.sqrt(s)
+    S_II = s0
+    idx = 1
+    for b in range(first_bucket,last_bucket+1):
+        for j in range(1, counts[b]):
+            a_,b_,s_ = buckets[b,j]
+            S_I = S_II
+            S_II += s_
+            t = torch.sqrt((1-S_I/S_II)*s)
+            v[idx] = a_*t
+            v[idx+1] = b_*t
+            idx += 2
+    return v
+
+def rand_vec_bs_even(n):
+    nb = 1 + n // BUCKET_SIZE
+    max_points = n // 2
+    buckets = torch.zeros((nb, max_points, 3), device=device, dtype=torch.float64)
+    counts = torch.zeros(nb, dtype=torch.long, device=device)
+    filled = 0
+    while filled < max_points:
+        a = 2*torch.rand((), device=device, dtype=torch.float64)-1
+        b = 2*torch.rand((), device=device, dtype=torch.float64)-1
+        s = a**2 + b**2
+        if s <= 1.0:
+            bucket = min(int((s*nb).item()), nb-1)
+            idx = counts[bucket]
+            buckets[bucket, idx] = torch.tensor([a,b,s], device=device, dtype=torch.float64)
+            counts[bucket] += 1
+            filled += 1
+    for b in range(nb):
+        c = counts[b]
+        if c>1:
+            order = torch.argsort(buckets[b,:c,2])
+            buckets[b,:c,:] = buckets[b, order, :]
+    last_bucket = nb-1
+    while last_bucket>0 and counts[last_bucket]==0: last_bucket-=1
+    s = 1.0 / buckets[last_bucket, counts[last_bucket]-1,2]
+    v = torch.zeros(n, device=device, dtype=torch.float64)
+    idx = 0
+    S_II = 0.0
+    for b in range(last_bucket+1):
+        for j in range(counts[b]):
+            a_,b_,s_ = buckets[b,j]
+            S_I = S_II
+            S_II += s_
+            t = torch.sqrt((1-S_I/S_II)*s)
+            v[idx] = a_*t
+            v[idx+1] = b_*t
+            idx += 2
+    return v
+
+# =========================
+# Baseline CPU/GPU hybride
+# =========================
+class BkgCalculator:
+    def __init__(self, ncha, width=5, niter=5, kernel_type=1):
+        self.ncha = ncha
+        self.width = width
+        self.niter = niter
+        self.kernel_type = kernel_type
+        if kernel_type>0:
+            self._widthkernel = 6*width+1
+            self._midkernel = 3*width+1
+            x = torch.arange(self._widthkernel, device=device, dtype=torch.float64) - self._midkernel
+            kernel = torch.exp(-0.5*(x/width)**2)
+        else:
+            self._widthkernel = 2*width+1
+            self._midkernel = width+1
+            kernel = torch.ones(self._widthkernel, device=device, dtype=torch.float64)
+        self.kernel = kernel / kernel.sum()
+
+    def removebaseline(self, spec):
+        spec_gpu = spec.to(device, dtype=torch.float64)
+        temp = spec_gpu.clone()
+        for _ in range(self.niter):
+            out = torch.zeros_like(spec_gpu)
+            for i in range(spec_gpu.size(0)):
+                k = torch.clamp(i - self._midkernel + torch.arange(self._widthkernel, device=device), 0, spec_gpu.size(0)-1)
+                out[i] = torch.min(temp[i], (temp[k]*self.kernel).sum())
+            temp = out
+        return (spec_gpu-temp).cpu()
+
+# =========================
+# Classe IFF CPU/GPU hybride
+# =========================
+class IFFAlgorithm:
+    def __init__(self, data, n_samples, random_gen=0):
+        self.data = data.double()  # float64
+        self.npix, self.ncha = data.shape
+        self.n_samples = n_samples
+        self.random_gen = random_gen
+        self.votes = torch.zeros(self.npix, dtype=torch.int32)
+        self.data_centered = torch.zeros_like(self.data)
+        self.freq = []
+        self.freq_grouped = []
+
+    def set_random_gen(self, choice):
+        self.random_gen = choice
+
+    def center_data(self):
+        mean = self.data.mean(dim=1, keepdim=True)
+        self.data_centered = self.data - mean
+
+    def rand_vect_bs(self):
+        return rand_vec_bs_odd(self.ncha) if self.ncha%2==1 else rand_vec_bs_even(self.ncha)
+
+    def rand_vect_mu(self):
+        return 2*torch.rand(self.ncha, device=device, dtype=torch.float64)-1
+
+    # --------------------------
+    # Monte-Carlo
+    # --------------------------
+    def mc_step_bs(self):
+        rnd_vec = self.rand_vect_bs()
+        proj = (self.data_centered.to(device) @ rnd_vec).cpu()
+        self.votes[torch.argmin(proj)] += 1
+        self.votes[torch.argmax(proj)] += 1
+
+    def mc_step_wu(self):
+        rnd_vec = self.rand_vect_mu()
+        proj = (self.data_centered.to(device) @ rnd_vec).cpu()
+        self.votes[torch.argmin(proj)] += 1
+        self.votes[torch.argmax(proj)] += 1
+
+    # --------------------------
+    # Compute
+    # --------------------------
+    def compute(self):
+        self.center_data()
+        with torch.no_grad():
+            for _ in range(self.n_samples):
+                if self.random_gen==0:
+                    self.mc_step_bs()
+                else:
+                    self.mc_step_wu()
+        self.sort_votes()
+
+    def sort_votes(self):
+        idx = torch.nonzero(self.votes).squeeze()
+        freq = self.votes[idx]
+        order = torch.argsort(-freq)
+        self.freq = [(int(idx[i]), int(freq[i])) for i in order]
+
+    def get_freq(self):
+        if not self.freq:
+            return torch.tensor([]), torch.tensor([])
+        indices, freqs = zip(*self.freq)
+        return torch.tensor(indices, dtype=torch.int32), torch.tensor(freqs, dtype=torch.int32)
+
+    def getspectrum(self, idx):
+        return self.data[idx]
+
+    # --------------------------
+    # group_vertices (CPU/GPU batch)
+    # --------------------------
+    def group_vertices(self, correlconf=0.9, kernel=0, width=5, niter=5):
+        self.freq_grouped = []
+        toprocess = self.freq.copy()
+        if not toprocess: return
+        bkgc = BkgCalculator(self.ncha, width, niter, kernel) if kernel>0 else None
+
+        while toprocess:
+            ref_idx, ref_freq = toprocess.pop(0)
+            ref_spec = self.getspectrum(ref_idx)
+            if bkgc: ref_spec = bkgc.removebaseline(ref_spec).to(device)
+            else: ref_spec = ref_spec.to(device)
+
+            if not toprocess:
+                self.freq_grouped.append(([ref_idx], ref_freq))
+                continue
+
+            indices, freqs = zip(*toprocess)
+            group_indices, total_freq = [], ref_freq
+            for start in range(0, len(indices), BATCH_SIZE):
+                end = min(start+BATCH_SIZE, len(indices))
+                batch_idx = indices[start:end]
+                batch_specs = torch.stack([self.getspectrum(i).to(device, dtype=torch.float64) for i in batch_idx])
+                if bkgc:
+                    batch_specs = torch.stack([bkgc.removebaseline(s).to(device) for s in batch_specs])
+                ref_c = ref_spec - ref_spec.mean()
+                specs_c = batch_specs - batch_specs.mean(dim=1, keepdim=True)
+                ref_std = ref_c.norm()
+                specs_std = specs_c.norm(dim=1)
+                corrs = (specs_c @ ref_c) / (specs_std * ref_std * self.ncha)
+                mask = corrs > correlconf
+                group_indices += [batch_idx[i] for i,m in enumerate(mask) if m]
+                total_freq += sum(freqs[start+i] for i,m in enumerate(mask) if m)
+
+            group_indices = [ref_idx]+group_indices
+            total_freq = ref_freq+total_freq-ref_freq
+            toprocess = [(i,f) for i,f in toprocess if i not in group_indices]
+            self.freq_grouped.append((group_indices, total_freq))
+
+        self.freq_grouped.sort(key=lambda x:-x[1])
