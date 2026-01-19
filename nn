@@ -1,0 +1,157 @@
+Professional survey outline (English — ready for IEEE COMST)
+
+Title (suggested)
+A Survey of Multimodal Fusion for Remote Sensing and Sensing Systems: A Data-/Feature-/Decision-Level Perspective
+
+Abstract (150–200 words)
+One paragraph: scope, three fusion levels (data/pansharpening, feature, decision), methodology for literature selection, summary of contributions (taxonomy, benchmark matrix, recommended evaluation protocol, open problems).
+
+1. Introduction (≈800–1,000 words)
+
+Motivation & scope: define multimodal fusion and why organize by data-level (pansharpening), feature-level, decision-level.
+
+Objectives of this survey (taxonomy, comparative analysis, benchmark recommendations, reproducibility checklist).
+
+Paper organization / contributions (bullet list).
+
+2. Methodology for literature selection (≈300–500 words)
+
+Search strategy (databases, keywords, time window), inclusion/exclusion criteria, number of papers reviewed per year.
+
+Short paragraph on why IEEE ComSurv/Tutorials exemplar surveys were used as templates.
+
+3. Background and problem formulation (≈700 words)
+
+Notation and formal definitions for three fusion levels.
+
+Brief recap of sensors/modalities (HSI, multispectral, panchromatic, LiDAR, SAR, camera, mmWave radar).
+
+Common pre-processing steps (radiometric calibration, co-registration, atmospheric correction).
+
+4. Taxonomy (single-page figure + 150–250 words)
+
+Taxonomy figure: tree that splits by level of fusion → method families → learning vs model-based → single/multi-sensor scenarios.
+
+Table 1: short mapping of method families ↔ typical applications & strengths/weaknesses.
+
+5. Data-level fusion (Pansharpening / raw data fusion) (≈1,200–1,500 words)
+
+5.1 Problem statement & mathematical model (observation models, forward model).
+
+5.2 Classic model-based methods (IHS, Brovey, PCA, wavelet, component substitution) — concise equations, complexity.
+
+5.3 Sparse-coding & unmixing approaches (dictionary learning, sparse reconstruction).
+
+5.4 Learning-based deep pansharpening (CNNs, GANs, attention, 3D conv, transformer variants).
+
+5.5 Evaluation metrics for pansharpening / spectral fidelity: SAM, ERGAS, SSIM, PSNR, RMSE — definitions and when to use each.
+
+5.6 Benchmarks and datasets (recommendations + preproc rules).
+
+5.7 Strengths, failure modes, open problems (spectral distortion, transferability, real-time constraints).
+
+6. Feature-level fusion (≈1,200–1,500 words)
+
+6.1 Formalization: feature extraction functions, alignment between feature spaces.
+
+6.2 Handcrafted features (spectral indices, texture, morphological profiles) and concatenation strategies.
+
+6.3 Statistical feature fusion (CCA, manifold alignment, joint subspace learning).
+
+6.4 Deep feature fusion: Siamese/dual-branch, cross-modal attention, cross-modal transformers, multimodal contrastive learning.
+
+6.5 Dimensionality reduction and feature selection (PCA, t-SNE/UMAP for analysis; wrapper/filter methods).
+
+6.6 Evaluation metrics: downstream task metrics (classification OA/AA/Kappa, detection mAP), representation quality (cluster separability).
+
+6.7 Strengths, limits, robustness to missing bands/modalities.
+
+7. Decision-level fusion (≈900–1,200 words)
+
+7.1 Definition and canonical frameworks (ensemble of classifiers, voting, stacking).
+
+7.2 Probabilistic fusion: Bayesian model averaging, log-likelihood combination.
+
+7.3 Evidence theory and belief fusion (Dempster-Shafer) for uncertain inputs.
+
+7.4 Learning to fuse decisions: meta-learners, calibration, confidence-aware fusion.
+
+7.5 Metrics: ROC/AUC, precision/recall, calibration error, robustness tests.
+
+7.6 Use-cases where decision fusion is preferable (heterogeneous sensors, privacy constraints, lightweight nodes).
+
+8. Cross-level & hybrid approaches (≈700 words)
+
+Hierarchical pipelines (data → feature → decision), end-to-end joint learning vs modular design.
+
+Sensor alignment, synchronization, cross-modal supervision, missing-modality handling.
+
+Cross-level tradeoffs (performance vs interpretability vs deployability).
+
+9. Comparative evaluation framework (core contribution) (≈800–1,000 words + tables)
+
+Table 2: Comparative matrix — rows = representative methods (one per family), columns = criteria: spectral fidelity, spatial fidelity, task performance, computational cost, data needs, robustness, reproducibility.
+
+Recommended experimental protocol: train/val/test splits, cross-scene generalization, simulation of missing modalities, ablation protocol.
+
+Standard metrics per task (pansharpening / classification / detection / segmentation).
+
+Reproducibility checklist (code, seeds, preproc, hardware).
+
+10. Datasets & benchmarks (concise table + links)
+
+Hyperspectral benchmarks: Indian Pines, Pavia University, Salinas, Kennedy Space Center — cite canonical sources.
+
+Multimodal benchmarks (radar+camera / mmWave+camera): list available datasets used in COMST surveys (reference examples).
+
+11. Practical deployment considerations (≈400–600 words)
+
+Complexity, latency, memory, model compression, real-time constraints, on-board vs edge vs cloud.
+
+Data privacy, sensor failure modes, calibration maintenance.
+
+12. Open challenges & future research directions (≈700 words)
+
+Standardization of benchmarks & metrics, robustness to domain shift, self-supervised multimodal pretraining, few-shot & continual learning, interpretability, physics-aware learning, real-time embedded fusion.
+
+Short bullet list of 6–8 concrete open problems.
+
+13. Conclusion (≈200–300 words)
+
+One paragraph summary + one paragraph actionable recommendations for researchers (what to test first, what baselines to include).
+
+Appendices (as needed)
+
+Appendix A: Taxonomy figure & algorithm pseudocode.
+
+Appendix B: Reproducible experiment scripts & parameter tables.
+
+Appendix C: List of reference implementations and code repos.
+
+Required figures / tables (must-have)
+
+Taxonomy figure (fusion levels → method families).
+
+Pipeline schematic(s) for each fusion level (data/feature/decision).
+
+Table of representative algorithms with short descriptions and complexity.
+
+Benchmark table: datasets, modalities, resolutions, typical tasks.
+
+Comparative matrix (performance vs cost).
+
+Sample result images (pansharpening visual comparison; classification maps).
+
+Recommended article parameters for IEEE ComSurv
+
+Target length: 12–18 journal pages (including figures), 8–12k words typical for comprehensive survey; follow COMST author guidelines.
+
+Number of references: ≥150 (liberal citation policy; include historical and latest works).
+
+Emphasize tutorial style and clarity for non-specialists.
+
+Short justification — why this structure?
+
+It mirrors successful COMST surveys that (i) present taxonomy, (ii) detail method families with equations and representative examples, (iii) supply extensive benchmark/metric recommendations and (iv) end with open challenges — see radar–camera and mmWave fusion surveys and recent hyperspectral COMST surveys.
+
+#################################3
