@@ -1,0 +1,92 @@
+Dans une pastille, on peut avoir un seul type de composé ou plusieurs en même temps.
+
+Pour augmenter, avoir plus d’extrudés et de pastilles ne sera pas possible prochainement, en tout cas pour le moment.
+
+La résolution des images HSI-NIR est d’environ 230 × 230 pour chaque pastille.
+
+En cropant sur les différents extrudés, on aura des parties en faible résolution, peut-être pas assez pour faire des convolutions. 
+
+On pourra interpoler pour augmenter la résolution, mais il faudra trouver un juste milieu entre le proche infrarouge et le LIBS.
+
+Parmi les idées proposées sur la résolution, on peut explorer le fait d’inverser le cube : on ne va pas chercher l’info spatiale, mais plutôt l’info spectrale, en prenant le signal comme étant une image.
+
+Il faudra faire attention aux classes qui sont rares et essayer d’équilibrer un peu toutes les classes.
+
+Pour la labellisation, il ne faudra pas prendre les gros vides comme faisant partie de l’objet. Il faudra séparer ce qui correspond à la résine, à l’objet, et aussi aux bulles d’air à l’intérieur des extrudés.
+
+On pourra commencer avec les échantillons les plus simples à annoter et garder les plus complexes pour après.
+
+Pour le data augmentation, le peak shifting peut être utile, surtout pour la LIBS.
+
+Les limitations des autoencodeurs sur la variabilité peuvent en partie être levées avec des autoencodeurs variationnels.
+
+Les GAN, c’est pas toujours facile à faire marcher. D’après ce qu’on a vu à IFPEN, pour l’augmentation des données, les modèles de diffusion ont plutôt bien marché sur les essais déjà faits, mais le problème, c’est qu’ils ont besoin d’une grosse base d’apprentissage. Sinon, avec une petite base, ils ont tendance à un peu apprendre par cœur.
+
+Dans le remote sensing, en général, il y a deux façons de faire : soit on prend toute l’image et on divise en entraînement et test, soit on découpe l’image en patchs et on prend certains patchs pour le test et les autres pour l’entraînement. La deuxième approche pourrait nous aider vu qu’on a peu d’échantillons, mais c’est pas trop conseillé à cause de la généralisation.
+
+Pour la survey, le plan présenté peut être considéré comme une base à revoir. Certains points sur l’alignement des données, au lieu de les mettre dans une partie à la fin, pourraient être déplacés dans la section 2 ou dans d’autres parties. Ça reste possible de réorganiser un peu l’ordre des sections, ça ne posera pas de problème.
+
+############
+1. Composition des pastilles et échantillons
+
+Dans une pastille, on peut avoir un seul type de composé ou plusieurs en même temps.
+
+Pour augmenter, avoir plus d’extrudés et de pastilles ne sera pas possible prochainement, en tout cas pour le moment.
+
+2. Résolution et traitement des images
+
+La résolution des images HSI-NIR est d’environ 230 × 230 pour chaque pastille.
+
+En cropant sur les différents extrudés, certaines parties seront en faible résolution, peut-être pas assez pour faire des convolutions.
+
+On pourra interpoler pour augmenter la résolution, mais il faudra trouver un juste milieu entre le proche infrarouge et la LIBS.
+
+Parmi les idées proposées, on peut explorer le fait d’inverser le cube : au lieu de chercher l’info spatiale, on se concentre sur l’info spectrale, en prenant le signal comme une image.
+
+3. Classes et labellisation
+
+Il faudra faire attention aux classes rares et essayer d’équilibrer un peu toutes les classes.
+
+Pour la labellisation, il ne faudra pas considérer les gros vides comme faisant partie de l’objet. Il faudra séparer ce qui correspond à la résine, à l’objet, et aux bulles d’air à l’intérieur des extrudés.
+
+On pourra commencer avec les échantillons les plus simples à annoter et garder les plus complexes pour après.
+
+4. Data augmentation et modèles d’apprentissage
+
+Pour le data augmentation, le peak shifting peut être utile, surtout pour la LIBS.
+
+Les limitations des autoencodeurs sur la variabilité peuvent en partie être levées avec des autoencodeurs variationnels.
+
+Les GAN, c’est pas toujours facile à faire marcher. D’après l’expérience à IFPEN, pour l’augmentation des données, les modèles de diffusion ont bien marché sur les essais déjà faits, mais ils ont besoin d’une grosse base d’apprentissage. Sinon, avec une petite base, ils ont tendance à apprendre un peu par cœur.
+
+5. Stratégie d’entraînement et généralisation
+
+Dans le remote sensing, il y a deux façons de faire : soit on prend toute l’image et on divise en entraînement et test, soit on découpe l’image en patchs et on prend certains patchs pour le test et les autres pour l’entraînement.
+
+La deuxième approche pourrait aider vu qu’on a peu d’échantillons, mais ce n’est pas trop conseillé à cause de la généralisation.
+
+6. Survey et organisation du plan
+
+Pour la survey, le plan présenté peut être considéré comme une base à revoir.
+
+Certains points sur l’alignement des données, au lieu de les mettre à la fin, pourraient être déplacés dans la section 2 ou ailleurs.
+
+On peut réorganiser un peu l’ordre des sections sans que ça pose de problème.
+################3
+
+
+Envoyer un mail pour fixer la prochaine réunion de toute l’équipe.
+
+Regarder des pistes de modèles de super-résolution si on se retrouve bloqués par la résolution.
+
+Garder en tête de faire passer les échantillons avec une caméra plus haute résolution à Brest pour la super-résolution, donc garder la possibilité d’envoyer les échantillons à Brest après le deuxième passage sur la LIBS et après les avoir repolis.
+
+Regarder les architectures qui utilisent des patchs et celles qui prennent toute l’image en entier, et voir quelle taille de patch elles utilisent. (au fur et à mesure de la littérature)
+
+Aborder et discuter du sujet des membres du CSI.
+
+Garder en tête que le CSI se fera plutôt en début d’année scolaire, en septembre.
+
+Faire un tableau sur l’espace partagé avec les noms des personnes susceptibles de nous intéresser pour le CSI.
+
+Regarder ce qui concerne la base de données de plastiques qui a été envoyée pendant la réunion.
