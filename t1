@@ -1419,3 +1419,308 @@ class IFFAlgorithmStreamingParallel:
         return self.data[idx].astype(np.float32)
 
 
+import tifffile as tiff
+import os
+import numpy as np
+
+out_dir = "tiff_bandes"
+os.makedirs(out_dir, exist_ok=True)
+
+data = calibrated.spectral_albedo
+
+for i, wl in enumerate(data.wavelength.values):
+
+    band = data.isel(wavelength=i)  # (y, x)
+
+    filename = f"{out_dir}/band_{int(wl)}nm.tif"
+
+    tiff.imwrite(
+        filename,
+        band.values.astype(np.float32)
+    )
+
+import os
+import matplotlib.pyplot as plt
+
+out_dir = "images_bandes"
+os.makedirs(out_dir, exist_ok=True)
+
+cube = calibrated.spectral_albedo
+
+n_bands = cube.shape[1]  # dimension wavelength
+
+for i in range(n_bands):
+
+    band = cube[:, i, :]   # (y, x)
+
+    plt.figure()
+    plt.imshow(band, cmap="gray")
+    plt.title(f"Bande {i}")
+    plt.axis("off")
+
+    filename = f"{out_dir}/band_{i:03d}.png"
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
+    plt.close()
+
+import numpy as np
+from sklearn.decomposition import PCA
+
+
+# Cube hyperspectral
+cube = calibrated.spectral_albedo   # (y, wl, x)
+
+y, n_wl, x = cube.shape
+
+
+# Reshape -> (pixels, bands)
+X = cube.transpose(0, 2, 1).reshape(-1, n_wl)
+
+
+# Nettoyage (éviter NaN / inf)
+X = np.nan_to_num(X)
+
+
+# Normalisation (important pour PCA)
+X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-8)
+
+
+# PCA
+pca = PCA(n_components=10)   # on garde 10 composantes
+pca.fit(X)
+
+
+# Importance des bandes
+# = somme des valeurs absolues des poids
+importance = np.sum(np.abs(pca.components_), axis=0)
+
+
+# Classement
+best_indices = np.argsort(importance)[::-1]
+
+
+print("Bandes les plus importantes :")
+print(best_indices[:10])
+
+N = 8
+
+selected = best_indices[:N]
+
+print("Bandes sélectionnées :", selected)
+
+import os
+import matplotlib.pyplot as plt
+from itertools import combinations
+
+
+out_dir = "rgb_pca"
+os.makedirs(out_dir, exist_ok=True)
+
+
+def normalize(img):
+
+    img = img.copy()
+
+    for i in range(3):
+        b = img[..., i]
+        img[..., i] = (b - b.min()) / (b.max() - b.min() + 1e-8)
+
+    return img
+
+
+for r, g, b in combinations(selected, 3):
+
+    R = cube[:, r, :]
+    G = cube[:, g, :]
+    B = cube[:, b, :]
+
+    rgb = np.stack([R, G, B], axis=-1)
+
+    rgb = normalize(rgb)
+
+    name = f"rgb_{r}_{g}_{b}.png"
+
+    plt.imsave(
+        os.path.join(out_dir, name),
+        rgb
+    )
+
+import matplotlib.pyplot as plt
+
+plt.plot(importance)
+plt.title("Importance PCA des longueurs d’onde")
+plt.xlabel("Indice wavelength")
+plt.ylabel("Importance")
+plt.show()
+
+try:
+    wavelengths = np.array(spec.wavelengths)
+except:
+    wavelengths = np.array(spec.capture.wavelengths)
+
+from sklearn.decomposition import PCA
+
+
+y, n_wl, x = cube.shape
+
+# reshape -> (pixels, bands)
+X = cube.transpose(0, 2, 1).reshape(-1, n_wl)
+
+# Nettoyage
+X = np.nan_to_num(X)
+
+# Normalisation
+X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-8)
+
+
+# PCA
+pca = PCA(n_components=10)
+pca.fit(X)
+
+
+# Importance des bandes
+importance = abs(pca.components_).sum(axis=0)
+
+best_idx = importance.argsort()[::-1]
+
+print("Top bandes :", best_idx[:10])
+
+N = 6
+selected = best_idx[:N]
+
+import os
+import matplotlib.pyplot as plt
+from itertools import combinations
+
+
+out_dir = "rgb_specarray_pca"
+os.makedirs(out_dir, exist_ok=True)
+
+
+def normalize(rgb):
+
+    rgb = rgb.copy()
+
+    for i in range(3):
+        b = rgb[..., i]
+        rgb[..., i] = (b - b.min()) / (b.max() - b.min() + 1e-8)
+
+    return rgb
+
+
+for r, g, b in combinations(selected, 3):
+
+    R = cube[:, r, :]
+    G = cube[:, g, :]
+    B = cube[:, b, :]
+
+    rgb = np.stack([R, G, B], axis=-1)
+
+    rgb = normalize(rgb)
+
+    # Nom avec longueur d'onde si possible
+    try:
+        name = f"rgb_{int(wavelengths[r])}_{int(wavelengths[g])}_{int(wavelengths[b])}.png"
+    except:
+        name = f"rgb_{r}_{g}_{b}.png"
+
+    plt.imsave(os.path.join(out_dir, name), rgb)
+
+pca_full = PCA().fit(X)
+
+var = np.cumsum(pca_full.explained_variance_ratio_)
+
+N = np.argmax(var > 0.95) + 1   # 95% variance
+
+
+from specarray import SpecArray
+from pathlib import Path
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import os
+
+# -------------------------------
+# 1️⃣ Lire les données avec specarray
+# -------------------------------
+
+data_path = Path("data/sample")  # chemin vers le dossier HSI
+spec = SpecArray.from_folder(data_path)
+
+# Si vous avez des references white/dark
+# white = SpecArray.from_folder("data/white")
+# dark  = SpecArray.from_folder("data/dark")
+# spec = spec.compute_spectral_albedo(white=white, dark=dark)
+
+cube = np.array(spec.spectral_albedo)  # (y, wavelength, x)
+wavelengths = np.array(spec.wavelengths)  # vecteur des longueurs d'onde
+
+y, n_wl, x = cube.shape
+print(f"Cube shape: {cube.shape}")
+
+# -------------------------------
+# 2️⃣ Fonction pour appliquer CLAHE sur une bande
+# -------------------------------
+
+def apply_clahe(band, clip_limit=2.0, tile_size=(8,8)):
+    """
+    band : 2D array (y, x)
+    """
+    # Normaliser sur 0-255
+    band_norm = cv2.normalize(band, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size)
+    enhanced = clahe.apply(band_norm)
+    return enhanced
+
+# Exemple sur une bande NIR (~index 30)
+band_idx = 30
+band = cube[:, band_idx, :]
+band_clahe = apply_clahe(band)
+
+plt.figure()
+plt.imshow(band_clahe, cmap='gray')
+plt.title(f"Bande {band_idx} CLAHE")
+plt.axis('off')
+plt.show()
+
+# -------------------------------
+# 3️⃣ Calculer des ratios spectraux
+# -------------------------------
+
+# Choisir 2 bandes pour le ratio (ex: 900nm et 1100nm)
+# On peut choisir automatiquement les indices les plus proches
+def find_nearest_idx(target_wl, wavelengths):
+    return np.argmin(np.abs(wavelengths - target_wl))
+
+wl1, wl2 = 900, 1100
+idx1 = find_nearest_idx(wl1, wavelengths)
+idx2 = find_nearest_idx(wl2, wavelengths)
+
+band1 = cube[:, idx1, :]
+band2 = cube[:, idx2, :]
+
+# Ratio simple
+ratio = band1 / (band2 + 1e-8)  # éviter division par 0
+
+# Normalisation pour affichage
+ratio_norm = (ratio - ratio.min()) / (ratio.max() - ratio.min())
+
+plt.figure()
+plt.imshow(ratio_norm, cmap='gray')
+plt.title(f"Ratio {wl1}nm/{wl2}nm")
+plt.axis('off')
+plt.show()
+
+# -------------------------------
+# 4️⃣ Sauvegarde
+# -------------------------------
+
+out_dir = "output_hsi"
+os.makedirs(out_dir, exist_ok=True)
+
+# Sauvegarde CLAHE
+cv2.imwrite(os.path.join(out_dir, f"band_{band_idx}_clahe.png"), band_clahe)
+
+# Sauvegarde ratio
+plt.imsave(os.path.join(out_dir, f"ratio_{wl1}_{wl2}.png"), ratio_norm, cmap='gray')
+
+print("Images sauvegardées dans", out_dir)
