@@ -1,0 +1,679 @@
+import os
+import json
+import numpy as np
+import cv2
+from PIL import Image
+
+
+# =============================
+# CONFIGURATION
+# =============================
+
+JSON_DIR = "annotations"
+IMG_DIR = "images"
+OUT_DIR = "masks"
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+
+# =============================
+# 1. RECUPERER TOUTES LES CLASSES
+# =============================
+
+def get_all_classes(json_dir):
+
+    classes = set()
+
+    for file in os.listdir(json_dir):
+
+        if not file.endswith(".json"):
+            continue
+
+        path = os.path.join(json_dir, file)
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        for shape in data["shapes"]:
+            classes.add(shape["label"])
+
+    return sorted(list(classes))
+
+
+# Charger toutes les classes
+all_classes = get_all_classes(JSON_DIR)
+
+# Ajouter background
+all_classes = ["background"] + all_classes
+
+
+# Créer CLASS_MAP automatiquement
+CLASS_MAP = {}
+
+for i, cls in enumerate(all_classes):
+    CLASS_MAP[cls] = i
+
+
+print("Classes trouvées :")
+for k, v in CLASS_MAP.items():
+    print(f"{v} -> {k}")
+
+
+# Sauvegarder la correspondance
+with open("class_mapping.txt", "w", encoding="utf-8") as f:
+    for k, v in CLASS_MAP.items():
+        f.write(f"{v} {k}\n")
+
+
+# =============================
+# FONCTION PRINCIPALE
+# =============================
+
+def process_json(json_path):
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    img_name = data["imagePath"]
+    img_path = os.path.join(IMG_DIR, img_name)
+
+    img = np.array(Image.open(img_path))
+    h, w = img.shape[:2]
+
+
+    # Masque final
+    final_mask = np.zeros((h, w), dtype=np.uint8)
+
+
+    # Masques par classe
+    class_masks = {}
+
+    for cls in CLASS_MAP:
+        class_masks[cls] = np.zeros((h, w), dtype=np.uint8)
+
+
+    # =============================
+    # 2. Dessiner les polygones
+    # =============================
+
+    for shape in data["shapes"]:
+
+        label = shape["label"]
+
+        if label not in CLASS_MAP:
+            continue
+
+        points = np.array(shape["points"], dtype=np.int32)
+
+        mask = np.zeros((h, w), dtype=np.uint8)
+
+        cv2.fillPoly(mask, [points], 1)
+
+        class_masks[label] = np.maximum(
+            class_masks[label],
+            mask
+        )
+
+
+    # =============================
+    # 3. Supprimer chevauchements
+    # =============================
+
+    classes = list(CLASS_MAP.keys())
+
+    for cls1 in classes:
+        for cls2 in classes:
+
+            if cls1 == cls2:
+                continue
+
+            class_masks[cls1] = np.where(
+                class_masks[cls2] == 1,
+                0,
+                class_masks[cls1]
+            )
+
+
+    # =============================
+    # 4. Construire masque final
+    # =============================
+
+    for cls, cls_id in CLASS_MAP.items():
+
+        final_mask[class_masks[cls] == 1] = cls_id
+
+
+    # =============================
+    # 5. Sauvegarde
+    # =============================
+
+    base = os.path.splitext(os.path.basename(json_path))[0]
+
+    out_path = os.path.join(OUT_DIR, base + "_mask.png")
+
+    Image.fromarray(final_mask).save(out_path)
+
+    print(f"Saved: {out_path}")
+
+
+
+# =============================
+# TRAITEMENT BATCH
+# =============================
+
+for file in os.listdir(JSON_DIR):
+
+    if file.endswith(".json"):
+
+        process_json(os.path.join(JSON_DIR, file))
+
+
+print("Conversion terminée ✅")
+
+####################3
+import os
+import json
+import numpy as np
+import cv2
+from PIL import Image
+
+
+# =============================
+# CONFIGURATION
+# =============================
+
+JSON_DIR = "annotations"   # Dossier des .json LabelMe
+IMG_DIR = "images"         # Dossier des images
+OUT_DIR = "masks"          # Dossier de sortie
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+
+# =============================
+# 1. RECUPERER TOUTES LES CLASSES
+# =============================
+
+def get_all_classes(json_dir):
+
+    classes = set()
+
+    for file in os.listdir(json_dir):
+
+        if not file.endswith(".json"):
+            continue
+
+        path = os.path.join(json_dir, file)
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        for shape in data["shapes"]:
+            classes.add(shape["label"])
+
+    return sorted(list(classes))
+
+
+# Charger toutes les classes
+all_classes = get_all_classes(JSON_DIR)
+
+# Ajouter background (fond)
+all_classes = ["background"] + all_classes
+
+
+# =============================
+# 2. CREER CLASS_MAP
+# =============================
+
+CLASS_MAP = {}
+
+for i, cls in enumerate(all_classes):
+    CLASS_MAP[cls] = i
+
+
+print("Classes détectées :")
+for k, v in CLASS_MAP.items():
+    print(f"{v} -> {k}")
+
+
+# Sauvegarder le mapping
+with open("class_mapping.txt", "w", encoding="utf-8") as f:
+    for k, v in CLASS_MAP.items():
+        f.write(f"{v} {k}\n")
+
+
+# =============================
+# 3. TRAITER UN JSON
+# =============================
+
+def process_json(json_path):
+
+    # Lire annotation
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # Charger image
+    img_name = data["imagePath"]
+    img_path = os.path.join(IMG_DIR, img_name)
+
+    img = np.array(Image.open(img_path))
+    h, w = img.shape[:2]
+
+
+    # Masque final (vide = background)
+    final_mask = np.zeros((h, w), dtype=np.uint8)
+
+
+    # =============================
+    # Dessiner polygones dans l'ordre
+    # =============================
+
+    for shape in data["shapes"]:
+
+        label = shape["label"]
+
+        if label not in CLASS_MAP:
+            continue
+
+        cls_id = CLASS_MAP[label]
+
+        points = np.array(shape["points"], dtype=np.int32)
+
+        # Masque temporaire
+        temp_mask = np.zeros((h, w), dtype=np.uint8)
+
+        # Remplir polygone
+        cv2.fillPoly(temp_mask, [points], 1)
+
+        # Appliquer sur masque final
+        final_mask[temp_mask == 1] = cls_id
+
+
+    # =============================
+    # Sauvegarde
+    # =============================
+
+    base = os.path.splitext(os.path.basename(json_path))[0]
+
+    out_path = os.path.join(OUT_DIR, base + "_mask.png")
+
+    Image.fromarray(final_mask).save(out_path)
+
+    print(f"Saved: {out_path}")
+
+
+# =============================
+# 4. TRAITEMENT EN LOT
+# =============================
+
+for file in os.listdir(JSON_DIR):
+
+    if file.endswith(".json"):
+
+        process_json(os.path.join(JSON_DIR, file))
+
+
+print("Conversion terminée ✅")
+
+##################################3
+import os
+import json
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+import specarray as sa
+import cv2
+
+# =============================
+# CONFIGURATION
+# =============================
+IMG_DIR = "hyperspectral"       # dossier des images ENVI (.hdr)
+MASK_JSON_DIR = "annotations"   # JSON LabelMe
+MASK_OUT_DIR = "masks"          # Masques PNG générés
+os.makedirs(MASK_OUT_DIR, exist_ok=True)
+
+# =============================
+# 1. Récupérer les classes automatiquement
+# =============================
+def get_all_classes(json_dir):
+    classes = set()
+    for file in os.listdir(json_dir):
+        if not file.endswith(".json"):
+            continue
+        with open(os.path.join(json_dir, file), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for shape in data["shapes"]:
+            classes.add(shape["label"])
+    return ["background"] + sorted(list(classes))
+
+CLASS_MAP = {cls: i for i, cls in enumerate(get_all_classes(MASK_JSON_DIR))}
+print("Classes détectées :")
+for k,v in CLASS_MAP.items():
+    print(f"{v} -> {k}")
+
+# =============================
+# 2. Convertir JSON LabelMe en masque
+# =============================
+def process_json(json_path, h_spec, w_spec):
+    """Convertit JSON LabelMe en masque [H,W]"""
+    final_mask = np.zeros((h_spec, w_spec), dtype=np.uint8)
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    for shape in data["shapes"]:
+        label = shape["label"]
+        if label not in CLASS_MAP:
+            continue
+        cls_id = CLASS_MAP[label]
+        points = np.array(shape["points"], dtype=np.int32)
+        temp_mask = np.zeros((h_spec, w_spec), dtype=np.uint8)
+        cv2.fillPoly(temp_mask, [points], 1)
+        final_mask[temp_mask==1] = cls_id
+
+    return final_mask
+
+# =============================
+# 3. Dataset PyTorch
+# =============================
+class HyperDataset(Dataset):
+    def __init__(self, img_dir, mask_json_dir, class_map, normalize=True):
+        self.img_dir = img_dir
+        self.mask_json_dir = mask_json_dir
+        self.files = sorted([f.split('.')[0] for f in os.listdir(mask_json_dir) if f.endswith(".json")])
+        self.class_map = class_map
+        self.normalize = normalize
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        name = self.files[idx]
+
+        # Charger image hyperspectrale
+        img_path = os.path.join(self.img_dir, name + ".hdr")
+        img = sa.load(img_path).astype(np.float32)  # shape [B,H,W]
+
+        if self.normalize:
+            img = (img - img.mean()) / (img.std() + 1e-8)
+
+        img_tensor = torch.from_numpy(img)  # [C,H,W]
+
+        # Charger et générer masque
+        h_spec, w_spec = img.shape[1], img.shape[2]
+        json_path = os.path.join(self.mask_json_dir, name + ".json")
+        mask_np = process_json(json_path, h_spec, w_spec)
+        mask_tensor = torch.from_numpy(mask_np).long()  # [H,W]
+
+        return img_tensor, mask_tensor
+
+# =============================
+# 4. Créer DataLoader
+# =============================
+dataset = HyperDataset(IMG_DIR, MASK_JSON_DIR, CLASS_MAP, normalize=True)
+loader = DataLoader(dataset, batch_size=2, shuffle=True)
+
+# =============================
+# 5. Test rapide
+# =============================
+for imgs, masks in loader:
+    print("Images:", imgs.shape)  # [B,C,H,W]
+    print("Masks:", masks.shape)  # [B,H,W]
+    break
+#############################33
+import os
+import json
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import specarray as sa
+import cv2
+
+# =============================
+# CONFIGURATION
+# =============================
+IMG_DIR = "hyperspectral"       # ENVI images (.hdr)
+MASK_JSON_DIR = "annotations"   # JSON LabelMe
+MASK_OUT_DIR = "masks"          # Masques PNG générés
+os.makedirs(MASK_OUT_DIR, exist_ok=True)
+
+# =============================
+# 1. Récupérer les classes automatiquement depuis LabelMe
+# =============================
+def get_all_classes(json_dir):
+    classes = set()
+    for file in os.listdir(json_dir):
+        if not file.endswith(".json"):
+            continue
+        with open(os.path.join(json_dir, file), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for shape in data["shapes"]:
+            classes.add(shape["label"])
+    return ["background"] + sorted(list(classes))
+
+CLASS_MAP = {cls: i for i, cls in enumerate(get_all_classes(MASK_JSON_DIR))}
+print("Classes détectées :")
+for k,v in CLASS_MAP.items():
+    print(f"{v} -> {k}")
+
+# =============================
+# 2. Convertir JSON LabelMe en masques adaptés hyperspectraux
+# =============================
+def process_json(json_path, hyperspectral_shape):
+    """Convertit JSON LabelMe en masque aligné avec hyperspectral data"""
+    h_spec, w_spec = hyperspectral_shape
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    final_mask = np.zeros((h_spec, w_spec), dtype=np.uint8)
+
+    for shape in data["shapes"]:
+        label = shape["label"]
+        if label not in CLASS_MAP:
+            continue
+        cls_id = CLASS_MAP[label]
+        points = np.array(shape["points"], dtype=np.float32)  # float pour resize
+        # Redimensionner points si JSON image != hyperspectral
+        json_h = data.get("imageHeight", h_spec)
+        json_w = data.get("imageWidth", w_spec)
+        scale_x = w_spec / json_w
+        scale_y = h_spec / json_h
+        points[:,0] *= scale_x
+        points[:,1] *= scale_y
+        points_int = points.astype(np.int32)
+        temp_mask = np.zeros((h_spec, w_spec), dtype=np.uint8)
+        cv2.fillPoly(temp_mask, [points_int], 1)
+        final_mask[temp_mask==1] = cls_id
+
+    return final_mask
+
+# =============================
+# 3. Dataset PyTorch Hyperspectral + Masque
+# =============================
+class HyperDataset(Dataset):
+    def __init__(self, img_dir, mask_json_dir, class_map, normalize=True):
+        self.img_dir = img_dir
+        self.mask_json_dir = mask_json_dir
+        self.files = sorted([f.split('.')[0] for f in os.listdir(mask_json_dir) if f.endswith(".json")])
+        self.class_map = class_map
+        self.normalize = normalize
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        name = self.files[idx]
+
+        # Charger image hyperspectrale
+        img_path = os.path.join(self.img_dir, name + ".hdr")
+        img = sa.load(img_path)          # specarray -> shape [B,H,W]
+        img = img.astype(np.float32)
+
+        if self.normalize:
+            img = (img - img.mean()) / (img.std()+1e-8)
+
+        img_tensor = torch.from_numpy(img)   # [C,H,W]
+
+        # Charger et générer masque
+        json_path = os.path.join(self.mask_json_dir, name + ".json")
+        h_spec, w_spec = img.shape[1], img.shape[2]
+        mask_np = process_json(json_path, (h_spec, w_spec))
+        mask_tensor = torch.from_numpy(mask_np).long()  # [H,W]
+
+        return img_tensor, mask_tensor
+
+# =============================
+# 4. Créer DataLoader
+# =============================
+dataset = HyperDataset(IMG_DIR, MASK_JSON_DIR, CLASS_MAP, normalize=True)
+loader = DataLoader(dataset, batch_size=2, shuffle=True)
+
+# =============================
+# 5. Test
+# =============================
+for imgs, masks in loader:
+    print("Images:", imgs.shape)  # [B,C,H,W]
+    print("Masks:", masks.shape)  # [B,H,W]
+    break
+
+###############################33
+import os
+import json
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+import specarray as sa
+import cv2
+import random
+
+# =============================
+# CONFIGURATION
+# =============================
+IMG_DIR = "hyperspectral"       # dossier ENVI (.hdr)
+MASK_JSON_DIR = "annotations"   # JSON LabelMe
+PATCH_SIZE = 64                 # taille des patches
+STRIDE = 32                     # chevauchement des patches
+BATCH_SIZE = 8
+
+# =============================
+# 1. Récupérer les classes automatiquement
+# =============================
+def get_all_classes(json_dir):
+    classes = set()
+    for file in os.listdir(json_dir):
+        if not file.endswith(".json"):
+            continue
+        with open(os.path.join(json_dir, file), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for shape in data["shapes"]:
+            classes.add(shape["label"])
+    return ["background"] + sorted(list(classes))
+
+CLASS_MAP = {cls: i for i, cls in enumerate(get_all_classes(MASK_JSON_DIR))}
+print("Classes détectées :")
+for k,v in CLASS_MAP.items():
+    print(f"{v} -> {k}")
+
+# =============================
+# 2. Convertir JSON LabelMe en masque
+# =============================
+def process_json(json_path, h_spec, w_spec):
+    final_mask = np.zeros((h_spec, w_spec), dtype=np.uint8)
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    for shape in data["shapes"]:
+        label = shape["label"]
+        if label not in CLASS_MAP:
+            continue
+        cls_id = CLASS_MAP[label]
+        points = np.array(shape["points"], dtype=np.int32)
+        temp_mask = np.zeros((h_spec, w_spec), dtype=np.uint8)
+        cv2.fillPoly(temp_mask, [points], 1)
+        final_mask[temp_mask==1] = cls_id
+    return final_mask
+
+# =============================
+# 3. Dataset avec patches, augmentation et normalisation
+# =============================
+class HyperPatchDataset(Dataset):
+    def __init__(self, img_dir, mask_json_dir, class_map, patch_size=64, stride=32,
+                 normalize=True, augment=True):
+        self.img_dir = img_dir
+        self.mask_json_dir = mask_json_dir
+        self.files = sorted([f.split('.')[0] for f in os.listdir(mask_json_dir) if f.endswith(".json")])
+        self.class_map = class_map
+        self.patch_size = patch_size
+        self.stride = stride
+        self.normalize = normalize
+        self.augment = augment
+        # Liste de tous les patches
+        self.patch_list = []
+        self.build_patch_list()
+
+    def build_patch_list(self):
+        for name in self.files:
+            img_path = os.path.join(self.img_dir, name + ".hdr")
+            img = sa.load(img_path).astype(np.float32)  # [C,H,W]
+            h_spec, w_spec = img.shape[1], img.shape[2]
+
+            json_path = os.path.join(self.mask_json_dir, name + ".json")
+            mask = process_json(json_path, h_spec, w_spec)
+
+            # Découpage en patchs
+            for i in range(0, h_spec - self.patch_size + 1, self.stride):
+                for j in range(0, w_spec - self.patch_size + 1, self.stride):
+                    self.patch_list.append((name, i, j))
+
+    def __len__(self):
+        return len(self.patch_list)
+
+    def __getitem__(self, idx):
+        name, i, j = self.patch_list[idx]
+
+        # Charger image et masque
+        img_path = os.path.join(self.img_dir, name + ".hdr")
+        img = sa.load(img_path).astype(np.float32)  # [C,H,W]
+        h_spec, w_spec = img.shape[1], img.shape[2]
+
+        json_path = os.path.join(self.mask_json_dir, name + ".json")
+        mask = process_json(json_path, h_spec, w_spec)
+
+        # Découper patch
+        img_patch = img[:, i:i+self.patch_size, j:j+self.patch_size]
+        mask_patch = mask[i:i+self.patch_size, j:j+self.patch_size]
+
+        # Normalisation
+        if self.normalize:
+            img_patch = (img_patch - img_patch.mean()) / (img_patch.std() + 1e-8)
+
+        # Augmentation simple
+        if self.augment:
+            if random.random() > 0.5:  # flip horizontal
+                img_patch = np.flip(img_patch, axis=2).copy()
+                mask_patch = np.flip(mask_patch, axis=1).copy()
+            if random.random() > 0.5:  # flip vertical
+                img_patch = np.flip(img_patch, axis=1).copy()
+                mask_patch = np.flip(mask_patch, axis=0).copy()
+            k = random.randint(0,3)  # rotation 0-3 * 90°
+            img_patch = np.rot90(img_patch, k, axes=(1,2)).copy()
+            mask_patch = np.rot90(mask_patch, k, axes=(0,1)).copy()
+
+        img_tensor = torch.from_numpy(img_patch).float()  # [C,H,W]
+        mask_tensor = torch.from_numpy(mask_patch).long() # [H,W]
+
+        return img_tensor, mask_tensor
+
+# =============================
+# 4. Créer DataLoader
+# =============================
+dataset = HyperPatchDataset(IMG_DIR, MASK_JSON_DIR, CLASS_MAP, patch_size=PATCH_SIZE, stride=STRIDE)
+loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+
+# =============================
+# 5. Test rapide
+# =============================
+for imgs, masks in loader:
+    print("Batch images:", imgs.shape)  # [B,C,H,W]
+    print("Batch masks:", masks.shape)  # [B,H,W]
+    break
