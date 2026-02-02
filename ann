@@ -271,3 +271,66 @@ for i, img_file in enumerate(sample_imgs):
     plt.imshow(cv2.cvtColor(img_disp, cv2.COLOR_BGR2RGB))
     plt.axis("off")
 plt.show()
+
+
+from ultralytics import YOLO
+from matplotlib import pyplot as plt
+from PIL import Image
+import cv2
+
+
+
+model = YOLO('yolo11x.pt')  
+
+import yaml
+with open("data/data.yaml", 'r') as stream:
+    num_classes = str(yaml.safe_load(stream)['nc'])
+
+
+project = "data/models/yolov11/results"
+
+
+name = "40_epochs_yolox" 
+    
+#model.tune(data='data.yaml', epochs=27, iterations=50, optimizer='AdamW', plots=False, save=False)
+# Train the model
+results = model.train(data='data/data.yaml',
+                      project=project,
+                      name=name,
+                      epochs=40,
+                      patience=10, 
+                      imgsz=640,
+                      batch=16, device="cuda",)
+#optimizer: auto
+#results = model.val() 
+
+
+my_new_model = YOLO("data/models/yolov11/results/40_epochs_yolox/weights/last.pt")
+metrics = my_new_model.val(data='data.yaml',split="test")
+# metrics.box.r
+new_image = 'plaques-WW.jpg'
+image = cv2.imread(new_image, cv2.Gray)
+image = cv2.resize(image, (640,640))
+cv2.imwrite('plaques-WW.jpg', image)
+new_results = my_new_model.predict(image, conf=0.25)  
+
+new_result_array = new_results[0].plot()
+plt.figure(figsize=(9, 9))
+plt.imshow(new_result_array)
+
+#print(new_results[0].boxes)
+
+for r in new_results:
+
+    for box in r.boxes:
+
+        coordinates = (box.xyxy).tolist()[0]
+        
+        x1, y1, x2, y2 = coordinates[0], coordinates[1], coordinates[2], coordinates[3]
+
+        roi = image[int(y1):int(y2), int(x1):int(x2)]
+        plt.figure(figsize=(50, 50))
+        plt.imshow(roi)
+        roi.save(r'C:\Users\karim\Desktop\car_plate/roi')
+
+
