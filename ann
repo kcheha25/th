@@ -3,6 +3,7 @@ import cv2
 import json
 import random
 import copy
+import numpy as np
 
 IMG_DIR = "images"
 ANN_DIR = "annotations"
@@ -43,6 +44,14 @@ def load_image_and_plots(img_path, ann_path):
     if len(plots) == 0:
         raise RuntimeError(f"Erreur: aucun plot trouvé pour {img_path}")
     return img, plots
+
+def augment_brightness_contrast(img):
+    # Facteur de contraste entre 0.8 et 1.2
+    alpha = random.uniform(0.8, 1.2)
+    # Décalage de brillance entre -30 et 30
+    beta = random.randint(-30, 30)
+    img_aug = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
+    return img_aug
 
 def generate_images(img, plots, num_images, idx_start=0):
     H, W, _ = img.shape
@@ -86,6 +95,10 @@ def generate_images(img, plots, num_images, idx_start=0):
             placed_boxes.append(new_box)
             shapes.append({"label":"plot","points":[[x, y],[x+pw, y+ph]],"shape_type":"rectangle"})
 
+        # ---------------------------
+        # Data augmentation contraste/brillance
+        canvas = augment_brightness_contrast(canvas)
+
         img_name = f"separate_{idx}.png"
         json_name = f"separate_{idx}.json"
         cv2.imwrite(os.path.join(OUT_IMG, img_name), canvas)
@@ -111,4 +124,4 @@ ann2_path = os.path.join(ANN_DIR, img_files[1].replace(".jpg",".json").replace("
 img2, plots2 = load_image_and_plots(img2_path, ann2_path)
 idx = generate_images(img2, plots2, NUM_IMAGES_PER_ORIG, idx_start=idx)
 
-print(f"Génération terminée : {idx} images créées avec quelques plots remplacés par du noir.")
+print(f"Génération terminée : {idx} images créées avec plots noirs et contraste/brillance aléatoire.")
