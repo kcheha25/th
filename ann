@@ -133,7 +133,6 @@ import os
 import cv2
 import json
 import random
-import shutil
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -143,25 +142,23 @@ import matplotlib.pyplot as plt
 SRC_IMG_DIR = "aug_separate_final"
 SRC_ANN_DIR = "aug_separate_final_ann"
 YOLO_DIR = "yolo_dataset"
-IMG_SIZE = 640
-SPLIT = {"train":0.8, "val":0.1, "test":0.1}
-CLASS_NAMES = ["plot"]  # Classe unique pour tes plots
+NEW_HEIGHT = 640  # redimensionner hauteur
+CLASS_NAMES = ["plot"]
+YAML_FILE = os.path.join(YOLO_DIR, "dataset.yaml")
 
 os.makedirs(YOLO_DIR, exist_ok=True)
-for split in SPLIT.keys():
+for split in ["train","val","test"]:
     os.makedirs(os.path.join(YOLO_DIR, split, "images"), exist_ok=True)
     os.makedirs(os.path.join(YOLO_DIR, split, "labels"), exist_ok=True)
 
 # ------------------------------
-# Récupérer toutes les images et annotations
+# Récupérer images et shuffle
 # ------------------------------
 img_files = [f for f in os.listdir(SRC_IMG_DIR) if f.lower().endswith((".png",".jpg"))]
 random.shuffle(img_files)
-
 n_total = len(img_files)
-n_train = int(n_total * SPLIT["train"])
-n_val = int(n_total * SPLIT["val"])
-
+n_train = int(n_total*0.8)
+n_val = int(n_total*0.1)
 splits_files = {
     "train": img_files[:n_train],
     "val": img_files[n_train:n_train+n_val],
@@ -171,22 +168,24 @@ splits_files = {
 # ------------------------------
 # Conversion bbox JSON -> YOLO
 # ------------------------------
-def convert_bbox_yolo(bbox, orig_size, new_size=IMG_SIZE):
-    """bbox = [x1, y1, x2, y2]"""
+def convert_bbox_yolo(bbox, orig_size, new_size):
+    """bbox = [x1,y1,x2,y2], new_size=(new_h, new_w)"""
     orig_h, orig_w = orig_size
-    x_scale = new_size / orig_w
-    y_scale = new_size / orig_h
+    new_h, new_w = new_size
     x1, y1, x2, y2 = bbox
-    x1, x2 = x1*x_scale, x2*x_scale
-    y1, y2 = y1*y_scale, y2*y_scale
-    xc = (x1+x2)/2 / new_size
-    yc = (y1+y2)/2 / new_size
-    w = (x2-x1)/new_size
-    h = (y2-y1)/new_size
+    # redimension
+    x1_new = x1
+    x2_new = x2
+    y1_new = y1 * (new_h/orig_h)
+    y2_new = y2 * (new_h/orig_h)
+    xc = (x1_new + x2_new)/2 / new_w
+    yc = (y1_new + y2_new)/2 / new_h
+    w = (x2_new - x1_new)/new_w
+    h = (y2_new - y1_new)/new_h
     return [xc, yc, w, h]
 
 # ------------------------------
-# Traitement
+# Traitement images et labels
 # ------------------------------
 for split, files in splits_files.items():
     for f in files:
@@ -198,7 +197,9 @@ for split, files in splits_files.items():
 
         img = cv2.imread(img_path)
         H, W, _ = img.shape
-        img_resized = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+        new_h = NEW_HEIGHT
+        new_w = W
+        img_resized = cv2.resize(img, (new_w, new_h))
 
         # Sauvegarder l'image
         cv2.imwrite(os.path.join(YOLO_DIR, split, "images", f), img_resized)
@@ -212,7 +213,7 @@ for split, files in splits_files.items():
                 continue
             x1, y1 = shape["points"][0]
             x2, y2 = shape["points"][1]
-            bbox = convert_bbox_yolo([x1, y1, x2, y2], (H, W))
+            bbox = convert_bbox_yolo([x1,y1,x2,y2], (H,W), (new_h,new_w))
             cls_idx = CLASS_NAMES.index(shape["label"])
             yolo_lines.append(f"{cls_idx} {' '.join([str(round(v,6)) for v in bbox])}")
 
@@ -221,10 +222,27 @@ for split, files in splits_files.items():
         with open(lbl_file, "w") as lf:
             lf.write("\n".join(yolo_lines))
 
-print("Conversion YOLO terminée !")
+print("Conversion YOLO terminée avec hauteur redimensionnée et largeur conservée !")
 
 # ------------------------------
-# Affichage de quelques images avec annotations
+# Génération fichier YAML avec chemins absolus
+# ------------------------------
+yaml_content = f"""
+path: {os.path.abspath(YOLO_DIR)}
+train: {os.path.abspath(os.path.join(YOLO_DIR, 'train', 'images'))}
+val: {os.path.abspath(os.path.join(YOLO_DIR, 'val', 'images'))}
+test: {os.path.abspath(os.path.join(YOLO_DIR, 'test', 'images'))}
+nc: {len(CLASS_NAMES)}
+names: {CLASS_NAMES}
+"""
+
+with open(YAML_FILE, "w") as f:
+    f.write(yaml_content.strip())
+
+print(f"Fichier YAML généré : {YAML_FILE}")
+
+# ------------------------------
+# Affichage de 10 images pour vérification
 # ------------------------------
 def display_yolo_image(img_path, lbl_path):
     img = cv2.imread(img_path)
@@ -243,8 +261,7 @@ def display_yolo_image(img_path, lbl_path):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0),1)
     return img_disp
 
-# Affichage 10 images aléatoires du train
-sample_imgs = random.sample(os.listdir(os.path.join(YOLO_DIR,"train","images")), min(10, len(os.listdir(os.path.join(YOLO_DIR,"train","images")))))
+sample_imgs = random.sample(os.listdir(os.path.join(YOLO_DIR,"train","images")), min(10,len(os.listdir(os.path.join(YOLO_DIR,"train","images")))))
 plt.figure(figsize=(15,10))
 for i, img_file in enumerate(sample_imgs):
     img_path = os.path.join(YOLO_DIR,"train","images",img_file)
