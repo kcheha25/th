@@ -3,314 +3,142 @@ import cv2
 import json
 import random
 import numpy as np
+from itertools import combinations
 
-
+# Dossiers
 IMG_DIR = "images"
 ANN_DIR = "annotations"
 
 PAD_IMG = "images_padded"
 PAD_ANN = "annotations_padded"
 
-AUG_IMG = "aug_images"
-AUG_ANN = "aug_annotations"
-
+OUT_IMG = "aug_mixed"
+OUT_ANN = "aug_mixed_ann"
 
 os.makedirs(PAD_IMG, exist_ok=True)
 os.makedirs(PAD_ANN, exist_ok=True)
-os.makedirs(AUG_IMG, exist_ok=True)
-os.makedirs(AUG_ANN, exist_ok=True)
+os.makedirs(OUT_IMG, exist_ok=True)
+os.makedirs(OUT_ANN, exist_ok=True)
 
-
+# Paramètres
 TOTAL_GEN = 3000
-FULL_20 = 1000
+MAX_SWAPS = 5
+MAX_JITTER = 3
+MIN_PLOTS = 8
+MAX_PLOTS = 20
 
-MAX_JITTER = 4
-
-MIN_KEEP = 8
-MAX_KEEP = 20
-
-
-
+# -------------------------------
+# 1️⃣ Padding pour uniformiser height
+# -------------------------------
 max_h = 0
-
-
-for f in os.listdir(IMG_DIR):
-
-    if f.lower().endswith((".jpg", ".png")):
-
-        img = cv2.imread(os.path.join(IMG_DIR, f))
-
-        if img is None:
-            continue
-
-        h, w, _ = img.shape
-
-        max_h = max(max_h, h)
-
-
-
-for f in os.listdir(IMG_DIR):
-
-    if not f.lower().endswith((".jpg", ".png")):
-        continue
-
-
-    img_path = os.path.join(IMG_DIR, f)
-
-    json_path = os.path.join(
-        ANN_DIR,
-        f.replace(".jpg", ".json").replace(".png", ".json")
-    )
-
-
-    if not os.path.exists(json_path):
-        continue
-
-
-    img = cv2.imread(img_path)
-
+img_files = [f for f in os.listdir(IMG_DIR) if f.lower().endswith((".jpg",".png"))]
+for f in img_files:
+    img = cv2.imread(os.path.join(IMG_DIR, f))
     if img is None:
         continue
-
-
     h, w, _ = img.shape
+    max_h = max(max_h, h)
 
-
+for f in img_files:
+    img_path = os.path.join(IMG_DIR, f)
+    json_path = os.path.join(ANN_DIR, f.replace(".jpg",".json").replace(".png",".json"))
+    if not os.path.exists(json_path):
+        continue
+    img = cv2.imread(img_path)
+    h, w, _ = img.shape
     pad = max_h - h
-
-
-    padded = cv2.copyMakeBorder(
-        img,
-        0, pad,
-        0, 0,
-        cv2.BORDER_CONSTANT,
-        value=(0, 0, 0)
-    )
-
-
+    padded = cv2.copyMakeBorder(img, 0, pad, 0, 0, cv2.BORDER_CONSTANT, value=(0,0,0))
     cv2.imwrite(os.path.join(PAD_IMG, f), padded)
-
-
     with open(json_path) as jf:
         ann = json.load(jf)
-
-
     ann["imageHeight"] = max_h
     ann["imageWidth"] = w
-
-
     with open(os.path.join(PAD_ANN, os.path.basename(json_path)), "w") as jf:
         json.dump(ann, jf, indent=2)
 
-
-
+# -------------------------------
+# 2️⃣ Charger tous les plots
+# -------------------------------
 dataset = []
-
-
 for jf in os.listdir(PAD_ANN):
-
     if not jf.endswith(".json"):
         continue
-
-
     with open(os.path.join(PAD_ANN, jf)) as f:
         ann = json.load(f)
-
-
     img_path = os.path.join(PAD_IMG, ann["imagePath"])
-
-    if not os.path.exists(img_path):
-        continue
-
-
     img = cv2.imread(img_path)
-
     if img is None:
         continue
-
-
     plots = []
-
-
     for s in ann["shapes"]:
-
         if s.get("label") != "plot":
             continue
-
-
         pts = s["points"]
-
-
-        x1 = int(min(p[0] for p in pts))
-        y1 = int(min(p[1] for p in pts))
-        x2 = int(max(p[0] for p in pts))
-        y2 = int(max(p[1] for p in pts))
-
-
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-
-        x2 = min(img.shape[1], x2)
-        y2 = min(img.shape[0], y2)
-
-
+        x1, y1 = int(min(p[0] for p in pts)), int(min(p[1] for p in pts))
+        x2, y2 = int(max(p[0] for p in pts)), int(max(p[1] for p in pts))
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
         crop = img[y1:y2, x1:x2]
-
-
+        ph, pw, _ = crop.shape
         if crop.size == 0:
             continue
+        plots.append({"crop": crop, "pos": (x1, y1), "size": (pw, ph)})
+    if plots:
+        dataset.append({"image": img, "plots": plots})
 
-
-        ph, pw, _ = crop.shape
-
-
-        plots.append({
-            "bbox": (x1, y1, x2, y2),
-            "crop": crop,
-            "size": (pw, ph)
-        })
-
-
-    if len(plots) > 0:
-
-        dataset.append({
-            "image": img,
-            "plots": plots
-        })
-
-
-
+# -------------------------------
+# 3️⃣ Fonction safe jitter
+# -------------------------------
 def safe_jitter(x, y, w, h, W, H, m):
-
-    for _ in range(15):
-
+    for _ in range(10):
         nx = x + random.randint(-m, m)
         ny = y + random.randint(-m, m)
-
         if nx < 0 or ny < 0:
             continue
-
         if nx + w > W or ny + h > H:
             continue
-
         return nx, ny
-
-
     return x, y
 
-
+# -------------------------------
+# 4️⃣ Génération des images mélangées
+# -------------------------------
+all_plots = []
+for data in dataset:
+    all_plots.extend(data["plots"])
 
 idx = 0
-
-
-
 while idx < TOTAL_GEN:
+    canvas = np.zeros_like(dataset[0]["image"])
+    H, W, _ = canvas.shape
 
+    # Sélection aléatoire de plots pour cette image
+    n_plots = random.randint(MIN_PLOTS, min(MAX_PLOTS, len(all_plots)))
+    selected = random.sample(all_plots, n_plots)
 
-    base = random.choice(dataset)
+    # Appliquer des swaps aléatoires pour varier les combinaisons
+    plots_copy = selected.copy()
+    n_swaps = min(MAX_SWAPS, len(plots_copy)//2)
+    for _ in range(n_swaps):
+        a, b = random.sample(range(len(plots_copy)), 2)
+        plots_copy[a]["pos"], plots_copy[b]["pos"] = plots_copy[b]["pos"], plots_copy[a]["pos"]
 
-
-    img = base["image"]
-
-    H, W, _ = img.shape
-
-
-    canvas = np.zeros_like(img)
-
-
-    plots = base["plots"]
-
-
-    if len(plots) < MIN_KEEP:
-        continue
-
-
-    if idx < FULL_20:
-
-        valid = [p for p in plots if len(plots) >= 20]
-
-        if len(valid) < 20:
-            continue
-
-        keep = 20
-
-    else:
-
-        keep = random.randint(
-            MIN_KEEP,
-            min(MAX_KEEP, len(plots))
-        )
-
-
-    selected = random.sample(plots, keep)
-
-
-    random.shuffle(selected)
-
-
+    # Placer les plots sur le canvas
     shapes = []
-
-
-    for p in selected:
-
-
-        crop = p["crop"]
-        x1, y1, _, _ = p["bbox"]
+    for p in plots_copy:
+        x, y = p["pos"]
         pw, ph = p["size"]
+        nx, ny = safe_jitter(x, y, pw, ph, W, H, MAX_JITTER)
+        canvas[ny:ny+ph, nx:nx+pw] = p["crop"]
+        shapes.append({"label":"plot","points":[[nx, ny],[nx+pw, ny+ph]],"shape_type":"rectangle"})
 
-
-        if crop.shape[0] != ph or crop.shape[1] != pw:
-            continue
-
-
-        nx, ny = safe_jitter(
-            x1, y1,
-            pw, ph,
-            W, H,
-            MAX_JITTER
-        )
-
-
-        canvas[ny:ny+ph, nx:nx+pw] = crop
-
-
-        shapes.append({
-            "label": "plot",
-            "points": [
-                [nx, ny],
-                [nx+pw, ny+ph]
-            ],
-            "shape_type": "rectangle"
-        })
-
-
-
-    if len(shapes) < MIN_KEEP:
-        continue
-
-
-    img_name = f"aug_{idx}.png"
-    json_name = f"aug_{idx}.json"
-
-
-    cv2.imwrite(os.path.join(AUG_IMG, img_name), canvas)
-
-
-    ann = {
-        "version": "5.0.1",
-        "imagePath": img_name,
-        "imageHeight": H,
-        "imageWidth": W,
-        "shapes": shapes
-    }
-
-
-    with open(os.path.join(AUG_ANN, json_name), "w") as f:
+    # Sauvegarder image + JSON
+    img_name = f"mixed_{idx}.png"
+    json_name = f"mixed_{idx}.json"
+    cv2.imwrite(os.path.join(OUT_IMG, img_name), canvas)
+    ann = {"version":"5.0.1","imagePath":img_name,"imageHeight":H,"imageWidth":W,"shapes":shapes}
+    with open(os.path.join(OUT_ANN, json_name), "w") as f:
         json.dump(ann, f, indent=2)
-
-
     idx += 1
 
-
-
-print("Dataset généré :", idx, "images")
+print("Augmentation terminée :", idx, "images générées")
