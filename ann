@@ -13,8 +13,8 @@ ANN_DIR = "annotations"
 PAD_IMG = "images_padded"
 PAD_ANN = "annotations_padded"
 
-OUT_IMG = "aug_separate"
-OUT_ANN = "aug_separate_ann"
+OUT_IMG = "aug_separate_500"
+OUT_ANN = "aug_separate_500_ann"
 
 os.makedirs(PAD_IMG, exist_ok=True)
 os.makedirs(PAD_ANN, exist_ok=True)
@@ -27,14 +27,14 @@ os.makedirs(OUT_ANN, exist_ok=True)
 MIN_PLOTS = 5
 MAX_PLOTS = 20
 MAX_SWAPS = 5
-MAX_GEN = 1500
-SIZE_TOL = 5  # tolérance taille pour swap, ici on garde plots intacts donc pas utilisé
+NUM_IMAGES_PER_ORIG = 500
 
 # ------------------------------
 # 1️⃣ Padding uniforme
 # ------------------------------
 max_h = 0
 img_files = [f for f in os.listdir(IMG_DIR) if f.lower().endswith((".jpg",".png"))]
+
 for f in img_files:
     img = cv2.imread(os.path.join(IMG_DIR, f))
     if img is None: continue
@@ -80,7 +80,7 @@ for jf in os.listdir(PAD_ANN):
     dataset.append({"image": img, "plots": plots})
 
 # ------------------------------
-# 3️⃣ Vérification superposition
+# 3️⃣ Vérification chevauchement
 # ------------------------------
 def is_free(new_box, placed_boxes):
     nx1, ny1, nx2, ny2 = new_box
@@ -91,16 +91,16 @@ def is_free(new_box, placed_boxes):
     return True
 
 # ------------------------------
-# 4️⃣ Génération images par image
+# 4️⃣ Génération images par image originale
 # ------------------------------
 idx = 0
 
-for data in dataset:  # générer séparément pour chaque image
+for data in dataset:  # une génération par image
     bg_image = data["image"]
     plots = data["plots"]
     H, W, _ = bg_image.shape
 
-    for _ in range(MAX_GEN // len(dataset)):
+    for _ in range(NUM_IMAGES_PER_ORIG):
         canvas = bg_image.copy()
         n_plots = random.randint(MIN_PLOTS, min(MAX_PLOTS, len(plots)))
         selected = random.sample(plots, n_plots)
@@ -121,9 +121,9 @@ for data in dataset:  # générer séparément pour chaque image
             pw, ph = p["size"]
             new_box = (x, y, x+pw, y+ph)
 
-            # vérifier si placement possible
+            # Vérification placement
             if x+pw > W or y+ph > H or not is_free(new_box, placed_boxes):
-                # on laisse le fond original à cette place
+                # placer fond à la place
                 canvas[y:y+ph, x:x+pw] = bg_image[y:y+ph, x:x+pw]
                 continue
 
@@ -141,4 +141,4 @@ for data in dataset:  # générer séparément pour chaque image
                 json.dump(ann, f, indent=2)
             idx += 1
 
-print("Génération terminée :", idx, "images créées.")
+print(f"Génération terminée : {idx} images créées.")
