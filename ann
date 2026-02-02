@@ -4,34 +4,31 @@ import json
 import random
 import copy
 
-# Dossiers
 IMG_DIR = "images"
 ANN_DIR = "annotations"
 
 PAD_IMG = "images_padded"
 PAD_ANN = "annotations_padded"
 
-OUT_IMG = "aug_safe_bg"
-OUT_ANN = "aug_safe_bg_ann"
+OUT_IMG = "aug_crossplots"
+OUT_ANN = "aug_crossplots_ann"
 
 os.makedirs(PAD_IMG, exist_ok=True)
 os.makedirs(PAD_ANN, exist_ok=True)
 os.makedirs(OUT_IMG, exist_ok=True)
 os.makedirs(OUT_ANN, exist_ok=True)
 
-# Paramètres
 MIN_PLOTS = 5
 MAX_PLOTS = 20
 MAX_SWAPS = 5
 MAX_GEN = 3000
-SIZE_TOL = 5  # tolérance px pour échanger plots
+SIZE_TOL = 5
 
 # -------------------------------
 # 1️⃣ Padding uniforme
 # -------------------------------
 max_h = 0
 img_files = [f for f in os.listdir(IMG_DIR) if f.lower().endswith((".jpg",".png"))]
-
 for f in img_files:
     img = cv2.imread(os.path.join(IMG_DIR, f))
     if img is None: continue
@@ -88,23 +85,30 @@ def is_free(new_box, placed_boxes):
     return True
 
 # -------------------------------
-# 4️⃣ Génération images sécurisée avec remplissage du fond
+# 4️⃣ Génération avec plots croisés
 # -------------------------------
-all_plots = [p for data in dataset for p in data["plots"]]
-
-half_gen = MAX_GEN // 2
 idx = 0
+half_gen = MAX_GEN // 2
 
-for bg_data in dataset:
+for i_bg, bg_data in enumerate(dataset):
+    # le fond choisi
     bg_image = bg_data["image"]
+    bg_plots = bg_data["plots"]
+    # les plots de l'autre image
+    other_plots = dataset[1-i_bg]["plots"]
+    
     for _ in range(half_gen):
         canvas = bg_image.copy()
         H, W, _ = canvas.shape
-        n_plots = random.randint(MIN_PLOTS, min(MAX_PLOTS, len(all_plots)))
-        selected = random.sample(all_plots, n_plots)
-        plots_copy = copy.deepcopy(selected)
-
-        # Swaps aléatoires avec tolérance de taille
+        
+        # Mélanger plots du fond et plots de l'autre image
+        n_bg = random.randint(MIN_PLOTS//2, MAX_PLOTS//2)
+        n_other = random.randint(MIN_PLOTS//2, MAX_PLOTS//2)
+        selected_bg = random.sample(bg_plots, min(len(bg_plots), n_bg))
+        selected_other = random.sample(other_plots, min(len(other_plots), n_other))
+        plots_copy = copy.deepcopy(selected_bg + selected_other)
+        
+        # Swaps aléatoires avec tolérance taille
         n_swaps = min(MAX_SWAPS, len(plots_copy)//2)
         for _ in range(n_swaps):
             a, b = random.sample(range(len(plots_copy)), 2)
@@ -114,29 +118,27 @@ for bg_data in dataset:
             if abs(pw_a - pw_b) <= SIZE_TOL and abs(ph_a - ph_b) <= SIZE_TOL:
                 pos_a, pos_b = pa["pos"], pb["pos"]
                 pa["pos"], pb["pos"] = pos_b, pos_a
-
+        
         placed_boxes = []
         shapes = []
-
+        
         for p in plots_copy:
             x, y = p["pos"]
             pw, ph = p["size"]
             new_box = (x, y, x+pw, y+ph)
-
-            # Vérification placement correct
+            
             if x+pw > W or y+ph > H or not is_free(new_box, placed_boxes):
                 # pas possible → remettre le fond
                 canvas[y:y+ph, x:x+pw] = bg_image[y:y+ph, x:x+pw]
                 continue
-
-            # Placer plot
+            
             canvas[y:y+ph, x:x+pw] = p["crop"]
             placed_boxes.append(new_box)
             shapes.append({"label":"plot","points":[[x, y],[x+pw, y+ph]],"shape_type":"rectangle"})
-
+        
         if len(shapes) >= MIN_PLOTS:
-            img_name = f"safe_bg_{idx}.png"
-            json_name = f"safe_bg_{idx}.json"
+            img_name = f"cross_{idx}.png"
+            json_name = f"cross_{idx}.json"
             cv2.imwrite(os.path.join(OUT_IMG, img_name), canvas)
             ann = {"version":"5.0.1","imagePath":img_name,"imageHeight":H,"imageWidth":W,"shapes":shapes}
             with open(os.path.join(OUT_ANN, json_name), "w") as f:
