@@ -24,8 +24,6 @@ os.makedirs(OUT_ANN, exist_ok=True)
 # ------------------------------
 # Paramètres
 # ------------------------------
-MIN_PLOTS = 5
-MAX_PLOTS = 20
 MAX_SWAPS = 5
 NUM_IMAGES_PER_ORIG = 500
 
@@ -109,7 +107,7 @@ def is_free(new_box, placed_boxes):
     return True
 
 # ------------------------------
-# 4️⃣ Génération images séparées
+# 4️⃣ Génération images séparées sans min/max plots
 # ------------------------------
 idx = 0
 
@@ -120,9 +118,7 @@ for i, data in enumerate(dataset):  # traitement séparé
 
     for _ in range(NUM_IMAGES_PER_ORIG):
         canvas = bg_image.copy()
-        n_plots = random.randint(MIN_PLOTS, min(MAX_PLOTS, len(plots)))
-        selected = random.sample(plots, n_plots)
-        plots_copy = copy.deepcopy(selected)
+        plots_copy = copy.deepcopy(plots)  # utiliser tous les plots
 
         # Swaps aléatoires
         n_swaps = min(MAX_SWAPS, len(plots_copy)//2)
@@ -145,7 +141,7 @@ for i, data in enumerate(dataset):  # traitement séparé
             placed_boxes.append(new_box)
             shapes.append({"label":"plot","points":[[x, y],[x+pw, y+ph]],"shape_type":"rectangle"})
 
-        if len(shapes) >= MIN_PLOTS:
+        if len(shapes) > 0:
             img_name = f"separate_{idx}.png"
             json_name = f"separate_{idx}.json"
             cv2.imwrite(os.path.join(OUT_IMG, img_name), canvas)
