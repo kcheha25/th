@@ -14,7 +14,7 @@ os.makedirs(OUT_ANN, exist_ok=True)
 
 MAX_SWAPS = 5
 NUM_IMAGES_PER_ORIG = 400
-SIZE_TOL = 5  # tolérance pour swaps
+SIZE_TOL = 5
 
 def is_free(new_box, placed_boxes):
     nx1, ny1, nx2, ny2 = new_box
@@ -61,7 +61,7 @@ def generate_images(img, plots, num_images, idx_start=0):
                 pos_a, pos_b = plots_copy[a]["pos"], plots_copy[b]["pos"]
                 plots_copy[a]["pos"], plots_copy[b]["pos"] = pos_b, pos_a
 
-        # Choisir aléatoirement 0 à 2 plots à “supprimer”
+        # Supprimer aléatoirement 0 à 2 plots et mettre noir
         num_remove = random.randint(0, 2)
         remove_indices = random.sample(range(len(plots_copy)), num_remove)
 
@@ -75,8 +75,7 @@ def generate_images(img, plots, num_images, idx_start=0):
 
             # Supprimer le plot si choisi
             if i in remove_indices:
-                # fond original à la place
-                canvas[y:y+ph, x:x+pw] = img[y:y+ph, x:x+pw]
+                canvas[y:y+ph, x:x+pw] = 0  # noir
                 continue
 
             if x+pw > W or y+ph > H or not is_free(new_box, placed_boxes):
@@ -96,7 +95,7 @@ def generate_images(img, plots, num_images, idx_start=0):
         idx += 1
     return idx
 
-# --- Traitement image 1 ---
+# --- Image 1 ---
 img_files = sorted([f for f in os.listdir(IMG_DIR) if f.lower().endswith((".jpg",".png"))])
 if len(img_files) < 2:
     raise RuntimeError("Erreur: il faut au moins 2 images dans le dossier.")
@@ -106,10 +105,10 @@ ann1_path = os.path.join(ANN_DIR, img_files[0].replace(".jpg",".json").replace("
 img1, plots1 = load_image_and_plots(img1_path, ann1_path)
 idx = generate_images(img1, plots1, NUM_IMAGES_PER_ORIG, idx_start=0)
 
-# --- Traitement image 2 ---
+# --- Image 2 ---
 img2_path = os.path.join(IMG_DIR, img_files[1])
 ann2_path = os.path.join(ANN_DIR, img_files[1].replace(".jpg",".json").replace(".png",".json"))
 img2, plots2 = load_image_and_plots(img2_path, ann2_path)
 idx = generate_images(img2, plots2, NUM_IMAGES_PER_ORIG, idx_start=idx)
 
-print(f"Génération terminée : {idx} images créées avec quelques plots supprimés aléatoirement.")
+print(f"Génération terminée : {idx} images créées avec quelques plots remplacés par du noir.")
