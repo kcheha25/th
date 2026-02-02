@@ -10,14 +10,9 @@ import copy
 IMG_DIR = "images"
 ANN_DIR = "annotations"
 
-PAD_IMG = "images_padded"
-PAD_ANN = "annotations_padded"
+OUT_IMG = "aug_separate_final"
+OUT_ANN = "aug_separate_final_ann"
 
-OUT_IMG = "aug_separate_500"
-OUT_ANN = "aug_separate_500_ann"
-
-os.makedirs(PAD_IMG, exist_ok=True)
-os.makedirs(PAD_ANN, exist_ok=True)
 os.makedirs(OUT_IMG, exist_ok=True)
 os.makedirs(OUT_ANN, exist_ok=True)
 
@@ -25,78 +20,11 @@ os.makedirs(OUT_ANN, exist_ok=True)
 # Paramètres
 # ------------------------------
 MAX_SWAPS = 5
-NUM_IMAGES_PER_ORIG = 500
+NUM_IMAGES_PER_ORIG = 400
+SIZE_TOL = 5  # tolérance pour swap, utile si tu veux limiter swaps
 
 # ------------------------------
-# 1️⃣ Padding uniforme
-# ------------------------------
-max_h = 0
-img_files = [f for f in os.listdir(IMG_DIR) if f.lower().endswith((".jpg",".png"))]
-
-for f in img_files:
-    img_path = os.path.join(IMG_DIR, f)
-    img = cv2.imread(img_path)
-    if img is None:
-        print(f"Erreur: impossible de charger l'image {img_path}")
-        continue
-    h, w, _ = img.shape
-    max_h = max(max_h, h)
-
-for f in img_files:
-    img_path = os.path.join(IMG_DIR, f)
-    json_path = os.path.join(ANN_DIR, f.replace(".jpg",".json").replace(".png",".json"))
-    if not os.path.exists(json_path):
-        print(f"Erreur: annotation manquante pour {img_path}")
-        continue
-    img = cv2.imread(img_path)
-    if img is None:
-        print(f"Erreur: impossible de charger l'image {img_path} après vérification")
-        continue
-    h, w, _ = img.shape
-    pad = max_h - h
-    padded = cv2.copyMakeBorder(img, 0, pad, 0, 0, cv2.BORDER_CONSTANT, value=(0,0,0))
-    cv2.imwrite(os.path.join(PAD_IMG, f), padded)
-    with open(json_path) as jf:
-        ann = json.load(jf)
-    ann["imageHeight"] = max_h
-    ann["imageWidth"] = w
-    with open(os.path.join(PAD_ANN, os.path.basename(json_path)), "w") as jf:
-        json.dump(ann, jf, indent=2)
-
-# ------------------------------
-# 2️⃣ Charger images et plots
-# ------------------------------
-dataset = []
-for jf in sorted(os.listdir(PAD_ANN)):
-    if not jf.endswith(".json"): 
-        continue
-    with open(os.path.join(PAD_ANN, jf)) as f:
-        ann = json.load(f)
-    img_path = os.path.join(PAD_IMG, ann["imagePath"])
-    img = cv2.imread(img_path)
-    if img is None:
-        print(f"Erreur: impossible de charger l'image padding {img_path}")
-        continue
-    plots = []
-    for s in ann["shapes"]:
-        if s.get("label") != "plot": 
-            continue
-        pts = s["points"]
-        x1, y1 = int(min(p[0] for p in pts)), int(min(p[1] for p in pts))
-        x2, y2 = int(max(p[0] for p in pts)), int(max(p[1] for p in pts))
-        crop = img[y1:y2, x1:x2]
-        ph, pw, _ = crop.shape
-        plots.append({"crop": crop, "pos": (x1, y1), "size": (pw, ph)})
-    if len(plots) == 0:
-        print(f"Erreur: aucun plot trouvé pour {img_path}")
-        continue
-    dataset.append({"image": img, "plots": plots})
-
-if len(dataset) < 2:
-    raise RuntimeError("Erreur: moins de 2 images valides détectées après padding et vérification.")
-
-# ------------------------------
-# 3️⃣ Vérification chevauchement
+# Fonction de vérification chevauchement
 # ------------------------------
 def is_free(new_box, placed_boxes):
     nx1, ny1, nx2, ny2 = new_box
@@ -107,25 +35,48 @@ def is_free(new_box, placed_boxes):
     return True
 
 # ------------------------------
-# 4️⃣ Génération images séparées sans min/max plots
+# Charger une image et ses plots
 # ------------------------------
-idx = 0
+def load_image_and_plots(img_path, ann_path):
+    img = cv2.imread(img_path)
+    if img is None:
+        raise RuntimeError(f"Erreur: impossible de charger {img_path}")
+    with open(ann_path) as f:
+        ann = json.load(f)
+    plots = []
+    for s in ann["shapes"]:
+        if s.get("label") != "plot":
+            continue
+        pts = s["points"]
+        x1, y1 = int(min(p[0] for p in pts)), int(min(p[1] for p in pts))
+        x2, y2 = int(max(p[0] for p in pts)), int(max(p[1] for p in pts))
+        crop = img[y1:y2, x1:x2]
+        ph, pw, _ = crop.shape
+        plots.append({"crop": crop, "pos": (x1, y1), "size": (pw, ph)})
+    if len(plots) == 0:
+        raise RuntimeError(f"Erreur: aucun plot trouvé pour {img_path}")
+    return img, plots
 
-for i, data in enumerate(dataset):  # traitement séparé
-    bg_image = data["image"]
-    plots = data["plots"]
-    H, W, _ = bg_image.shape
+# ------------------------------
+# Génération d'images à partir d'une image
+# ------------------------------
+def generate_images(img, plots, num_images, idx_start=0):
+    H, W, _ = img.shape
+    idx = idx_start
+    for _ in range(num_images):
+        canvas = img.copy()
+        plots_copy = copy.deepcopy(plots)
 
-    for _ in range(NUM_IMAGES_PER_ORIG):
-        canvas = bg_image.copy()
-        plots_copy = copy.deepcopy(plots)  # utiliser tous les plots
-
-        # Swaps aléatoires
+        # Swaps aléatoires entre plots
         n_swaps = min(MAX_SWAPS, len(plots_copy)//2)
         for _ in range(n_swaps):
             a, b = random.sample(range(len(plots_copy)), 2)
-            pos_a, pos_b = plots_copy[a]["pos"], plots_copy[b]["pos"]
-            plots_copy[a]["pos"], plots_copy[b]["pos"] = pos_b, pos_a
+            pw_a, ph_a = plots_copy[a]["size"]
+            pw_b, ph_b = plots_copy[b]["size"]
+            # swap seulement si taille similaire
+            if abs(pw_a - pw_b) <= SIZE_TOL and abs(ph_a - ph_b) <= SIZE_TOL:
+                pos_a, pos_b = plots_copy[a]["pos"], plots_copy[b]["pos"]
+                plots_copy[a]["pos"], plots_copy[b]["pos"] = pos_b, pos_a
 
         placed_boxes = []
         shapes = []
@@ -135,19 +86,41 @@ for i, data in enumerate(dataset):  # traitement séparé
             pw, ph = p["size"]
             new_box = (x, y, x+pw, y+ph)
             if x+pw > W or y+ph > H or not is_free(new_box, placed_boxes):
-                canvas[y:y+ph, x:x+pw] = bg_image[y:y+ph, x:x+pw]
+                # fond original si placement impossible
+                canvas[y:y+ph, x:x+pw] = img[y:y+ph, x:x+pw]
                 continue
             canvas[y:y+ph, x:x+pw] = p["crop"]
             placed_boxes.append(new_box)
             shapes.append({"label":"plot","points":[[x, y],[x+pw, y+ph]],"shape_type":"rectangle"})
 
-        if len(shapes) > 0:
-            img_name = f"separate_{idx}.png"
-            json_name = f"separate_{idx}.json"
-            cv2.imwrite(os.path.join(OUT_IMG, img_name), canvas)
-            ann = {"version":"5.0.1","imagePath":img_name,"imageHeight":H,"imageWidth":W,"shapes":shapes}
-            with open(os.path.join(OUT_ANN, json_name), "w") as f:
-                json.dump(ann, f, indent=2)
-            idx += 1
+        img_name = f"separate_{idx}.png"
+        json_name = f"separate_{idx}.json"
+        cv2.imwrite(os.path.join(OUT_IMG, img_name), canvas)
+        ann_out = {"version":"5.0.1","imagePath":img_name,"imageHeight":H,"imageWidth":W,"shapes":shapes}
+        with open(os.path.join(OUT_ANN, json_name), "w") as f:
+            json.dump(ann_out, f, indent=2)
+        idx += 1
+    return idx
 
-print(f"Génération terminée : {idx} images créées (500 par image).")
+# ------------------------------
+# 1️⃣ Traitement premier image
+# ------------------------------
+img_files = sorted([f for f in os.listdir(IMG_DIR) if f.lower().endswith((".jpg",".png"))])
+if len(img_files) < 2:
+    raise RuntimeError("Erreur: il faut au moins 2 images dans le dossier.")
+
+# Première image
+img1_path = os.path.join(IMG_DIR, img_files[0])
+ann1_path = os.path.join(ANN_DIR, img_files[0].replace(".jpg",".json").replace(".png",".json"))
+img1, plots1 = load_image_and_plots(img1_path, ann1_path)
+idx = generate_images(img1, plots1, NUM_IMAGES_PER_ORIG, idx_start=0)
+
+# ------------------------------
+# 2️⃣ Traitement deuxième image
+# ------------------------------
+img2_path = os.path.join(IMG_DIR, img_files[1])
+ann2_path = os.path.join(ANN_DIR, img_files[1].replace(".jpg",".json").replace(".png",".json"))
+img2, plots2 = load_image_and_plots(img2_path, ann2_path)
+idx = generate_images(img2, plots2, NUM_IMAGES_PER_ORIG, idx_start=idx)
+
+print(f"Génération terminée : {idx} images créées.")
