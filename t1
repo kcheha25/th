@@ -1724,3 +1724,64 @@ cv2.imwrite(os.path.join(out_dir, f"band_{band_idx}_clahe.png"), band_clahe)
 plt.imsave(os.path.join(out_dir, f"ratio_{wl1}_{wl2}.png"), ratio_norm, cmap='gray')
 
 print("Images sauvegardées dans", out_dir)
+
+best_contrast = 0
+best_pair = (0,0)
+for i in range(n_wl):
+    for j in range(n_wl):
+        r = cube[:, i, :] / (cube[:, j, :] + 1e-8)
+        contrast = r.std()  # ou r.max() - r.min()
+        if contrast > best_contrast:
+            best_contrast = contrast
+            best_pair = (i,j)
+
+import numpy as np
+from tqdm import tqdm  # pour la barre de progression
+import matplotlib.pyplot as plt
+
+# cube : (y, n_wl, x)
+# wavelengths : vecteur des longueurs d'onde
+
+y, n_wl, x = cube.shape
+
+def find_best_ratio(cube):
+    best_score = -1
+    best_pair = (0, 0)
+    
+    for i in tqdm(range(n_wl)):
+        for j in range(n_wl):
+            if i == j:
+                continue  # éviter la division par soi-même
+            band1 = cube[:, i, :]
+            band2 = cube[:, j, :]
+            
+            ratio = band1 / (band2 + 1e-8)
+            
+            # normalisation
+            ratio_norm = (ratio - ratio.min()) / (ratio.max() - ratio.min())
+            
+            # score basé sur l'écart type (contraste global)
+            score = ratio_norm.std()
+            
+            if score > best_score:
+                best_score = score
+                best_pair = (i, j)
+    
+    return best_pair, best_score
+
+# Calcul du meilleur ratio
+best_pair, best_score = find_best_ratio(cube)
+i_best, j_best = best_pair
+print(f"Meilleur ratio : bandes {i_best} ({wavelengths[i_best]} nm) / {j_best} ({wavelengths[j_best]} nm), score={best_score:.4f}")
+
+# Affichage du ratio optimal
+band1 = cube[:, i_best, :]
+band2 = cube[:, j_best, :]
+ratio_opt = band1 / (band2 + 1e-8)
+ratio_opt_norm = (ratio_opt - ratio_opt.min()) / (ratio_opt.max() - ratio_opt.min())
+
+plt.figure()
+plt.imshow(ratio_opt_norm, cmap='gray')
+plt.title(f"Meilleur ratio {wavelengths[i_best]} nm / {wavelengths[j_best]} nm")
+plt.axis('off')
+plt.show()
