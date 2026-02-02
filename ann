@@ -125,3 +125,132 @@ img2, plots2 = load_image_and_plots(img2_path, ann2_path)
 idx = generate_images(img2, plots2, NUM_IMAGES_PER_ORIG, idx_start=idx)
 
 print(f"Génération terminée : {idx} images créées avec plots noirs et contraste/brillance aléatoire.")
+
+
+
+##############
+import os
+import cv2
+import json
+import random
+import shutil
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ------------------------------
+# Paramètres
+# ------------------------------
+SRC_IMG_DIR = "aug_separate_final"
+SRC_ANN_DIR = "aug_separate_final_ann"
+YOLO_DIR = "yolo_dataset"
+IMG_SIZE = 640
+SPLIT = {"train":0.8, "val":0.1, "test":0.1}
+CLASS_NAMES = ["plot"]  # Classe unique pour tes plots
+
+os.makedirs(YOLO_DIR, exist_ok=True)
+for split in SPLIT.keys():
+    os.makedirs(os.path.join(YOLO_DIR, split, "images"), exist_ok=True)
+    os.makedirs(os.path.join(YOLO_DIR, split, "labels"), exist_ok=True)
+
+# ------------------------------
+# Récupérer toutes les images et annotations
+# ------------------------------
+img_files = [f for f in os.listdir(SRC_IMG_DIR) if f.lower().endswith((".png",".jpg"))]
+random.shuffle(img_files)
+
+n_total = len(img_files)
+n_train = int(n_total * SPLIT["train"])
+n_val = int(n_total * SPLIT["val"])
+
+splits_files = {
+    "train": img_files[:n_train],
+    "val": img_files[n_train:n_train+n_val],
+    "test": img_files[n_train+n_val:]
+}
+
+# ------------------------------
+# Conversion bbox JSON -> YOLO
+# ------------------------------
+def convert_bbox_yolo(bbox, orig_size, new_size=IMG_SIZE):
+    """bbox = [x1, y1, x2, y2]"""
+    orig_h, orig_w = orig_size
+    x_scale = new_size / orig_w
+    y_scale = new_size / orig_h
+    x1, y1, x2, y2 = bbox
+    x1, x2 = x1*x_scale, x2*x_scale
+    y1, y2 = y1*y_scale, y2*y_scale
+    xc = (x1+x2)/2 / new_size
+    yc = (y1+y2)/2 / new_size
+    w = (x2-x1)/new_size
+    h = (y2-y1)/new_size
+    return [xc, yc, w, h]
+
+# ------------------------------
+# Traitement
+# ------------------------------
+for split, files in splits_files.items():
+    for f in files:
+        img_path = os.path.join(SRC_IMG_DIR, f)
+        ann_path = os.path.join(SRC_ANN_DIR, f.replace(".png",".json").replace(".jpg",".json"))
+        if not os.path.exists(ann_path):
+            print(f"Erreur: annotation manquante pour {f}")
+            continue
+
+        img = cv2.imread(img_path)
+        H, W, _ = img.shape
+        img_resized = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+
+        # Sauvegarder l'image
+        cv2.imwrite(os.path.join(YOLO_DIR, split, "images", f), img_resized)
+
+        # Lire annotation JSON
+        with open(ann_path) as af:
+            ann = json.load(af)
+        yolo_lines = []
+        for shape in ann["shapes"]:
+            if shape["label"] not in CLASS_NAMES:
+                continue
+            x1, y1 = shape["points"][0]
+            x2, y2 = shape["points"][1]
+            bbox = convert_bbox_yolo([x1, y1, x2, y2], (H, W))
+            cls_idx = CLASS_NAMES.index(shape["label"])
+            yolo_lines.append(f"{cls_idx} {' '.join([str(round(v,6)) for v in bbox])}")
+
+        # Sauvegarder annotation YOLO
+        lbl_file = os.path.join(YOLO_DIR, split, "labels", f.replace(".png",".txt").replace(".jpg",".txt"))
+        with open(lbl_file, "w") as lf:
+            lf.write("\n".join(yolo_lines))
+
+print("Conversion YOLO terminée !")
+
+# ------------------------------
+# Affichage de quelques images avec annotations
+# ------------------------------
+def display_yolo_image(img_path, lbl_path):
+    img = cv2.imread(img_path)
+    img_disp = img.copy()
+    H, W, _ = img.shape
+    with open(lbl_path) as f:
+        lines = f.readlines()
+    for l in lines:
+        cls, xc, yc, w, h = [float(v) for v in l.strip().split()]
+        x1 = int((xc - w/2)*W)
+        y1 = int((yc - h/2)*H)
+        x2 = int((xc + w/2)*W)
+        y2 = int((yc + h/2)*H)
+        cv2.rectangle(img_disp, (x1,y1),(x2,y2),(0,255,0),2)
+        cv2.putText(img_disp, CLASS_NAMES[int(cls)], (x1, y1-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0),1)
+    return img_disp
+
+# Affichage 10 images aléatoires du train
+sample_imgs = random.sample(os.listdir(os.path.join(YOLO_DIR,"train","images")), min(10, len(os.listdir(os.path.join(YOLO_DIR,"train","images")))))
+plt.figure(figsize=(15,10))
+for i, img_file in enumerate(sample_imgs):
+    img_path = os.path.join(YOLO_DIR,"train","images",img_file)
+    lbl_path = os.path.join(YOLO_DIR,"train","labels",img_file.replace(".png",".txt").replace(".jpg",".txt"))
+    img_disp = display_yolo_image(img_path, lbl_path)
+    plt.subplot(2,5,i+1)
+    plt.imshow(cv2.cvtColor(img_disp, cv2.COLOR_BGR2RGB))
+    plt.axis("off")
+plt.show()
