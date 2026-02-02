@@ -36,16 +36,24 @@ max_h = 0
 img_files = [f for f in os.listdir(IMG_DIR) if f.lower().endswith((".jpg",".png"))]
 
 for f in img_files:
-    img = cv2.imread(os.path.join(IMG_DIR, f))
-    if img is None: continue
+    img_path = os.path.join(IMG_DIR, f)
+    img = cv2.imread(img_path)
+    if img is None:
+        print(f"Erreur: impossible de charger l'image {img_path}")
+        continue
     h, w, _ = img.shape
     max_h = max(max_h, h)
 
 for f in img_files:
     img_path = os.path.join(IMG_DIR, f)
     json_path = os.path.join(ANN_DIR, f.replace(".jpg",".json").replace(".png",".json"))
-    if not os.path.exists(json_path): continue
+    if not os.path.exists(json_path):
+        print(f"Erreur: annotation manquante pour {img_path}")
+        continue
     img = cv2.imread(img_path)
+    if img is None:
+        print(f"Erreur: impossible de charger l'image {img_path} après vérification")
+        continue
     h, w, _ = img.shape
     pad = max_h - h
     padded = cv2.copyMakeBorder(img, 0, pad, 0, 0, cv2.BORDER_CONSTANT, value=(0,0,0))
@@ -61,23 +69,33 @@ for f in img_files:
 # 2️⃣ Charger images et plots
 # ------------------------------
 dataset = []
-for jf in os.listdir(PAD_ANN):
-    if not jf.endswith(".json"): continue
+for jf in sorted(os.listdir(PAD_ANN)):
+    if not jf.endswith(".json"): 
+        continue
     with open(os.path.join(PAD_ANN, jf)) as f:
         ann = json.load(f)
     img_path = os.path.join(PAD_IMG, ann["imagePath"])
     img = cv2.imread(img_path)
-    if img is None: continue
+    if img is None:
+        print(f"Erreur: impossible de charger l'image padding {img_path}")
+        continue
     plots = []
     for s in ann["shapes"]:
-        if s.get("label") != "plot": continue
+        if s.get("label") != "plot": 
+            continue
         pts = s["points"]
         x1, y1 = int(min(p[0] for p in pts)), int(min(p[1] for p in pts))
         x2, y2 = int(max(p[0] for p in pts)), int(max(p[1] for p in pts))
         crop = img[y1:y2, x1:x2]
         ph, pw, _ = crop.shape
         plots.append({"crop": crop, "pos": (x1, y1), "size": (pw, ph)})
+    if len(plots) == 0:
+        print(f"Erreur: aucun plot trouvé pour {img_path}")
+        continue
     dataset.append({"image": img, "plots": plots})
+
+if len(dataset) < 2:
+    raise RuntimeError("Erreur: moins de 2 images valides détectées après padding et vérification.")
 
 # ------------------------------
 # 3️⃣ Vérification chevauchement
@@ -91,11 +109,11 @@ def is_free(new_box, placed_boxes):
     return True
 
 # ------------------------------
-# 4️⃣ Génération images par image originale
+# 4️⃣ Génération images séparées
 # ------------------------------
 idx = 0
 
-for data in dataset:  # une génération par image
+for i, data in enumerate(dataset):  # traitement séparé
     bg_image = data["image"]
     plots = data["plots"]
     H, W, _ = bg_image.shape
@@ -106,7 +124,7 @@ for data in dataset:  # une génération par image
         selected = random.sample(plots, n_plots)
         plots_copy = copy.deepcopy(selected)
 
-        # Swaps aléatoires entre plots sélectionnés
+        # Swaps aléatoires
         n_swaps = min(MAX_SWAPS, len(plots_copy)//2)
         for _ in range(n_swaps):
             a, b = random.sample(range(len(plots_copy)), 2)
@@ -120,14 +138,9 @@ for data in dataset:  # une génération par image
             x, y = p["pos"]
             pw, ph = p["size"]
             new_box = (x, y, x+pw, y+ph)
-
-            # Vérification placement
             if x+pw > W or y+ph > H or not is_free(new_box, placed_boxes):
-                # placer fond à la place
                 canvas[y:y+ph, x:x+pw] = bg_image[y:y+ph, x:x+pw]
                 continue
-
-            # placer plot
             canvas[y:y+ph, x:x+pw] = p["crop"]
             placed_boxes.append(new_box)
             shapes.append({"label":"plot","points":[[x, y],[x+pw, y+ph]],"shape_type":"rectangle"})
@@ -141,4 +154,4 @@ for data in dataset:  # une génération par image
                 json.dump(ann, f, indent=2)
             idx += 1
 
-print(f"Génération terminée : {idx} images créées.")
+print(f"Génération terminée : {idx} images créées (500 par image).")
