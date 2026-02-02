@@ -21,8 +21,10 @@ os.makedirs(AUG_IMG, exist_ok=True)
 os.makedirs(AUG_ANN, exist_ok=True)
 
 
-N_GEN = 3000
-MAX_JITTER = 5
+TOTAL_GEN = 3000
+FULL_20 = 1000
+
+MAX_JITTER = 4
 
 MIN_KEEP = 8
 MAX_KEEP = 20
@@ -40,8 +42,7 @@ for f in os.listdir(IMG_DIR):
 
         h, w, _ = img.shape
 
-        if h > max_h:
-            max_h = h
+        max_h = max(max_h, h)
 
 
 
@@ -107,7 +108,6 @@ for jf in os.listdir(PAD_ANN):
 
     img = cv2.imread(os.path.join(PAD_IMG, ann["imagePath"]))
 
-
     plots = []
 
 
@@ -116,7 +116,6 @@ for jf in os.listdir(PAD_ANN):
         if s["label"] == "plot":
 
             pts = s["points"]
-
 
             x1 = int(min(p[0] for p in pts))
             y1 = int(min(p[1] for p in pts))
@@ -127,10 +126,16 @@ for jf in os.listdir(PAD_ANN):
             crop = img[y1:y2, x1:x2]
 
 
-            plots.append({
-                "bbox": (x1, y1, x2, y2),
-                "crop": crop
-            })
+            ph, pw, _ = crop.shape
+
+
+            if ph > 0 and pw > 0:
+
+                plots.append({
+                    "bbox": (x1, y1, x2, y2),
+                    "crop": crop,
+                    "size": (pw, ph)
+                })
 
 
     dataset.append({
@@ -140,8 +145,23 @@ for jf in os.listdir(PAD_ANN):
 
 
 
-def jitter(v, m):
-    return v + random.randint(-m, m)
+def safe_jitter(x, y, w, h, W, H, m):
+
+    for _ in range(10):
+
+        nx = x + random.randint(-m, m)
+        ny = y + random.randint(-m, m)
+
+        if nx < 0 or ny < 0:
+            continue
+
+        if nx + w > W or ny + h > H:
+            continue
+
+        return nx, ny
+
+
+    return x, y
 
 
 
@@ -149,15 +169,14 @@ idx = 0
 
 
 
-for i in range(N_GEN):
+for i in range(TOTAL_GEN):
 
 
     base = random.choice(dataset)
 
-
     img = base["image"]
 
-    h, w, _ = img.shape
+    H, W, _ = img.shape
 
 
     canvas = np.zeros_like(img)
@@ -170,10 +189,19 @@ for i in range(N_GEN):
         continue
 
 
-    keep = random.randint(
-        MIN_KEEP,
-        min(MAX_KEEP, len(plots))
-    )
+    if idx < FULL_20:
+
+        if len(plots) < 20:
+            continue
+
+        keep = 20
+
+    else:
+
+        keep = random.randint(
+            MIN_KEEP,
+            min(MAX_KEEP, len(plots))
+        )
 
 
     selected = random.sample(plots, keep)
@@ -181,6 +209,7 @@ for i in range(N_GEN):
 
     crops = [p["crop"] for p in selected]
     boxes = [p["bbox"] for p in selected]
+    sizes = [p["size"] for p in selected]
 
 
     random.shuffle(crops)
@@ -189,21 +218,19 @@ for i in range(N_GEN):
     shapes = []
 
 
-    for crop, box in zip(crops, boxes):
+    for crop, box, size in zip(crops, boxes, sizes):
 
 
-        x1, y1, x2, y2 = box
+        x1, y1, _, _ = box
+        pw, ph = size
 
 
-        ph, pw, _ = crop.shape
-
-
-        nx = jitter(x1, MAX_JITTER)
-        ny = jitter(y1, MAX_JITTER)
-
-
-        nx = max(0, min(nx, w - pw))
-        ny = max(0, min(ny, h - ph))
+        nx, ny = safe_jitter(
+            x1, y1,
+            pw, ph,
+            W, H,
+            MAX_JITTER
+        )
 
 
         canvas[ny:ny+ph, nx:nx+pw] = crop
@@ -230,8 +257,8 @@ for i in range(N_GEN):
     ann = {
         "version": "5.0.1",
         "imagePath": img_name,
-        "imageHeight": h,
-        "imageWidth": w,
+        "imageHeight": H,
+        "imageWidth": W,
         "shapes": shapes
     }
 
@@ -244,4 +271,4 @@ for i in range(N_GEN):
 
 
 
-print("Génération terminée :", idx)
+print("Terminé :", idx, "images générées")
