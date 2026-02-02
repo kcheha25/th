@@ -2,17 +2,16 @@ import os
 import cv2
 import json
 import random
-import numpy as np
 
 # Dossiers
-IMG_DIR = "images"         # contient tes deux images originales
+IMG_DIR = "images"         # contient image1 et image2
 ANN_DIR = "annotations"
 
 PAD_IMG = "images_padded"
 PAD_ANN = "annotations_padded"
 
-OUT_IMG = "aug_final"
-OUT_ANN = "aug_final_ann"
+OUT_IMG = "aug_swap_half"
+OUT_ANN = "aug_swap_half_ann"
 
 os.makedirs(PAD_IMG, exist_ok=True)
 os.makedirs(PAD_ANN, exist_ok=True)
@@ -83,56 +82,39 @@ for jf in os.listdir(PAD_ANN):
     dataset.append({"image": img, "plots": plots})
 
 # -------------------------------
-# 3️⃣ Vérification superposition
+# 3️⃣ Génération images : moitié fond image1 / moitié image2
 # -------------------------------
-def is_free(new_box, placed_boxes):
-    nx1, ny1, nx2, ny2 = new_box
-    for b in placed_boxes:
-        x1, y1, x2, y2 = b
-        if not (nx2 <= x1 or nx1 >= x2 or ny2 <= y1 or ny1 >= y2):
-            return False
-    return True
-
-# -------------------------------
-# 4️⃣ Génération images
-# -------------------------------
-# Regrouper tous les plots des deux images
 all_plots = [p for data in dataset for p in data["plots"]]
-
+half_gen = TOTAL_GEN // 2
 idx = 0
-while idx < TOTAL_GEN:
-    # choisir aléatoirement le fond parmi les deux images originales
-    bg_data = random.choice(dataset)
-    canvas = bg_data["image"].copy()
-    H, W, _ = canvas.shape
 
-    # nombre de plots à placer
-    n_plots = random.randint(MIN_PLOTS, min(MAX_PLOTS, len(all_plots)))
-    selected = random.sample(all_plots, n_plots)
-    plots_copy = selected.copy()
-    random.shuffle(plots_copy)
+for i, bg_data in enumerate(dataset):
+    # pour chaque fond, générer moitié du total
+    for _ in range(half_gen):
+        canvas = bg_data["image"].copy()
+        H, W, _ = canvas.shape
 
-    # swaps aléatoires pour augmenter variété
-    n_swaps = min(MAX_SWAPS, len(plots_copy)//2)
-    for _ in range(n_swaps):
-        a, b = random.sample(range(len(plots_copy)), 2)
-        plots_copy[a]["pos"], plots_copy[b]["pos"] = plots_copy[b]["pos"], plots_copy[a]["pos"]
+        n_plots = random.randint(MIN_PLOTS, min(MAX_PLOTS, len(all_plots)))
+        selected = random.sample(all_plots, n_plots)
+        plots_copy = selected.copy()
 
-    # placer les plots sur le canvas (fond original) sans superposition
-    placed_boxes = []
-    shapes = []
-    for p in plots_copy:
-        x, y = p["pos"]
-        pw, ph = p["size"]
-        new_box = (x, y, x+pw, y+ph)
-        if is_free(new_box, placed_boxes):
+        # swaps aléatoires
+        n_swaps = min(MAX_SWAPS, len(plots_copy)//2)
+        for _ in range(n_swaps):
+            a, b = random.sample(range(len(plots_copy)), 2)
+            plots_copy[a]["pos"], plots_copy[b]["pos"] = plots_copy[b]["pos"], plots_copy[a]["pos"]
+
+        # placer les plots aux positions exactes
+        shapes = []
+        for p in plots_copy:
+            x, y = p["pos"]
+            pw, ph = p["size"]
             canvas[y:y+ph, x:x+pw] = p["crop"]
-            placed_boxes.append(new_box)
             shapes.append({"label":"plot","points":[[x, y],[x+pw, y+ph]],"shape_type":"rectangle"})
 
-    if len(shapes) >= MIN_PLOTS:
-        img_name = f"final_{idx}.png"
-        json_name = f"final_{idx}.json"
+        # sauvegarder
+        img_name = f"swap_half_{idx}.png"
+        json_name = f"swap_half_{idx}.json"
         cv2.imwrite(os.path.join(OUT_IMG, img_name), canvas)
         ann = {"version":"5.0.1","imagePath":img_name,"imageHeight":H,"imageWidth":W,"shapes":shapes}
         with open(os.path.join(OUT_ANN, json_name), "w") as f:
