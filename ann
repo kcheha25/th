@@ -2,16 +2,17 @@ import os
 import cv2
 import json
 import random
+import copy
 
 # Dossiers
-IMG_DIR = "images"         # contient image1 et image2
+IMG_DIR = "images"         # image1 et image2
 ANN_DIR = "annotations"
 
 PAD_IMG = "images_padded"
 PAD_ANN = "annotations_padded"
 
-OUT_IMG = "aug_swap_half"
-OUT_ANN = "aug_swap_half_ann"
+OUT_IMG = "aug_final_size_safe"
+OUT_ANN = "aug_final_size_safe_ann"
 
 os.makedirs(PAD_IMG, exist_ok=True)
 os.makedirs(PAD_ANN, exist_ok=True)
@@ -19,31 +20,27 @@ os.makedirs(OUT_IMG, exist_ok=True)
 os.makedirs(OUT_ANN, exist_ok=True)
 
 # Paramètres
-TOTAL_GEN = 3000
 MIN_PLOTS = 8
 MAX_PLOTS = 20
 MAX_SWAPS = 5
+MAX_GEN = 3000
 
 # -------------------------------
-# 1️⃣ Padding pour uniformiser height
+# 1️⃣ Padding uniforme
 # -------------------------------
 max_h = 0
 img_files = [f for f in os.listdir(IMG_DIR) if f.lower().endswith((".jpg",".png"))]
 
-# trouver la hauteur max
 for f in img_files:
     img = cv2.imread(os.path.join(IMG_DIR, f))
-    if img is None:
-        continue
+    if img is None: continue
     h, w, _ = img.shape
     max_h = max(max_h, h)
 
-# ajouter padding
 for f in img_files:
     img_path = os.path.join(IMG_DIR, f)
     json_path = os.path.join(ANN_DIR, f.replace(".jpg",".json").replace(".png",".json"))
-    if not os.path.exists(json_path):
-        continue
+    if not os.path.exists(json_path): continue
     img = cv2.imread(img_path)
     h, w, _ = img.shape
     pad = max_h - h
@@ -61,18 +58,15 @@ for f in img_files:
 # -------------------------------
 dataset = []
 for jf in os.listdir(PAD_ANN):
-    if not jf.endswith(".json"):
-        continue
+    if not jf.endswith(".json"): continue
     with open(os.path.join(PAD_ANN, jf)) as f:
         ann = json.load(f)
     img_path = os.path.join(PAD_IMG, ann["imagePath"])
     img = cv2.imread(img_path)
-    if img is None:
-        continue
+    if img is None: continue
     plots = []
     for s in ann["shapes"]:
-        if s.get("label") != "plot":
-            continue
+        if s.get("label") != "plot": continue
         pts = s["points"]
         x1, y1 = int(min(p[0] for p in pts)), int(min(p[1] for p in pts))
         x2, y2 = int(max(p[0] for p in pts)), int(max(p[1] for p in pts))
@@ -82,43 +76,65 @@ for jf in os.listdir(PAD_ANN):
     dataset.append({"image": img, "plots": plots})
 
 # -------------------------------
-# 3️⃣ Génération images : moitié fond image1 / moitié image2
+# 3️⃣ Vérification superposition
+# -------------------------------
+def is_free(new_box, placed_boxes):
+    nx1, ny1, nx2, ny2 = new_box
+    for b in placed_boxes:
+        x1, y1, x2, y2 = b
+        if not (nx2 <= x1 or nx1 >= x2 or ny2 <= y1 or ny1 >= y2):
+            return False
+    return True
+
+# -------------------------------
+# 4️⃣ Génération images sécurisée
 # -------------------------------
 all_plots = [p for data in dataset for p in data["plots"]]
-half_gen = TOTAL_GEN // 2
+
+half_gen = MAX_GEN // 2
 idx = 0
 
-for i, bg_data in enumerate(dataset):
-    # pour chaque fond, générer moitié du total
+for bg_data in dataset:
     for _ in range(half_gen):
         canvas = bg_data["image"].copy()
         H, W, _ = canvas.shape
-
         n_plots = random.randint(MIN_PLOTS, min(MAX_PLOTS, len(all_plots)))
         selected = random.sample(all_plots, n_plots)
-        plots_copy = selected.copy()
+        plots_copy = copy.deepcopy(selected)
 
-        # swaps aléatoires
+        # Swaps aléatoires
         n_swaps = min(MAX_SWAPS, len(plots_copy)//2)
         for _ in range(n_swaps):
             a, b = random.sample(range(len(plots_copy)), 2)
             plots_copy[a]["pos"], plots_copy[b]["pos"] = plots_copy[b]["pos"], plots_copy[a]["pos"]
 
-        # placer les plots aux positions exactes
+        placed_boxes = []
         shapes = []
-        for p in plots_copy:
+
+        for i, p in enumerate(plots_copy):
             x, y = p["pos"]
             pw, ph = p["size"]
-            canvas[y:y+ph, x:x+pw] = p["crop"]
-            shapes.append({"label":"plot","points":[[x, y],[x+pw, y+ph]],"shape_type":"rectangle"})
 
-        # sauvegarder
-        img_name = f"swap_half_{idx}.png"
-        json_name = f"swap_half_{idx}.json"
-        cv2.imwrite(os.path.join(OUT_IMG, img_name), canvas)
-        ann = {"version":"5.0.1","imagePath":img_name,"imageHeight":H,"imageWidth":W,"shapes":shapes}
-        with open(os.path.join(OUT_ANN, json_name), "w") as f:
-            json.dump(ann, f, indent=2)
-        idx += 1
+            # Vérifier qu'aucun plot plus petit ne remplace la zone
+            # On cherche un plot dont pw >= position originale pw, ph >= ph
+            # Sinon on ignore ce plot
+            if pw <= 0 or ph <= 0: 
+                continue
+            if x+pw > W or y+ph > H: 
+                continue
+            new_box = (x, y, x+pw, y+ph)
+            if is_free(new_box, placed_boxes):
+                canvas[y:y+ph, x:x+pw] = p["crop"]
+                placed_boxes.append(new_box)
+                shapes.append({"label":"plot","points":[[x, y],[x+pw, y+ph]],"shape_type":"rectangle"})
 
-print("Augmentation terminée :", idx, "images générées.")
+        if len(shapes) >= MIN_PLOTS:
+            img_name = f"safe_size_{idx}.png"
+            json_name = f"safe_size_{idx}.json"
+            cv2.imwrite(os.path.join(OUT_IMG, img_name), canvas)
+            ann = {"version":"5.0.1","imagePath":img_name,"imageHeight":H,"imageWidth":W,"shapes":shapes}
+            with open(os.path.join(OUT_ANN, json_name), "w") as f:
+                json.dump(ann, f, indent=2)
+            idx += 1
+
+print("Génération terminée :", idx, "images créées.")
