@@ -4,158 +4,143 @@ import json
 import random
 import numpy as np
 
-input_img_dir = "images"
-input_json_dir = "annotations"
+IMG_DIR = "images_padded"
+ANN_DIR = "annotations_padded"
 
-padded_img_dir = "images_padded"
-padded_json_dir = "annotations_padded"
+OUT_IMG = "aug_images"
+OUT_ANN = "aug_annotations"
 
-plots_dir = "plots"
+os.makedirs(OUT_IMG, exist_ok=True)
+os.makedirs(OUT_ANN, exist_ok=True)
 
-gen_img_dir = "generated_images"
-gen_json_dir = "generated_annotations"
+N_GEN = 3000
+MAX_JITTER = 5
 
-os.makedirs(padded_img_dir, exist_ok=True)
-os.makedirs(padded_json_dir, exist_ok=True)
-os.makedirs(plots_dir, exist_ok=True)
-os.makedirs(gen_img_dir, exist_ok=True)
-os.makedirs(gen_json_dir, exist_ok=True)
+MIN_KEEP = 8
+MAX_KEEP = 20
 
 
-max_height = 0
+def load_dataset():
 
-for img_name in os.listdir(input_img_dir):
-    if img_name.endswith((".jpg", ".png")):
-        img = cv2.imread(os.path.join(input_img_dir, img_name))
-        h, w, _ = img.shape
-        max_height = max(max_height, h)
+    data = []
+
+    for jf in os.listdir(ANN_DIR):
+
+        if not jf.endswith(".json"):
+            continue
+
+        with open(os.path.join(ANN_DIR, jf)) as f:
+            ann = json.load(f)
+
+        img = cv2.imread(os.path.join(IMG_DIR, ann["imagePath"]))
+
+        plots = []
+
+        for s in ann["shapes"]:
+
+            if s["label"] == "plot":
+
+                pts = s["points"]
+
+                x1 = int(min(p[0] for p in pts))
+                y1 = int(min(p[1] for p in pts))
+                x2 = int(max(p[0] for p in pts))
+                y2 = int(max(p[1] for p in pts))
+
+                crop = img[y1:y2, x1:x2]
+
+                plots.append({
+                    "bbox": (x1, y1, x2, y2),
+                    "crop": crop
+                })
+
+        data.append({
+            "image": img,
+            "plots": plots
+        })
+
+    return data
 
 
-for img_name in os.listdir(input_img_dir):
+dataset = load_dataset()
 
-    if not img_name.endswith((".jpg", ".png")):
-        continue
 
-    img_path = os.path.join(input_img_dir, img_name)
-    json_path = os.path.join(
-        input_json_dir,
-        img_name.replace(".jpg", ".json").replace(".png", ".json")
-    )
+def jitter(v, m):
+    return v + random.randint(-m, m)
 
-    img = cv2.imread(img_path)
+
+idx = 0
+
+
+for i in range(N_GEN):
+
+    base = random.choice(dataset)
+
+    img = base["image"]
     h, w, _ = img.shape
 
-    pad = max_height - h
+    canvas = np.zeros_like(img)
 
-    padded = cv2.copyMakeBorder(
-        img,
-        0, pad,
-        0, 0,
-        cv2.BORDER_CONSTANT,
-        value=[0, 0, 0]
-    )
+    plots = base["plots"]
 
-    cv2.imwrite(os.path.join(padded_img_dir, img_name), padded)
-
-    with open(json_path) as f:
-        data = json.load(f)
-
-    data["imageHeight"] = max_height
-    data["imageWidth"] = w
-
-    with open(os.path.join(padded_json_dir, os.path.basename(json_path)), "w") as f:
-        json.dump(data, f, indent=2)
-
-
-counter = 0
-
-for json_file in os.listdir(padded_json_dir):
-
-    if not json_file.endswith(".json"):
+    if len(plots) < MIN_KEEP:
         continue
 
-    with open(os.path.join(padded_json_dir, json_file)) as f:
-        data = json.load(f)
+    keep = random.randint(
+        MIN_KEEP,
+        min(MAX_KEEP, len(plots))
+    )
 
-    img = cv2.imread(os.path.join(padded_img_dir, data["imagePath"]))
+    selected = random.sample(plots, keep)
 
-    for shape in data["shapes"]:
+    crops = [p["crop"] for p in selected]
+    boxes = [p["bbox"] for p in selected]
 
-        if shape["label"] == "plot":
-
-            pts = shape["points"]
-
-            x1 = int(min(p[0] for p in pts))
-            y1 = int(min(p[1] for p in pts))
-            x2 = int(max(p[0] for p in pts))
-            y2 = int(max(p[1] for p in pts))
-
-            crop = img[y1:y2, x1:x2]
-
-            name = f"plot_{counter}.png"
-
-            cv2.imwrite(os.path.join(plots_dir, name), crop)
-
-            counter += 1
-
-
-plot_files = os.listdir(plots_dir)
-
-sample_img = cv2.imread(os.path.join(padded_img_dir, os.listdir(padded_img_dir)[0]))
-IMG_H, IMG_W, _ = sample_img.shape
-
-N_IMAGES = 1000
-
-
-for i in range(N_IMAGES):
-
-    canvas = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
-
-    n = random.randint(10, 25)
+    random.shuffle(crops)
 
     shapes = []
 
-    for _ in range(n):
+    for crop, box in zip(crops, boxes):
 
-        pf = random.choice(plot_files)
+        x1, y1, x2, y2 = box
 
-        plot = cv2.imread(os.path.join(plots_dir, pf))
+        ph, pw, _ = crop.shape
 
-        ph, pw, _ = plot.shape
+        nx = jitter(x1, MAX_JITTER)
+        ny = jitter(y1, MAX_JITTER)
 
-        if pw >= IMG_W or ph >= IMG_H:
-            continue
+        nx = max(0, min(nx, w - pw))
+        ny = max(0, min(ny, h - ph))
 
-        x = random.randint(0, IMG_W - pw - 1)
-        y = random.randint(0, IMG_H - ph - 1)
-
-        canvas[y:y+ph, x:x+pw] = plot
+        canvas[ny:ny+ph, nx:nx+pw] = crop
 
         shapes.append({
             "label": "plot",
             "points": [
-                [x, y],
-                [x+pw, y+ph]
+                [nx, ny],
+                [nx+pw, ny+ph]
             ],
             "shape_type": "rectangle"
         })
 
 
-    img_name = f"gen_{i}.png"
-    json_name = f"gen_{i}.json"
+    name_img = f"aug_{idx}.png"
+    name_json = f"aug_{idx}.json"
 
-    cv2.imwrite(os.path.join(gen_img_dir, img_name), canvas)
+    cv2.imwrite(os.path.join(OUT_IMG, name_img), canvas)
 
-    data = {
+    ann = {
         "version": "5.0.1",
-        "imagePath": img_name,
-        "imageHeight": IMG_H,
-        "imageWidth": IMG_W,
+        "imagePath": name_img,
+        "imageHeight": h,
+        "imageWidth": w,
         "shapes": shapes
     }
 
-    with open(os.path.join(gen_json_dir, json_name), "w") as f:
-        json.dump(data, f, indent=2)
+    with open(os.path.join(OUT_ANN, name_json), "w") as f:
+        json.dump(ann, f, indent=2)
+
+    idx += 1
 
 
-print("Terminé")
+print("Images générées :", idx)
