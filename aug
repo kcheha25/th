@@ -202,3 +202,67 @@ for hdr_file in plot_files:
     plt.title(f"Ratio {WL1}nm/{WL2}nm - {hdr_file.stem}")
     plt.axis('off')
     plt.show()
+
+
+import numpy as np
+import spectral.io.envi as envi
+from pathlib import Path
+import cv2
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+PLOTS_DIR = Path("output_plots")
+OUTPUT_ENVI = Path("wgan_input")
+OUTPUT_ENVI.mkdir(exist_ok=True)
+
+hdr_files = list(PLOTS_DIR.glob("*/*.hdr"))
+
+H_min, W_min = float('inf'), float('inf')
+for hdr_file in hdr_files:
+    img = envi.open(str(hdr_file))
+    cube = np.array(img.load())
+    H_min = min(H_min, cube.shape[1])
+    W_min = min(W_min, cube.shape[2])
+
+H_min = int(H_min)
+W_min = int(W_min)
+
+def load_and_preprocess_cube(hdr_file, H_target, W_target):
+    img = envi.open(str(hdr_file))
+    cube = np.array(img.load())
+    cube = np.transpose(cube, (1,2,0))
+    cube_resized = np.zeros((H_target, W_target, cube.shape[2]), dtype=np.float32)
+    for b in range(cube.shape[2]):
+        cube_resized[:,:,b] = cv2.resize(cube[:,:,b], (W_target, H_target), interpolation=cv2.INTER_LINEAR)
+    cube_resized -= cube_resized.min()
+    if cube_resized.max() > 0:
+        cube_resized /= cube_resized.max()
+    return cube_resized, img.metadata
+
+for i, hdr_file in enumerate(hdr_files):
+    cube_proc, metadata = load_and_preprocess_cube(hdr_file, H_min, W_min)
+    out_dir = OUTPUT_ENVI / f"plot_{i}"
+    out_dir.mkdir(exist_ok=True)
+    hdr_path = out_dir / f"plot_{i}.hdr"
+    envi.save_image(
+        str(hdr_path),
+        cube_proc.transpose(2,0,1),
+        interleave='bil',
+        dtype=np.float32,
+        metadata={'wavelength': [float(w) for w in metadata['wavelength']]}
+    )
+
+class HSIDataset(Dataset):
+    def __init__(self, envi_dir):
+        self.dirs = list(Path(envi_dir).glob("plot_*"))
+    def __len__(self):
+        return len(self.dirs)
+    def __getitem__(self, idx):
+        hdr_file = list(self.dirs[idx].glob("*.hdr"))[0]
+        img = envi.open(str(hdr_file))
+        cube = np.array(img.load()).transpose(1,2,0)
+        cube = np.transpose(cube, (2,0,1))
+        return torch.tensor(cube, dtype=torch.float32)
+
+dataset = HSIDataset(OUTPUT_ENVI)
+dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
