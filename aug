@@ -76,3 +76,38 @@ for cube_dir in DATA_ROOT.iterdir():
         plot_id += 1
 
 print("Done")
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+PLOTS_DIR = Path("output_plots")
+WL1 = 900
+WL2 = 1100
+MAX_PLOTS = 10
+
+def find_nearest_idx(target, arr):
+    return np.argmin(np.abs(arr - target))
+
+def compute_ratio(cube, wavelengths):
+    i1 = find_nearest_idx(WL1, wavelengths)
+    i2 = find_nearest_idx(WL2, wavelengths)
+    band1 = cube[:, i1, :]
+    band2 = cube[:, i2, :]
+    ratio = band1 / (band2 + 1e-8)
+    ratio_norm = (ratio - ratio.min()) / (ratio.max() - ratio.min())
+    return ratio_norm
+
+plot_files = list(PLOTS_DIR.glob("*.npy"))[:MAX_PLOTS]
+
+for plot_path in plot_files:
+    cube = np.load(plot_path)
+    bands = cube.shape[1]
+    wavelengths = np.linspace(400, 1100, bands)
+    ratio_map = compute_ratio(cube, wavelengths)
+    plt.figure(figsize=(6, 4))
+    plt.imshow(ratio_map, cmap='gray', aspect='auto')
+    plt.title(f"Ratio {WL1}nm/{WL2}nm - {plot_path.name}")
+    plt.axis('off')
+    plt.show()
