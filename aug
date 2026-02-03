@@ -183,15 +183,22 @@ def compute_ratio(cube, wavelengths):
     ratio_norm = (ratio - ratio.min()) / (ratio.max() - ratio.min())
     return ratio_norm
 
-plot_dirs = list(PLOTS_DIR.iterdir())[:MAX_PLOTS]
+plot_files = list(PLOTS_DIR.glob("*/*.hdr"))[:MAX_PLOTS]
 
-for plot_dir in plot_dirs:
-    spec_plot = SpecArray.from_folder(plot_dir)
-    cube = np.array(spec_plot.spectral_albedo)  # (H, B, W)
-    wavelengths = np.array(spec_plot.wavelengths)
+for hdr_file in plot_files:
+    img = envi.open(str(hdr_file))
+    cube = np.array(img.load())  # shape (bands, rows, cols)
+    cube = np.transpose(cube, (1,0,2))  # (rows, bands, cols)
+    
+    if 'wavelength' in img.metadata:
+        wavelengths = np.array([float(w) for w in img.metadata['wavelength']])
+    else:
+        bands = cube.shape[1]
+        wavelengths = np.linspace(400, 1100, bands)
+    
     ratio_map = compute_ratio(cube, wavelengths)
-    plt.figure(figsize=(6, 4))
+    plt.figure(figsize=(6,4))
     plt.imshow(ratio_map, cmap='gray', aspect='auto')
-    plt.title(f"Ratio {WL1}nm/{WL2}nm - {plot_dir.name}")
+    plt.title(f"Ratio {WL1}nm/{WL2}nm - {hdr_file.stem}")
     plt.axis('off')
     plt.show()
