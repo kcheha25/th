@@ -183,15 +183,15 @@ def compute_ratio(cube, wavelengths):
     ratio_norm = (ratio - ratio.min()) / (ratio.max() - ratio.min())
     return ratio_norm
 
-plot_files = list(PLOTS_DIR.glob("*.npy"))[:MAX_PLOTS]
+plot_dirs = list(PLOTS_DIR.iterdir())[:MAX_PLOTS]
 
-for plot_path in plot_files:
-    cube = np.load(plot_path)
-    bands = cube.shape[1]
-    wavelengths = np.linspace(400, 1100, bands)
+for plot_dir in plot_dirs:
+    spec_plot = SpecArray.from_folder(plot_dir)
+    cube = np.array(spec_plot.spectral_albedo)  # (H, B, W)
+    wavelengths = np.array(spec_plot.wavelengths)
     ratio_map = compute_ratio(cube, wavelengths)
     plt.figure(figsize=(6, 4))
     plt.imshow(ratio_map, cmap='gray', aspect='auto')
-    plt.title(f"Ratio {WL1}nm/{WL2}nm - {plot_path.name}")
+    plt.title(f"Ratio {WL1}nm/{WL2}nm - {plot_dir.name}")
     plt.axis('off')
     plt.show()
