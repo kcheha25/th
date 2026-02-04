@@ -497,3 +497,13 @@ class WGAN_GP:
             fake_imgs = self.G(z)
             g_loss = self.D(fake_imgs).mean(); g_loss.backward(mone); self.g_optimizer.step()
             print(f'Iter {g_iter}: D loss real {d_loss_real.item():.4f} fake {d_loss_fake.item():.4f}, G loss {g_loss.item():.4f}')
+
+wgan = WGAN_GP(
+    channels=channels,
+    cuda=torch.cuda.is_available(),
+    batch_size=16,
+    generator_iters=1000,  # nombre total d’itérations du générateur
+    critic_iter=5,
+    lambda_term=10
+)
+wgan.train(dataloader)
