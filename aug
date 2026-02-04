@@ -383,20 +383,18 @@ from spectral import envi
 import numpy as np
 import cv2
 
+import torch
+from torch.utils.data import Dataset
+from pathlib import Path
+from spectral import envi
+import numpy as np
+import cv2
+
 class HyperspectralDataset(Dataset):
-    def __init__(self, root_dir):
+    def __init__(self, root_dir, target_size=32):
         self.dirs = [d for d in Path(root_dir).iterdir() if d.is_dir()]
-
-        H_list, W_list = [], []
-        for d in self.dirs:
-            hdr_file = list(d.glob("*.hdr"))[0]
-            img = envi.open(str(hdr_file))
-            cube = np.array(img.load())      # (B,H,W)
-            H_list.append(cube.shape[1])
-            W_list.append(cube.shape[2])
-
-        self.H_mean = int(np.mean(H_list))
-        self.W_mean = int(np.mean(W_list))
+        self.H_target = target_size
+        self.W_target = target_size
 
     def __len__(self):
         return len(self.dirs)
@@ -404,14 +402,15 @@ class HyperspectralDataset(Dataset):
     def __getitem__(self, idx):
         hdr_file = list(self.dirs[idx].glob("*.hdr"))[0]
         img = envi.open(str(hdr_file))
-        cube = np.array(img.load())          # (B,H,W)
+        cube = np.array(img.load())          # (Bands, H, W)
         B, H, W = cube.shape
-        cube_resized = np.zeros((B, self.H_mean, self.W_mean), dtype=np.float32)
+        cube_resized = np.zeros((B, self.H_target, self.W_target), dtype=np.float32)
         for b in range(B):
-            cube_resized[b] = cv2.resize(cube[b], (self.W_mean, self.H_mean), interpolation=cv2.INTER_LINEAR)
+            cube_resized[b] = cv2.resize(cube[b], (self.W_target, self.H_target), interpolation=cv2.INTER_LINEAR)
         cube_resized = torch.tensor(cube_resized, dtype=torch.float32)
         cube_resized = (cube_resized - cube_resized.min()) / (cube_resized.max() - cube_resized.min() + 1e-8)
-        return cube_resized, 0  # dummy label
+        return cube_resized, 0  # dummy label pour DataLoader
+
 
 
 BATCH_SIZE = 16
