@@ -516,3 +516,292 @@ wgan = WGAN_GP(
     lambda_term=10
 )
 wgan.train(dataloader)
+
+
+import os
+from torchvision import utils
+
+class WGAN_GP(WGAN_GP):  # hérite de ta classe existante
+    def save_model(self, g_path='./generator.pkl', d_path='./discriminator.pkl'):
+        torch.save(self.G.state_dict(), g_path)
+        torch.save(self.D.state_dict(), d_path)
+        print(f'Models saved: {g_path}, {d_path}')
+
+    def generate_and_save_images(self, n_samples=64, save_dir='generated_images', iter_num=0):
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        z = self.get_var(torch.randn(n_samples, 100, 1, 1))
+        samples = self.G(z).detach().cpu()
+        samples = (samples + 1)/2  # rescale [-1,1] -> [0,1]
+        grid = utils.make_grid(samples, nrow=8)
+        utils.save_image(grid, os.path.join(save_dir, f'iter_{iter_num:04d}.png'))
+        print(f'Saved generated images at iteration {iter_num}')
+
+if g_iter % 50 == 0:  # toutes les 50 itérations
+    self.generate_and_save_images(n_samples=64, iter_num=g_iter)
+    self.save_model()
+
+
+import torch
+import torch.nn as nn
+
+class Generator(nn.Module):
+    def __init__(self, channels, z_dim=256):
+        super().__init__()
+        self.main_module = nn.Sequential(
+            nn.ConvTranspose2d(z_dim, 2048, 4, 1, 0),
+            nn.BatchNorm2d(2048), nn.ReLU(True),
+            nn.ConvTranspose2d(2048, 1024, 4, 2, 1),
+            nn.BatchNorm2d(1024), nn.ReLU(True),
+            nn.ConvTranspose2d(1024, 512, 4, 2, 1),
+            nn.BatchNorm2d(512), nn.ReLU(True),
+            nn.ConvTranspose2d(512, 256, 4, 2, 1),
+            nn.BatchNorm2d(256), nn.ReLU(True),
+            nn.ConvTranspose2d(256, channels, 4, 2, 1)
+        )
+        self.output = nn.Tanh()
+
+    def forward(self, x):
+        return self.output(self.main_module(x))
+
+
+class Discriminator(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.main_module = nn.Sequential(
+            nn.Conv2d(channels, 256, 4, 2, 1),
+            nn.InstanceNorm2d(256, affine=True), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(256, 512, 4, 2, 1),
+            nn.InstanceNorm2d(512, affine=True), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(512, 1024, 4, 2, 1),
+            nn.InstanceNorm2d(1024, affine=True), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(1024, 2048, 4, 2, 1),
+            nn.InstanceNorm2d(2048, affine=True), nn.LeakyReLU(0.2, True)
+        )
+        self.output = nn.Conv2d(2048, 1, 4, 1, 0)
+
+    def forward(self, x):
+        return self.output(self.main_module(x))
+
+    def feature_extraction(self, x):
+        return self.main_module(x).view(-1, 2048*2*2)  # flatten selon nouvelle couche
+
+
+import torch
+import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from scipy.spatial.distance import cosine
+from scipy.stats import pearsonr
+
+# 1️⃣ Générer des cubes avec le WGAN
+def generate_augmented_cubes(wgan_model, num_samples=10, z_dim=256):
+    wgan_model.G.eval()
+    z = torch.randn(num_samples, z_dim, 1, 1)
+    z = z.cuda() if wgan_model.cuda else z
+    with torch.no_grad():
+        cubes = wgan_model.G(z).cpu().numpy()  # (N, C, H, W)
+    return cubes
+
+# 2️⃣ Spectral Angle Mapper (SAM)
+def compute_sam(real_cube, fake_cube):
+    bands, H, W = real_cube.shape
+    sam_map = np.zeros((H,W))
+    for i in range(H):
+        for j in range(W):
+            r = real_cube[:,i,j]
+            f = fake_cube[:,i,j]
+            cos_angle = np.dot(r,f) / (np.linalg.norm(r)*np.linalg.norm(f)+1e-8)
+            cos_angle = np.clip(cos_angle, -1, 1)
+            sam_map[i,j] = np.arccos(cos_angle)
+    return sam_map.mean()
+
+# 3️⃣ RMSE spectral
+def compute_rmse(real_cube, fake_cube):
+    return np.sqrt(np.mean((real_cube - fake_cube)**2))
+
+# 4️⃣ Corrélation spectrale
+def compute_spectral_corr(real_cube, fake_cube):
+    bands, H, W = real_cube.shape
+    corr_list = []
+    for i in range(H):
+        for j in range(W):
+            corr, _ = pearsonr(real_cube[:,i,j], fake_cube[:,i,j])
+            corr_list.append(corr)
+    return np.mean(corr_list)
+
+# 5️⃣ PCA / t-SNE visualization
+def visualize_pca_tsne(real_cubes, fake_cubes, n_components=3):
+    # Flatten HxW into samples
+    N_real = len(real_cubes)
+    N_fake = len(fake_cubes)
+    bands, H, W = real_cubes[0].shape
+    X_real = np.array([cube.reshape(bands, -1).T for cube in real_cubes])
+    X_real = X_real.reshape(N_real*H*W, bands)
+    X_fake = np.array([cube.reshape(bands, -1).T for cube in fake_cubes])
+    X_fake = X_fake.reshape(N_fake*H*W, bands)
+    
+    X = np.vstack([X_real, X_fake])
+    y = np.array([0]*(N_real*H*W) + [1]*(N_fake*H*W))
+
+    pca = PCA(n_components=n_components)
+    X_pca = pca.fit_transform(X)
+
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+    X_tsne = tsne.fit_transform(X)
+
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1)
+    plt.scatter(X_pca[:,0], X_pca[:,1], c=y, s=1, cmap='coolwarm')
+    plt.title("PCA Visualization")
+    plt.subplot(1,2,2)
+    plt.scatter(X_tsne[:,0], X_tsne[:,1], c=y, s=1, cmap='coolwarm')
+    plt.title("t-SNE Visualization")
+    plt.show()
+
+# 6️⃣ Pipeline pour un plot
+def evaluate_plot(wgan_model, real_cubes):
+    fake_cubes = generate_augmented_cubes(wgan_model, num_samples=len(real_cubes))
+    sam_scores = [compute_sam(r,f) for r,f in zip(real_cubes, fake_cubes)]
+    rmse_scores = [compute_rmse(r,f) for r,f in zip(real_cubes, fake_cubes)]
+    corr_scores = [compute_spectral_corr(r,f) for r,f in zip(real_cubes, fake_cubes)]
+    print(f"SAM mean: {np.mean(sam_scores):.4f} rad")
+    print(f"RMSE mean: {np.mean(rmse_scores):.4f}")
+    print(f"Spectral correlation mean: {np.mean(corr_scores):.4f}")
+    visualize_pca_tsne(real_cubes, fake_cubes)
+    return sam_scores, rmse_scores, corr_scores
+
+# real_cubes : liste des cubes réels pour un plot (shape B,H,W)
+# wgan : ton modèle WGAN_GP déjà entraîné
+
+sam_scores, rmse_scores, corr_scores = evaluate_plot(wgan, real_cubes)
+
+
+import torch
+import torch.nn as nn
+import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from scipy.stats import pearsonr
+
+# Generator et Discriminator identiques à l'entraînement
+class Generator(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.main_module = nn.Sequential(
+            nn.ConvTranspose2d(100, 1024, 4, 1, 0),
+            nn.BatchNorm2d(1024), nn.ReLU(True),
+            nn.ConvTranspose2d(1024, 512, 4, 2, 1),
+            nn.BatchNorm2d(512), nn.ReLU(True),
+            nn.ConvTranspose2d(512, 256, 4, 2, 1),
+            nn.BatchNorm2d(256), nn.ReLU(True),
+            nn.ConvTranspose2d(256, channels, 4, 2, 1)
+        )
+        self.output = nn.Tanh()
+    def forward(self, x):
+        return self.output(self.main_module(x))
+
+class Discriminator(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.main_module = nn.Sequential(
+            nn.Conv2d(channels, 256, 4, 2, 1),
+            nn.InstanceNorm2d(256, affine=True), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(256, 512, 4, 2, 1),
+            nn.InstanceNorm2d(512, affine=True), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(512, 1024, 4, 2, 1),
+            nn.InstanceNorm2d(1024, affine=True), nn.LeakyReLU(0.2, True)
+        )
+        self.output = nn.Conv2d(1024, 1, 4, 1, 0)
+    def forward(self, x):
+        return self.output(self.main_module(x))
+
+# WGAN wrapper pour charger et générer
+class WGAN_GP:
+    def __init__(self, channels, cuda=False):
+        self.G = Generator(channels)
+        self.D = Discriminator(channels)
+        self.C = channels
+        self.cuda = cuda
+        if cuda:
+            self.G.cuda()
+            self.D.cuda()
+    def load_weights(self, g_path="generator.pkl", d_path="discriminator.pkl"):
+        self.G.load_state_dict(torch.load(g_path, map_location='cuda' if self.cuda else 'cpu'))
+        self.D.load_state_dict(torch.load(d_path, map_location='cuda' if self.cuda else 'cpu'))
+        self.G.eval()
+        self.D.eval()
+    def generate(self, num_samples=10, z_dim=100):
+        z = torch.randn(num_samples, z_dim, 1, 1)
+        z = z.cuda() if self.cuda else z
+        with torch.no_grad():
+            cubes = self.G(z).cpu().numpy()
+        return cubes
+
+# Fonctions d’évaluation
+def compute_sam(real_cube, fake_cube):
+    bands, H, W = real_cube.shape
+    sam_map = np.zeros((H,W))
+    for i in range(H):
+        for j in range(W):
+            r = real_cube[:,i,j]
+            f = fake_cube[:,i,j]
+            cos_angle = np.dot(r,f)/(np.linalg.norm(r)*np.linalg.norm(f)+1e-8)
+            cos_angle = np.clip(cos_angle, -1, 1)
+            sam_map[i,j] = np.arccos(cos_angle)
+    return sam_map.mean()
+
+def compute_rmse(real_cube, fake_cube):
+    return np.sqrt(np.mean((real_cube-fake_cube)**2))
+
+def compute_spectral_corr(real_cube, fake_cube):
+    bands, H, W = real_cube.shape
+    corr_list = []
+    for i in range(H):
+        for j in range(W):
+            corr,_ = pearsonr(real_cube[:,i,j], fake_cube[:,i,j])
+            corr_list.append(corr)
+    return np.mean(corr_list)
+
+def visualize_pca_tsne(real_cubes, fake_cubes, n_components=3):
+    N_real = len(real_cubes)
+    N_fake = len(fake_cubes)
+    bands, H, W = real_cubes[0].shape
+    X_real = np.array([cube.reshape(bands,-1).T for cube in real_cubes]).reshape(N_real*H*W,bands)
+    X_fake = np.array([cube.reshape(bands,-1).T for cube in fake_cubes]).reshape(N_fake*H*W,bands)
+    X = np.vstack([X_real, X_fake])
+    y = np.array([0]*(N_real*H*W)+[1]*(N_fake*H*W))
+    pca = PCA(n_components=n_components)
+    X_pca = pca.fit_transform(X)
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+    X_tsne = tsne.fit_transform(X)
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1)
+    plt.scatter(X_pca[:,0], X_pca[:,1], c=y, s=1, cmap='coolwarm')
+    plt.title("PCA Visualization")
+    plt.subplot(1,2,2)
+    plt.scatter(X_tsne[:,0], X_tsne[:,1], c=y, s=1, cmap='coolwarm')
+    plt.title("t-SNE Visualization")
+    plt.show()
+
+def evaluate_plot(wgan_model, real_cubes):
+    fake_cubes = wgan_model.generate(num_samples=len(real_cubes))
+    sam_scores = [compute_sam(r,f) for r,f in zip(real_cubes, fake_cubes)]
+    rmse_scores = [compute_rmse(r,f) for r,f in zip(real_cubes, fake_cubes)]
+    corr_scores = [compute_spectral_corr(r,f) for r,f in zip(real_cubes, fake_cubes)]
+    print(f"SAM mean: {np.mean(sam_scores):.4f} rad")
+    print(f"RMSE mean: {np.mean(rmse_scores):.4f}")
+    print(f"Spectral correlation mean: {np.mean(corr_scores):.4f}")
+    visualize_pca_tsne(real_cubes, fake_cubes)
+    return sam_scores, rmse_scores, corr_scores
+
+# ----------------------------
+# Exemple d’utilisation
+channels = 128  # nombre de bandes
+wgan = WGAN_GP(channels=channels, cuda=torch.cuda.is_available())
+wgan.load_weights("generator.pkl", "discriminator.pkl")
+
+# real_cubes = liste de cubes hyperspectraux à comparer (N, C, H, W)
+# sam_scores, rmse_scores, corr_scores = evaluate_plot(wgan, real_cubes)
