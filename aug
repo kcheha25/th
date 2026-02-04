@@ -362,3 +362,118 @@ for cube_dir in cube_dirs[:10]:
     plt.title(f"{cube_dir.name} - band {mid_band}")
     plt.axis('off')
     plt.show()
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
+from spectral import envi
+import numpy as np
+
+class HyperspectralDataset(Dataset):
+    def __init__(self, root_dir):
+        self.dirs = [d for d in Path(root_dir).iterdir() if d.is_dir()]
+
+    def __len__(self):
+        return len(self.dirs)
+
+    def __getitem__(self, idx):
+        hdr_file = list(self.dirs[idx].glob("*.hdr"))[0]
+        img = envi.open(str(hdr_file))
+        cube = np.array(img.load())        # (Bands, H, W)
+        cube = torch.tensor(cube, dtype=torch.float32)
+        cube = (cube - cube.min()) / (cube.max() - cube.min() + 1e-8)
+        return cube, 0  # dummy label for DataLoader compatibility
+
+BATCH_SIZE = 16
+dataset = HyperspectralDataset("extrudes_eroded")
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+channels = next(iter(dataloader))[0].shape[1]  # nombre de bandes
+
+import torch.nn as nn
+import torch.optim as optim
+from torch.autograd import Variable, grad as autograd_grad
+
+class Generator(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.main_module = nn.Sequential(
+            nn.ConvTranspose2d(100, 1024, 4, 1, 0),
+            nn.BatchNorm2d(1024), nn.ReLU(True),
+            nn.ConvTranspose2d(1024, 512, 4, 2, 1),
+            nn.BatchNorm2d(512), nn.ReLU(True),
+            nn.ConvTranspose2d(512, 256, 4, 2, 1),
+            nn.BatchNorm2d(256), nn.ReLU(True),
+            nn.ConvTranspose2d(256, channels, 4, 2, 1)
+        )
+        self.output = nn.Tanh()
+    def forward(self, x):
+        return self.output(self.main_module(x))
+
+class Discriminator(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.main_module = nn.Sequential(
+            nn.Conv2d(channels, 256, 4, 2, 1),
+            nn.InstanceNorm2d(256, affine=True), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(256, 512, 4, 2, 1),
+            nn.InstanceNorm2d(512, affine=True), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(512, 1024, 4, 2, 1),
+            nn.InstanceNorm2d(1024, affine=True), nn.LeakyReLU(0.2, True)
+        )
+        self.output = nn.Conv2d(1024, 1, 4, 1, 0)
+    def forward(self, x):
+        return self.output(self.main_module(x))
+    def feature_extraction(self, x):
+        return self.main_module(x).view(-1, 1024*4*4)
+
+class WGAN_GP:
+    def __init__(self, channels, cuda=False, batch_size=16, generator_iters=1000, critic_iter=5, lambda_term=10):
+        self.G = Generator(channels)
+        self.D = Discriminator(channels)
+        self.C = channels
+        self.cuda = cuda
+        self.batch_size = batch_size
+        self.generator_iters = generator_iters
+        self.critic_iter = critic_iter
+        self.lambda_term = lambda_term
+        self.d_optimizer = optim.Adam(self.D.parameters(), lr=1e-4, betas=(0.5,0.999))
+        self.g_optimizer = optim.Adam(self.G.parameters(), lr=1e-4, betas=(0.5,0.999))
+        if cuda:
+            self.G.cuda(); self.D.cuda()
+    def get_var(self, x):
+        return x.cuda() if self.cuda else x
+    def gradient_penalty(self, real, fake):
+        eta = torch.rand(real.size(0),1,1,1)
+        eta = eta.expand(real.size())
+        eta = self.get_var(eta)
+        interpolated = eta * real + (1-eta)*fake
+        interpolated = Variable(interpolated, requires_grad=True)
+        prob_interpolated = self.D(interpolated)
+        gradients = autograd_grad(outputs=prob_interpolated, inputs=interpolated,
+                                  grad_outputs=torch.ones_like(prob_interpolated),
+                                  create_graph=True, retain_graph=True)[0]
+        gradients = gradients.view(gradients.size(0), -1)
+        return ((gradients.norm(2,dim=1)-1)**2).mean()*self.lambda_term
+    def train(self, loader):
+        data_iter = iter(loader)
+        one = self.get_var(torch.tensor(1., dtype=torch.float))
+        mone = -one
+        for g_iter in range(self.generator_iters):
+            for p in self.D.parameters(): p.requires_grad=True
+            for d_iter in range(self.critic_iter):
+                self.D.zero_grad()
+                try: real_imgs = next(data_iter)[0]
+                except StopIteration: data_iter = iter(loader); real_imgs = next(data_iter)[0]
+                if real_imgs.size(0)!=self.batch_size: continue
+                z = self.get_var(torch.randn(self.batch_size,100,1,1))
+                real_imgs = self.get_var(real_imgs)
+                d_loss_real = self.D(real_imgs).mean(); d_loss_real.backward(mone)
+                fake_imgs = self.G(z); d_loss_fake = self.D(fake_imgs).mean(); d_loss_fake.backward(one)
+                gp = self.gradient_penalty(real_imgs.data, fake_imgs.data); gp.backward()
+                self.d_optimizer.step()
+            for p in self.D.parameters(): p.requires_grad=False
+            self.G.zero_grad()
+            z = self.get_var(torch.randn(self.batch_size,100,1,1))
+            fake_imgs = self.G(z)
+            g_loss = self.D(fake_imgs).mean(); g_loss.backward(mone); self.g_optimizer.step()
+            print(f'Iter {g_iter}: D loss real {d_loss_real.item():.4f} fake {d_loss_fake.item():.4f}, G loss {g_loss.item():.4f}')
