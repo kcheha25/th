@@ -376,18 +376,27 @@ from spectral import envi
 import numpy as np
 import cv2
 
+import torch
+from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
+from spectral import envi
+import numpy as np
+import cv2
+
 class HyperspectralDataset(Dataset):
     def __init__(self, root_dir):
         self.dirs = [d for d in Path(root_dir).iterdir() if d.is_dir()]
 
-        H_min, W_min = float('inf'), float('inf')
+        H_list, W_list = [], []
         for d in self.dirs:
             hdr_file = list(d.glob("*.hdr"))[0]
             img = envi.open(str(hdr_file))
             cube = np.array(img.load())      # (B,H,W)
-            H_min = min(H_min, cube.shape[1])
-            W_min = min(W_min, cube.shape[2])
-        self.H_min, self.W_min = int(H_min), int(W_min)
+            H_list.append(cube.shape[1])
+            W_list.append(cube.shape[2])
+
+        self.H_mean = int(np.mean(H_list))
+        self.W_mean = int(np.mean(W_list))
 
     def __len__(self):
         return len(self.dirs)
@@ -397,12 +406,13 @@ class HyperspectralDataset(Dataset):
         img = envi.open(str(hdr_file))
         cube = np.array(img.load())          # (B,H,W)
         B, H, W = cube.shape
-        cube_resized = np.zeros((B, self.H_min, self.W_min), dtype=np.float32)
+        cube_resized = np.zeros((B, self.H_mean, self.W_mean), dtype=np.float32)
         for b in range(B):
-            cube_resized[b] = cv2.resize(cube[b], (self.W_min, self.H_min), interpolation=cv2.INTER_LINEAR)
+            cube_resized[b] = cv2.resize(cube[b], (self.W_mean, self.H_mean), interpolation=cv2.INTER_LINEAR)
         cube_resized = torch.tensor(cube_resized, dtype=torch.float32)
         cube_resized = (cube_resized - cube_resized.min()) / (cube_resized.max() - cube_resized.min() + 1e-8)
         return cube_resized, 0  # dummy label
+
 
 BATCH_SIZE = 16
 dataset = HyperspectralDataset("extrudes_eroded")
