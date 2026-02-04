@@ -336,3 +336,29 @@ for json_file in json_files:
         )
 
 print("Extraction terminée (sans trou/plots).")
+
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+from spectral import envi
+import random
+
+EXTRUDES_DIR = Path("extrudes_eroded")
+cube_dirs = list(EXTRUDES_DIR.iterdir())
+cube_dirs = [d for d in cube_dirs if d.is_dir()]
+random.shuffle(cube_dirs)
+
+for cube_dir in cube_dirs[:10]:
+    hdr_file = list(cube_dir.glob("*.hdr"))[0]
+    img = envi.open(str(hdr_file))
+    cube = np.array(img.load())          # (Bands, H, W)
+    cube = np.transpose(cube, (1,2,0))   # (H, W, Bands)
+    
+    mid_band = cube.shape[2] // 2
+    slice_img = cube[:, :, mid_band]
+    
+    plt.figure(figsize=(4,4))
+    plt.imshow(slice_img, cmap='gray')
+    plt.title(f"{cube_dir.name} - band {mid_band}")
+    plt.axis('off')
+    plt.show()
