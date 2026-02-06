@@ -807,60 +807,69 @@ wgan.load_weights("generator.pkl", "discriminator.pkl")
 # sam_scores, rmse_scores, corr_scores = evaluate_plot(wgan, real_cubes)
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from pathlib import Path
 import numpy as np
 import cv2
 import spectral.io.envi as envi
+from collections import defaultdict
 
 
 class SpectralPixelDataset(Dataset):
+
     def __init__(self, root_dir, target_size=32):
+
         self.root_dir = Path(root_dir)
         self.target_size = target_size
 
-        self.samples = []  # (spectrum, class_id)
+        self.samples = []
 
-        # Parcours des dossiers = classes
-        for class_dir in sorted(self.root_dir.iterdir()):
+        self.class_map = {}
+        self.class_names = []
 
-            if not class_dir.is_dir():
-                continue
+        class_counter = 0
 
-            class_id = int(class_dir.name)  # nom dossier = classe
+        hdr_files = list(self.root_dir.rglob("*.hdr"))
 
-            hdr_files = list(class_dir.glob("*.hdr"))
+        for hdr_file in sorted(hdr_files):
 
-            for hdr_file in hdr_files:
+            name = hdr_file.stem
+            prefix = name.split("_")[0]
 
-                img = envi.open(str(hdr_file))
-                cube = np.array(img.load())   # (B,H,W)
+            if prefix not in self.class_map:
+                self.class_map[prefix] = class_counter
+                self.class_names.append(prefix)
+                class_counter += 1
 
-                B, H, W = cube.shape
+            class_id = self.class_map[prefix]
 
-                # Resize spatial
-                cube_resized = np.zeros((B, target_size, target_size), dtype=np.float32)
+            img = envi.open(str(hdr_file))
+            cube = np.array(img.load())
 
-                for b in range(B):
-                    cube_resized[b] = cv2.resize(
-                        cube[b],
-                        (target_size, target_size),
-                        interpolation=cv2.INTER_LINEAR
-                    )
+            B, H, W = cube.shape
 
-                # Normalisation globale
-                cube_resized = (cube_resized - cube_resized.min()) / \
-                               (cube_resized.max() - cube_resized.min() + 1e-8)
+            cube_resized = np.zeros(
+                (B, self.target_size, self.target_size),
+                dtype=np.float32
+            )
 
-                # (B,H,W) -> (H*W,B)
-                spectra = cube_resized.reshape(B, -1).T
+            for b in range(B):
+                cube_resized[b] = cv2.resize(
+                    cube[b],
+                    (self.target_size, self.target_size),
+                    interpolation=cv2.INTER_LINEAR
+                )
 
-                # Stockage
-                for s in spectra:
-                    self.samples.append((
-                        torch.tensor(s, dtype=torch.float32),
-                        class_id
-                    ))
+            cube_resized = (cube_resized - cube_resized.min()) / \
+                           (cube_resized.max() - cube_resized.min() + 1e-8)
+
+            spectra = cube_resized.reshape(B, -1).T
+
+            for s in spectra:
+                self.samples.append((
+                    torch.tensor(s, dtype=torch.float32),
+                    class_id
+                ))
 
     def __len__(self):
         return len(self.samples)
@@ -868,43 +877,42 @@ class SpectralPixelDataset(Dataset):
     def __getitem__(self, idx):
         return self.samples[idx]
 
-from collections import defaultdict
 
-
-def create_class_dataloaders(dataset, batch_size=64, shuffle=True):
+def create_class_dataloaders(dataset, batch_size=128):
 
     class_indices = defaultdict(list)
 
     for i, (_, label) in enumerate(dataset):
         class_indices[label].append(i)
 
-    dataloaders = {}
+    loaders = {}
 
     for label, indices in class_indices.items():
 
-        subset = torch.utils.data.Subset(dataset, indices)
+        subset = Subset(dataset, indices)
 
-        loader = DataLoader(
+        loaders[label] = DataLoader(
             subset,
             batch_size=batch_size,
-            shuffle=shuffle,
+            shuffle=True,
             drop_last=True
         )
 
-        dataloaders[label] = loader
+    return loaders
 
-    return dataloaders
 
-dataset = SpectralPixelDataset("extrudes_eroded", target_size=32)
+if __name__ == "__main__":
 
-class_loaders = create_class_dataloaders(
-    dataset,
-    batch_size=128
-)
+    dataset = SpectralPixelDataset("extrudes_eroded", target_size=32)
 
-print("Classes:", class_loaders.keys())
+    loaders = create_class_dataloaders(dataset, batch_size=128)
 
-# Exemple : itérer sur classe 0
-for spectra, labels in class_loaders[0]:
-    print(spectra.shape)   # (BATCH, Bands)
-    break
+    print(dataset.class_map)
+    print(dataset.class_names)
+
+    class_id = dataset.class_map[dataset.class_names[0]]
+
+    for spectra, labels in loaders[class_id]:
+        print(spectra.shape)
+        print(labels.shape)
+        break
