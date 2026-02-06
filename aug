@@ -1156,3 +1156,83 @@ for class_id, loader in loaders.items():
             total_count += 1
     
     print(f"Classe {dataset.class_names[class_id]} : {null_count}/{total_count} spectres nuls ou quasi-constants")
+
+import torch
+from torch.utils.data import Dataset
+from pathlib import Path
+import numpy as np
+import spectral.io.envi as envi
+from collections import defaultdict
+
+class SpectralPixelDatasetOriginal(Dataset):
+    """
+    Dataset qui conserve pour chaque spectre ses coordonnées spatiales (h, w) dans le cube original, sans resize.
+    """
+    def __init__(self, root_dir):
+        self.root_dir = Path(root_dir)
+        self.samples = []  # list of tuples: (spectrum tensor, class_id, (h, w))
+        self.class_map = {}
+        self.class_names = []
+
+        class_counter = 0
+        hdr_files = list(self.root_dir.rglob("*.hdr"))
+
+        for hdr_file in sorted(hdr_files):
+            name = hdr_file.stem
+            prefix = name.split("_")[0]
+
+            if prefix not in self.class_map:
+                self.class_map[prefix] = class_counter
+                self.class_names.append(prefix)
+                class_counter += 1
+
+            class_id = self.class_map[prefix]
+
+            img = envi.open(str(hdr_file))
+            cube = np.array(img.load())  # shape (B, H, W)
+            B, H, W = cube.shape
+
+            # Normalisation par cube
+            cube = (cube - cube.min()) / (cube.max() - cube.min() + 1e-8)
+
+            for h in range(H):
+                for w in range(W):
+                    spectrum = cube[:, h, w]
+                    self.samples.append((
+                        torch.tensor(spectrum, dtype=torch.float32),
+                        class_id,
+                        (h, w)
+                    ))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]  # returns (spectrum, class_id, (h, w))
+
+
+# --------------------------
+# Vérification des spectres nuls
+# --------------------------
+def check_null_spectra(dataset, threshold=1e-6):
+    """
+    Retourne un dictionnaire par classe avec les indices et positions des spectres quasi nuls.
+    """
+    null_positions = defaultdict(list)
+
+    for idx, (spectrum, class_id, (h, w)) in enumerate(dataset):
+        if torch.var(spectrum) < threshold:
+            null_positions[class_id].append((idx, h, w))
+
+    # Affichage
+    for class_id, positions in null_positions.items():
+        print(f"Classe {dataset.class_names[class_id]} : {len(positions)} spectres nuls")
+        if len(positions) > 0:
+            print("Exemples (index, h, w) :", positions[:10])  # montre les 10 premiers
+
+    return null_positions
+
+
+if __name__ == "__main__":
+    dataset = SpectralPixelDatasetOriginal("extrudes_eroded")
+    null_positions = check_null_spectra(dataset)
