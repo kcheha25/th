@@ -1115,3 +1115,26 @@ if __name__ == "__main__":
     loader = loaders[class_id]
 
     netG, netD = train_single_class(loader)
+
+
+with torch.no_grad():
+    fake = netG(fixed_noise).cpu()  # shape (16,1,n_bands)
+    real_batch = next(iter(loader))[0][:16].cpu()  # récupère les 16 premiers spectres réels du loader
+    real_batch = real_batch.unsqueeze(1) if real_batch.dim() == 2 else real_batch  # (16,1,n_bands)
+
+    plt.figure(figsize=(12,5))
+    for k in range(16):
+        plt.plot(real_batch[k,0], color='blue', alpha=0.5, label='Real' if k==0 else "")
+        plt.plot(fake[k,0], color='red', alpha=0.5, label='Fake' if k==0 else "")
+    plt.title(f"Epoch {epoch}")
+    plt.xlabel("Band")
+    plt.ylabel("Reflectance")
+    plt.legend()
+    plt.show()
+
+pearson = np.mean([
+    np.corrcoef(real_np[i], fake_np[i])[0,1] 
+    if np.std(real_np[i])>1e-8 and np.std(fake_np[i])>1e-8 
+    else 0.0
+    for i in range(real_np.shape[0])
+])
