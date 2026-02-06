@@ -1298,3 +1298,103 @@ def create_class_dataloaders(dataset, batch_size=128):
         subset = Subset(dataset, indices)
         loaders[label] = DataLoader(subset, batch_size=batch_size, shuffle=True, drop_last=True)
     return loaders
+
+
+import os
+
+def train_single_class(loader, class_name="class0"):
+    netD = Discriminator(n_bands).to(device)
+    netG = Generator(nz, n_bands).to(device)
+    netD.apply(weights_init)
+    netG.apply(weights_init)
+
+    optimizerD = optim.Adam(netD.parameters(), lr=lr, betas=(0, 0.9))
+    optimizerG = optim.Adam(netG.parameters(), lr=lr, betas=(0, 0.9))
+
+    # fixed noise pour générer toujours les mêmes fakes
+    fixed_noise = torch.randn(16, nz, 1, device=device)
+
+    # selectionner les 16 premiers spectres réels fixes du loader
+    real_batch_iter = iter(loader)
+    real_fixed = next(real_batch_iter)[0][:16].to(device)
+    if real_fixed.dim() == 2:
+        real_fixed = real_fixed.unsqueeze(1)  # (16,1,n_bands)
+
+    os.makedirs(f"./results/{class_name}", exist_ok=True)
+    best_sam = float('inf')
+    best_netG = None
+    best_netD = None
+
+    for epoch in range(epoch_num):
+        epoch_metrics = {'MSE': [], 'Pearson': [], 'SAM': []}
+
+        for i, data in enumerate(loader):
+            real_cpu = data[0].to(device)
+            b_size = real_cpu.size(0)
+
+            for _ in range(n_critic):
+                netD.zero_grad()
+                noise = torch.randn(b_size, nz, 1, device=device)
+                fake = netG(noise)
+
+                eps = torch.rand(b_size, 1, 1, device=device)
+                x_p = eps * real_cpu + (1 - eps) * fake
+                x_p.requires_grad_(True)
+                grad = autograd.grad(
+                    outputs=netD(x_p).sum(),
+                    inputs=x_p,
+                    create_graph=True,
+                    retain_graph=True
+                )[0]
+                grad_norm = grad.view(b_size, -1).norm(2, dim=1)
+                grad_penalty = p_coeff * ((grad_norm - 1) ** 2).mean()
+
+                loss_D = torch.mean(netD(fake)) - torch.mean(netD(real_cpu)) + grad_penalty
+                loss_D.backward()
+                optimizerD.step()
+
+            netG.zero_grad()
+            noise = torch.randn(b_size, nz, 1, device=device)
+            fake = netG(noise)
+            loss_G = -torch.mean(netD(fake))
+            loss_G.backward()
+            optimizerG.step()
+
+            metrics = compute_metrics(real_cpu, fake)
+            for k in epoch_metrics:
+                epoch_metrics[k].append(metrics[k])
+
+        epoch_avg_metrics = {k: np.mean(v) for k,v in epoch_metrics.items()}
+        print(f"Epoch {epoch} | Loss_D: {loss_D.item():.4f} | Loss_G: {loss_G.item():.4f} | "
+              f"MSE: {epoch_avg_metrics['MSE']:.4f} | Pearson: {epoch_avg_metrics['Pearson']:.4f} | SAM: {epoch_avg_metrics['SAM']:.4f}")
+
+        # -------------------- Visualisation --------------------
+        with torch.no_grad():
+            fake_fixed = netG(fixed_noise).cpu()
+            plt.figure(figsize=(12,5))
+            for k in range(16):
+                plt.plot(real_fixed[k,0].cpu(), color='blue', alpha=0.5, label='Real' if k==0 else "")
+                plt.plot(fake_fixed[k,0].cpu(), color='red', alpha=0.5, label='Fake' if k==0 else "")
+            plt.title(f"Epoch {epoch}")
+            plt.xlabel("Band")
+            plt.ylabel("Reflectance")
+            plt.legend()
+            plt.savefig(f"./results/{class_name}/epoch_{epoch:03d}.png")
+            plt.close()
+
+        # -------------------- Sauvegarde modèles tous les 50 epochs --------------------
+        if (epoch+1) % 50 == 0:
+            torch.save(netG.state_dict(), f"./results/{class_name}/netG_epoch_{epoch:03d}.pth")
+            torch.save(netD.state_dict(), f"./results/{class_name}/netD_epoch_{epoch:03d}.pth")
+
+        # -------------------- Sauvegarde du meilleur modèle (SAM minimal) --------------------
+        if epoch_avg_metrics['SAM'] < best_sam:
+            best_sam = epoch_avg_metrics['SAM']
+            best_netG = netG.state_dict()
+            best_netD = netD.state_dict()
+
+    # sauvegarde final du meilleur modèle
+    torch.save(best_netG, f"./results/{class_name}/netG_best.pth")
+    torch.save(best_netD, f"./results/{class_name}/netD_best.pth")
+
+    return netG, netD
