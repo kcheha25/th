@@ -805,3 +805,56 @@ wgan.load_weights("generator.pkl", "discriminator.pkl")
 
 # real_cubes = liste de cubes hyperspectraux à comparer (N, C, H, W)
 # sam_scores, rmse_scores, corr_scores = evaluate_plot(wgan, real_cubes)
+
+
+import torch
+import torch.nn as nn
+
+class Generator(nn.Module):
+    def __init__(self, nz):
+        super().__init__()
+        self.main_module = nn.Sequential(
+            nn.ConvTranspose1d(nz, 1024, 16, 1, 0, bias=False),  # nz -> 1024*16
+            nn.InstanceNorm1d(1024, affine=True),
+            nn.ReLU(True),
+
+            nn.ConvTranspose1d(1024, 512, 4, 2, 1, bias=False),  # 16 -> 33
+            nn.InstanceNorm1d(512, affine=True),
+            nn.ReLU(True),
+
+            nn.ConvTranspose1d(512, 256, 4, 2, 1, bias=False),   # 33 -> 67
+            nn.InstanceNorm1d(256, affine=True),
+            nn.ReLU(True),
+
+            nn.ConvTranspose1d(256, 128, 4, 2, 1, bias=False),   # 67 -> 135
+            nn.InstanceNorm1d(128, affine=True),
+            nn.ReLU(True),
+
+            nn.ConvTranspose1d(128, 1, 4, 2, 1, bias=False),     # 135 -> 272
+        )
+        self.output = nn.Tanh()
+
+    def forward(self, x):
+        return self.output(self.main_module(x))
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.main_module = nn.Sequential(
+            nn.Conv1d(1, 256, 4, 2, 1, bias=False),     # 272 -> 135
+            nn.InstanceNorm1d(256, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv1d(256, 512, 4, 2, 1, bias=False),   # 135 -> 67
+            nn.InstanceNorm1d(512, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv1d(512, 1024, 4, 2, 1, bias=False),  # 67 -> 33
+            nn.InstanceNorm1d(1024, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv1d(1024, 1, 33, 1, 0, bias=False),   # 33 -> 1
+        )
+
+    def forward(self, x):
+        return self.main_module(x)
