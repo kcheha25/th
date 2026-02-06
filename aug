@@ -1236,3 +1236,65 @@ def check_null_spectra(dataset, threshold=1e-6):
 if __name__ == "__main__":
     dataset = SpectralPixelDatasetOriginal("extrudes_eroded")
     null_positions = check_null_spectra(dataset)
+
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.autograd as autograd
+from torch.utils.data import Dataset, DataLoader, Subset
+from pathlib import Path
+import numpy as np
+import spectral.io.envi as envi
+from collections import defaultdict
+import matplotlib.pyplot as plt
+
+# -------------------------------
+# Dataset
+# -------------------------------
+class SpectralPixelDataset(Dataset):
+    def __init__(self, root_dir, null_threshold=1e-6):
+        self.root_dir = Path(root_dir)
+        self.null_threshold = null_threshold
+        self.samples = []
+        self.class_map = {}
+        self.class_names = []
+        class_counter = 0
+        hdr_files = list(self.root_dir.rglob("*.hdr"))
+
+        for hdr_file in sorted(hdr_files):
+            name = hdr_file.stem
+            prefix = name.split("_")[0]
+            if prefix not in self.class_map:
+                self.class_map[prefix] = class_counter
+                self.class_names.append(prefix)
+                class_counter += 1
+            class_id = self.class_map[prefix]
+            img = envi.open(str(hdr_file))
+            cube = np.array(img.load(), dtype=np.float32)
+            B, H, W = cube.shape
+            spectra = cube.reshape(B, -1).T
+            for s in spectra:
+                if np.var(s) > self.null_threshold:
+                    s_norm = 2 * (s - s.min()) / (s.max() - s.min() + 1e-8) - 1
+                    self.samples.append((torch.tensor(s_norm, dtype=torch.float32), class_id))
+
+        print(f"Dataset chargé : {len(self.samples)} spectres non nuls")
+        print(f"Classes : {self.class_names}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+def create_class_dataloaders(dataset, batch_size=128):
+    class_indices = defaultdict(list)
+    for i, (_, label) in enumerate(dataset):
+        class_indices[label].append(i)
+    loaders = {}
+    for label, indices in class_indices.items():
+        subset = Subset(dataset, indices)
+        loaders[label] = DataLoader(subset, batch_size=batch_size, shuffle=True, drop_last=True)
+    return loaders
