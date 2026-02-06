@@ -916,3 +916,202 @@ if __name__ == "__main__":
         print(spectra.shape)
         print(labels.shape)
         break
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.autograd as autograd
+import matplotlib.pyplot as plt
+import numpy as np
+
+# -------------------------------
+# Hyperparameters
+# -------------------------------
+nz = 100
+n_critic = 5
+p_coeff = 10
+lr = 1e-4
+batch_size = 16
+epoch_num = 50
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+n_bands = 272
+
+# -------------------------------
+# Modèles (Generator / Discriminator)
+# -------------------------------
+class Discriminator(nn.Module):
+    def __init__(self, n_bands):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.Conv1d(1, 64, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(64, 128, 4, 2, 1, bias=False),
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(128, 256, 4, 2, 1, bias=False),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(256, 512, 4, 2, 1, bias=False),
+            nn.BatchNorm1d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(512, 1, kernel_size=17, stride=1, padding=0, bias=False)
+        )
+
+    def forward(self, x):
+        return self.main(x).view(-1)
+
+
+class Generator(nn.Module):
+    def __init__(self, nz, n_bands):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.ConvTranspose1d(nz, 512, 17, 1, 0, bias=False),
+            nn.BatchNorm1d(512),
+            nn.ReLU(True),
+            nn.ConvTranspose1d(512, 256, 4, 2, 1, bias=False),
+            nn.BatchNorm1d(256),
+            nn.ReLU(True),
+            nn.ConvTranspose1d(256, 128, 4, 2, 1, bias=False),
+            nn.BatchNorm1d(128),
+            nn.ReLU(True),
+            nn.ConvTranspose1d(128, 64, 4, 2, 1, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(True),
+            nn.ConvTranspose1d(64, 1, 4, 2, 1, bias=False),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        return self.main(x)
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
+
+
+# -------------------------------
+# Métriques de cohérence
+# -------------------------------
+def compute_metrics(real, fake):
+    """
+    real, fake : (batch, 1, n_bands)
+    Retourne dictionnaire : {'MSE':..., 'Pearson':..., 'SAM':...}
+    """
+    real_np = real.detach().cpu().numpy().reshape(real.size(0), -1)
+    fake_np = fake.detach().cpu().numpy().reshape(fake.size(0), -1)
+
+    # MSE
+    mse = np.mean((real_np - fake_np) ** 2)
+
+    # Pearson correlation moyenne
+    pearson = np.mean([np.corrcoef(real_np[i], fake_np[i])[0,1] for i in range(real_np.shape[0])])
+
+    # SAM : angle spectral moyenne
+    sam = np.mean([
+        np.arccos(np.clip(np.dot(real_np[i], fake_np[i]) /
+                          (np.linalg.norm(real_np[i]) * np.linalg.norm(fake_np[i]) + 1e-8), -1, 1))
+        for i in range(real_np.shape[0])
+    ])
+
+    return {'MSE': mse, 'Pearson': pearson, 'SAM': sam}
+
+
+# -------------------------------
+# Entraînement pour une seule classe
+# -------------------------------
+def train_single_class(loader):
+    netD = Discriminator(n_bands).to(device)
+    netG = Generator(nz, n_bands).to(device)
+    netD.apply(weights_init)
+    netG.apply(weights_init)
+
+    optimizerD = optim.Adam(netD.parameters(), lr=lr, betas=(0, 0.9))
+    optimizerG = optim.Adam(netG.parameters(), lr=lr, betas=(0, 0.9))
+
+    fixed_noise = torch.randn(16, nz, 1, device=device)
+
+    for epoch in range(epoch_num):
+        epoch_metrics = {'MSE': [], 'Pearson': [], 'SAM': []}
+
+        for i, data in enumerate(loader):
+            real_cpu = data[0].to(device)
+            b_size = real_cpu.size(0)
+
+            # --------------------
+            # Discriminator update
+            # --------------------
+            for _ in range(n_critic):
+                netD.zero_grad()
+                noise = torch.randn(b_size, nz, 1, device=device)
+                fake = netG(noise)
+
+                # Gradient penalty
+                eps = torch.rand(b_size, 1, 1, device=device)
+                x_p = eps * real_cpu + (1 - eps) * fake
+                x_p.requires_grad_(True)
+                grad = autograd.grad(
+                    outputs=netD(x_p).sum(),
+                    inputs=x_p,
+                    create_graph=True,
+                    retain_graph=True
+                )[0]
+                grad_norm = grad.view(b_size, -1).norm(2, dim=1)
+                grad_penalty = p_coeff * ((grad_norm - 1) ** 2).mean()
+
+                loss_D = torch.mean(netD(fake)) - torch.mean(netD(real_cpu)) + grad_penalty
+                loss_D.backward()
+                optimizerD.step()
+
+            # --------------------
+            # Generator update
+            # --------------------
+            netG.zero_grad()
+            noise = torch.randn(b_size, nz, 1, device=device)
+            fake = netG(noise)
+            loss_G = -torch.mean(netD(fake))
+            loss_G.backward()
+            optimizerG.step()
+
+            # --------------------
+            # Calcul des métriques pour ce batch
+            # --------------------
+            metrics = compute_metrics(real_cpu, fake)
+            for k in epoch_metrics:
+                epoch_metrics[k].append(metrics[k])
+
+        # --------------------
+        # Moyenne des métriques de l'epoch
+        # --------------------
+        epoch_avg_metrics = {k: np.mean(v) for k,v in epoch_metrics.items()}
+        print(f"Epoch {epoch} | Loss_D: {loss_D.item():.4f} | Loss_G: {loss_G.item():.4f} | "
+              f"MSE: {epoch_avg_metrics['MSE']:.4f} | Pearson: {epoch_avg_metrics['Pearson']:.4f} | SAM: {epoch_avg_metrics['SAM']:.4f}")
+
+        # Visualisation simple
+        with torch.no_grad():
+            fake = netG(fixed_noise).cpu()
+            plt.figure(figsize=(8,4))
+            for k in range(16):
+                plt.plot(fake[k,0])
+            plt.title(f"Epoch {epoch}")
+            plt.show()
+
+    return netG, netD
+
+
+if __name__ == "__main__":
+    from preprocessing import create_class_dataloaders, SpectralPixelDataset
+
+    dataset = SpectralPixelDataset("extrudes_eroded", target_size=32)
+    loaders = create_class_dataloaders(dataset, batch_size=batch_size)
+
+    # Choisir une classe, par exemple la première
+    class_id = 0
+    loader = loaders[class_id]
+
+    netG, netD = train_single_class(loader)
