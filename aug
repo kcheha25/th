@@ -806,67 +806,105 @@ wgan.load_weights("generator.pkl", "discriminator.pkl")
 # real_cubes = liste de cubes hyperspectraux à comparer (N, C, H, W)
 # sam_scores, rmse_scores, corr_scores = evaluate_plot(wgan, real_cubes)
 
-
 import torch
-import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
+import numpy as np
+import cv2
+import spectral.io.envi as envi
 
-class Generator(nn.Module):
-    def __init__(self, nz):
-        super().__init__()
-        self.main_module = nn.Sequential(
-            nn.ConvTranspose1d(nz, 1024, 16, 1, 0, bias=False),  # nz -> 1024*16
-            nn.InstanceNorm1d(1024, affine=True),
-            nn.ReLU(True),
 
-            nn.ConvTranspose1d(1024, 512, 4, 2, 1, bias=False),  # 16 -> 33
-            nn.InstanceNorm1d(512, affine=True),
-            nn.ReLU(True),
+class SpectralPixelDataset(Dataset):
+    def __init__(self, root_dir, target_size=32):
+        self.root_dir = Path(root_dir)
+        self.target_size = target_size
 
-            nn.ConvTranspose1d(512, 256, 4, 2, 1, bias=False),   # 33 -> 67
-            nn.InstanceNorm1d(256, affine=True),
-            nn.ReLU(True),
+        self.samples = []  # (spectrum, class_id)
 
-            nn.ConvTranspose1d(256, 128, 4, 2, 1, bias=False),   # 67 -> 135
-            nn.InstanceNorm1d(128, affine=True),
-            nn.ReLU(True),
+        # Parcours des dossiers = classes
+        for class_dir in sorted(self.root_dir.iterdir()):
 
-            nn.ConvTranspose1d(128, 1, 4, 2, 1, bias=False),     # 135 -> 272
+            if not class_dir.is_dir():
+                continue
+
+            class_id = int(class_dir.name)  # nom dossier = classe
+
+            hdr_files = list(class_dir.glob("*.hdr"))
+
+            for hdr_file in hdr_files:
+
+                img = envi.open(str(hdr_file))
+                cube = np.array(img.load())   # (B,H,W)
+
+                B, H, W = cube.shape
+
+                # Resize spatial
+                cube_resized = np.zeros((B, target_size, target_size), dtype=np.float32)
+
+                for b in range(B):
+                    cube_resized[b] = cv2.resize(
+                        cube[b],
+                        (target_size, target_size),
+                        interpolation=cv2.INTER_LINEAR
+                    )
+
+                # Normalisation globale
+                cube_resized = (cube_resized - cube_resized.min()) / \
+                               (cube_resized.max() - cube_resized.min() + 1e-8)
+
+                # (B,H,W) -> (H*W,B)
+                spectra = cube_resized.reshape(B, -1).T
+
+                # Stockage
+                for s in spectra:
+                    self.samples.append((
+                        torch.tensor(s, dtype=torch.float32),
+                        class_id
+                    ))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+from collections import defaultdict
+
+
+def create_class_dataloaders(dataset, batch_size=64, shuffle=True):
+
+    class_indices = defaultdict(list)
+
+    for i, (_, label) in enumerate(dataset):
+        class_indices[label].append(i)
+
+    dataloaders = {}
+
+    for label, indices in class_indices.items():
+
+        subset = torch.utils.data.Subset(dataset, indices)
+
+        loader = DataLoader(
+            subset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=True
         )
-        self.output = nn.Tanh()
 
-    def forward(self, x):
-        return self.output(self.main_module(x))
+        dataloaders[label] = loader
 
-class Discriminator(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.main_module = nn.Sequential(
-            nn.Conv1d(1, 256, 4, 2, 1, bias=False),     # 272 -> 135
-            nn.InstanceNorm1d(256, affine=True),
-            nn.LeakyReLU(0.2, inplace=True),
+    return dataloaders
 
-            nn.Conv1d(256, 512, 4, 2, 1, bias=False),   # 135 -> 67
-            nn.InstanceNorm1d(512, affine=True),
-            nn.LeakyReLU(0.2, inplace=True),
+dataset = SpectralPixelDataset("extrudes_eroded", target_size=32)
 
-            nn.Conv1d(512, 1024, 4, 2, 1, bias=False),  # 67 -> 33
-            nn.InstanceNorm1d(1024, affine=True),
-            nn.LeakyReLU(0.2, inplace=True),
+class_loaders = create_class_dataloaders(
+    dataset,
+    batch_size=128
+)
 
-            nn.Conv1d(1024, 1, 33, 1, 0, bias=False),   # 33 -> 1
-        )
+print("Classes:", class_loaders.keys())
 
-    def forward(self, x):
-        return self.main_module(x)
-
-Objet : Problème d’accès à mon compte ShareLaTeX
-
-Bonjour,
-
-Je rencontre un problème avec mon compte ShareLaTeX. Mon compte n’est plus actif et je n’ai plus accès à ShareLaTeX avec mon adresse [ton adresse] sur l’espace collaboratif.
-
-Pouvez-vous m’indiquer la marche à suivre pour réactiver mon compte ou récupérer l’accès à mes projets ?
-
-Je vous remercie par avance pour votre aide.
-
-Cordialement,
+# Exemple : itérer sur classe 0
+for spectra, labels in class_loaders[0]:
+    print(spectra.shape)   # (BATCH, Bands)
+    break
