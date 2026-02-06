@@ -1138,3 +1138,21 @@ pearson = np.mean([
     else 0.0
     for i in range(real_np.shape[0])
 ])
+
+# Vérifier les spectres nuls ou quasi-constants par classe
+threshold_variance = 1e-6  # seuil pour considérer un spectre comme nul
+
+for class_id, loader in loaders.items():
+    null_count = 0
+    total_count = 0
+    
+    for spectra, labels in loader:
+        # spectra shape: (batch_size, n_bands)
+        batch_size = spectra.size(0)
+        for i in range(batch_size):
+            spectrum = spectra[i]
+            if torch.var(spectrum) < threshold_variance:
+                null_count += 1
+            total_count += 1
+    
+    print(f"Classe {dataset.class_names[class_id]} : {null_count}/{total_count} spectres nuls ou quasi-constants")
