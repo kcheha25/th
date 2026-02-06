@@ -858,3 +858,15 @@ class Discriminator(nn.Module):
 
     def forward(self, x):
         return self.main_module(x)
+
+Objet : Problème d’accès à mon compte ShareLaTeX
+
+Bonjour,
+
+Je rencontre un problème avec mon compte ShareLaTeX. Mon compte n’est plus actif et je n’ai plus accès à ShareLaTeX avec mon adresse [ton adresse] sur l’espace collaboratif.
+
+Pouvez-vous m’indiquer la marche à suivre pour réactiver mon compte ou récupérer l’accès à mes projets ?
+
+Je vous remercie par avance pour votre aide.
+
+Cordialement,
