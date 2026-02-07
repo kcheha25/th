@@ -1441,3 +1441,33 @@ loss_G = adv_loss + 1.0*mse + 0.3*spec
 
 def smooth_loss(x):
     return torch.mean(torch.abs(x[:,:,1:] - x[:,:,:-1]))
+
+def deriv_loss(real, fake):
+    d_real = real[:,:,1:] - real[:,:,:-1]
+    d_fake = fake[:,:,1:] - fake[:,:,:-1]
+    return torch.mean(torch.abs(d_real - d_fake))
+
+def freq_smooth_loss(x, cutoff=0.3):
+    fft = torch.fft.rfft(x, dim=2)
+    freqs = torch.linspace(0,1,fft.shape[2],device=x.device)
+
+    mask = (freqs > cutoff).float()
+    return torch.mean(torch.abs(fft)*mask)
+
+def curvature_loss(x):
+    return torch.mean(
+        torch.abs(x[:,:,2:] - 2*x[:,:,1:-1] + x[:,:,:-2])
+    )
+
+smooth = tv_loss_1d(fake)
+curve = curvature_loss(fake)
+spec = spectral_loss(real, fake)
+mse = F.mse_loss(fake, real)
+
+loss_G = (
+    adv
+    + 40*mse
+    + 10*spec
+    + 5*smooth
+    + 2*curve
+)
