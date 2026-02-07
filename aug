@@ -1398,3 +1398,43 @@ def train_single_class(loader, class_name="class0"):
     torch.save(best_netD, f"./results/{class_name}/netD_best.pth")
 
     return netG, netD
+
+class SpectralLoss1D(nn.Module):
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+        self.l1 = nn.L1Loss()
+
+    def forward(self, real, fake):
+        # real, fake : (B,1,N)
+
+        real_f = torch.fft.rfft(real, dim=2)
+        fake_f = torch.fft.rfft(fake, dim=2)
+
+        real_mag = torch.abs(real_f) + self.eps
+        fake_mag = torch.abs(fake_f) + self.eps
+
+        real_log = torch.log(real_mag)
+        fake_log = torch.log(fake_mag)
+
+        return self.l1(fake_log, real_log)
+
+def train_single_class(loader, class_name="class0"):
+
+    netD = Discriminator(n_bands).to(device)
+    netG = Generator(nz, n_bands).to(device)
+
+    netD.apply(weights_init)
+    netG.apply(weights_init)
+
+    optimizerD = optim.Adam(netD.parameters(), lr=lr, betas=(0, 0.9))
+    optimizerG = optim.Adam(netG.parameters(), lr=lr, betas=(0, 0.9))
+
+    spectral_loss = SpectralLoss1D().to(device)
+    mse_loss = nn.MSELoss()
+
+adv_loss = -torch.mean(netD(fake))
+mse = mse_loss(fake, real_cpu)
+spec = spectral_loss(real_cpu, fake)
+
+loss_G = adv_loss + 1.0*mse + 0.3*spec
