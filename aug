@@ -1438,3 +1438,6 @@ mse = mse_loss(fake, real_cpu)
 spec = spectral_loss(real_cpu, fake)
 
 loss_G = adv_loss + 1.0*mse + 0.3*spec
+
+def smooth_loss(x):
+    return torch.mean(torch.abs(x[:,:,1:] - x[:,:,:-1]))
