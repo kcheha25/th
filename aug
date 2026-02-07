@@ -1542,3 +1542,12 @@ class SpectralPixelDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.samples[idx]
+    
+
+    scp mon_env.tar.gz user@serveur:/chemin/de/destination
+
+cd ~/miniforge3/envs/mon_env
+mkdir test2
+cd test2
+tar -xzf ~/kc_env.tar.gz -C ~/miniconda3/envs/test2
+~/miniconda3/envs/test2/bin/conda-unpack
