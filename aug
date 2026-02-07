@@ -1471,3 +1471,74 @@ loss_G = (
     + 5*smooth
     + 2*curve
 )
+
+from collections import defaultdict
+from imblearn.over_sampling import SMOTE
+
+class SpectralPixelDataset(Dataset):
+    def __init__(self, root_dir, null_threshold=1e-6, min_spectra=400, smote_k=5, shift_level=0.01):
+        self.root_dir = Path(root_dir)
+        self.null_threshold = null_threshold
+        self.samples = []
+        self.class_map = {}
+        self.class_names = []
+        class_counter = 0
+        hdr_files = list(self.root_dir.rglob("*.hdr"))
+
+        class_spectra = defaultdict(list)
+
+        # Chargement des spectres
+        for hdr_file in sorted(hdr_files):
+            name = hdr_file.stem
+            prefix = name.split("_")[0]
+            if prefix not in self.class_map:
+                self.class_map[prefix] = class_counter
+                self.class_names.append(prefix)
+                class_counter += 1
+            class_id = self.class_map[prefix]
+
+            img = envi.open(str(hdr_file))
+            cube = np.array(img.load(), dtype=np.float32)
+            B, H, W = cube.shape
+            spectra = cube.reshape(B, -1).T
+            for s in spectra:
+                if np.var(s) > self.null_threshold:
+                    s_norm = 2 * (s - s.min()) / (s.max() - s.min() + 1e-8) - 1
+                    class_spectra[class_id].append(s_norm)
+
+        # Comptage des spectres par classe
+        counts = {c: len(class_spectra[c]) for c in class_spectra}
+
+        # Pour chaque classe
+        for class_id, spect_list in class_spectra.items():
+            X_class = np.stack(spect_list)
+            y_class = np.full(len(spect_list), class_id)
+
+            # Augmenter seulement les classes < min_spectra
+            if counts[class_id] < min_spectra:
+                n_needed = min_spectra - counts[class_id]
+                smote = SMOTE(sampling_strategy={class_id: min_spectra},
+                              k_neighbors=min(smote_k, counts[class_id]-1),
+                              random_state=42)
+                X_res, y_res = smote.fit_resample(X_class, y_class)
+
+                # Appliquer un petit décalage uniquement sur les spectres générés par SMOTE
+                X_new = X_res[len(X_class):]  # spectres créés par SMOTE
+                X_new += np.random.uniform(-shift_level, shift_level, X_new.shape)
+                X_res[len(X_class):] = np.clip(X_new, -1, 1)  # clip [-1,1]
+            else:
+                X_res, y_res = X_class, y_class  # classes avec >= min_spectra inchangées
+
+            # Ajouter les spectres finaux au dataset
+            for i in range(len(X_res)):
+                self.samples.append((torch.tensor(X_res[i], dtype=torch.float32),
+                                     int(y_res[i])))
+
+        print(f"Dataset chargé : {len(self.samples)} spectres après augmentation")
+        print(f"Classes : {self.class_names}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
