@@ -1551,3 +1551,18 @@ mkdir test2
 cd test2
 tar -xzf ~/kc_env.tar.gz -C ~/miniconda3/envs/test2
 ~/miniconda3/envs/test2/bin/conda-unpack
+
+
+import glob
+
+# Liste des morceaux triés par nom
+parts = sorted(glob.glob("kc_env_part_*"))
+output_file = "kc_env_recombine.tar.gz"
+
+with open(output_file, "wb") as outfile:
+    for part in parts:
+        with open(part, "rb") as infile:
+            outfile.write(infile.read())
+        print(f"Ajouté : {part}")
+
+print(f"Fichier recombiné : {output_file}")
