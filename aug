@@ -1566,3 +1566,339 @@ with open(output_file, "wb") as outfile:
         print(f"Ajouté : {part}")
 
 print(f"Fichier recombiné : {output_file}")
+
+
+
+###################################
+import numpy as np
+import torch
+from pathlib import Path
+from spectral import envi
+import os
+
+def is_null_spectrum(s, threshold=1e-6):
+    return np.var(s) < threshold
+
+def normalize_spectrum(s):
+    s_min = s.min()
+    s_max = s.max()
+    s_norm = 2 * (s - s_min) / (s_max - s_min + 1e-8) - 1
+    return s_norm, s_min, s_max
+
+def denormalize_spectrum(s_norm, s_min, s_max):
+    return 0.5 * (s_norm + 1) * (s_max - s_min) + s_min
+
+def load_generators(class_names, model_dir, Generator, nz, n_bands, device):
+    generators = {}
+
+    for cname in class_names:
+        netG = Generator(nz, n_bands).to(device)
+        path = Path(model_dir) / cname / "netG_best.pth"
+        netG.load_state_dict(torch.load(path, map_location=device))
+        netG.eval()
+        generators[cname] = netG
+
+    return generators
+
+
+@torch.no_grad()
+def generate_spectrum(netG, nz, device):
+    z = torch.randn(1, nz, 1, device=device)
+    fake = netG(z).squeeze().cpu().numpy()
+    return fake  # ∈ [-1,1]
+
+
+def augment_extrude(
+    hdr_path,
+    netG,
+    nz,
+    device,
+    null_threshold=1e-6
+):
+    img = envi.open(str(hdr_path))
+    cube = np.array(img.load(), dtype=np.float32)  # (B,H,W)
+
+    B, H, W = cube.shape
+    cube_aug = np.zeros_like(cube)
+
+    for i in range(H):
+        for j in range(W):
+            s = cube[:, i, j]
+
+            if is_null_spectrum(s, null_threshold):
+                cube_aug[:, i, j] = s
+            else:
+                fake_norm = generate_spectrum(netG, nz, device)
+
+                s_min = s.min()
+                s_max = s.max()
+                fake_phys = denormalize_spectrum(fake_norm, s_min, s_max)
+
+                cube_aug[:, i, j] = fake_phys
+
+    return cube_aug
+
+
+def save_envi_cube(cube, ref_hdr_path, out_path):
+    img = envi.open(str(ref_hdr_path))
+    metadata = img.metadata.copy()
+
+    out_path = Path(out_path)
+    envi.save_image(
+        str(out_path.with_suffix(".hdr")),
+        cube,
+        metadata=metadata,
+        dtype=np.float32,
+        force=True
+    )
+
+
+def augment_all_extrudes(
+    root_dir,
+    output_dir,
+    generators,
+    nz,
+    device
+):
+    root_dir = Path(root_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+
+    hdr_files = list(root_dir.rglob("*.hdr"))
+
+    for hdr in hdr_files:
+        name = hdr.stem
+        class_name = name.split("_")[0]
+
+        if class_name not in generators:
+            continue
+
+        print(f"Augmentation : {hdr.name}")
+
+        cube_aug = augment_extrude(
+            hdr,
+            generators[class_name],
+            nz,
+            device
+        )
+
+        class_out = output_dir / class_name
+        class_out.mkdir(exist_ok=True)
+
+        out_path = class_out / f"{name}_aug"
+        save_envi_cube(cube_aug, hdr, out_path)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+nz = 100
+n_bands = 224
+
+generators = load_generators(
+    class_names=dataset.class_names,
+    model_dir="./results",
+    Generator=Generator,
+    nz=nz,
+    n_bands=n_bands,
+    device=device
+)
+
+augment_all_extrudes(
+    root_dir="./extrudes",
+    output_dir="./extrudes_augmented",
+    generators=generators,
+    nz=nz,
+    device=device
+)
+#################################3
+# nombre d'extrudes augmentés à générer PAR extrude original
+AUG_PER_CLASS = {
+    "class0": 5,
+    "class1": 2,
+    "class2": 10,
+}
+
+def augment_extrude(
+    hdr_path,
+    netG,
+    nz,
+    device,
+    null_threshold=1e-6
+):
+    img = envi.open(str(hdr_path))
+    cube = np.array(img.load(), dtype=np.float32)
+
+    B, H, W = cube.shape
+    cube_aug = np.zeros_like(cube)
+
+    for i in range(H):
+        for j in range(W):
+            s = cube[:, i, j]
+
+            if np.var(s) < null_threshold:
+                cube_aug[:, i, j] = s
+            else:
+                fake_norm = generate_spectrum(netG, nz, device)
+                fake_phys = denormalize_spectrum(
+                    fake_norm, s.min(), s.max()
+                )
+                cube_aug[:, i, j] = fake_phys
+
+    return cube_aug
+
+def augment_all_extrudes(
+    root_dir,
+    output_dir,
+    generators,
+    aug_per_class,
+    nz,
+    device
+):
+    root_dir = Path(root_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+
+    hdr_files = list(root_dir.rglob("*.hdr"))
+
+    for hdr in hdr_files:
+        name = hdr.stem
+        class_name = name.split("_")[0]
+
+        if class_name not in generators:
+            continue
+
+        n_aug = aug_per_class.get(class_name, 1)
+
+        print(f"{hdr.name} | classe={class_name} | N_aug={n_aug}")
+
+        class_out = output_dir / class_name
+        class_out.mkdir(exist_ok=True)
+
+        for k in range(n_aug):
+            cube_aug = augment_extrude(
+                hdr,
+                generators[class_name],
+                nz,
+                device
+            )
+
+            out_path = class_out / f"{name}_aug{k+1}"
+            save_envi_cube(cube_aug, hdr, out_path)
+#################################
+def sam_np(x, y, eps=1e-8):
+    num = np.dot(x, y)
+    den = np.linalg.norm(x) * np.linalg.norm(y) + eps
+    cos = np.clip(num / den, -1, 1)
+    return np.arccos(cos)
+
+
+def generate_best_spectrum(
+    netG,
+    nz,
+    device,
+    real_phys,
+    K=5
+):
+    s_min = real_phys.min()
+    s_max = real_phys.max()
+
+    real_norm = 2 * (real_phys - s_min) / (s_max - s_min + 1e-8) - 1
+    real_norm = real_norm.astype(np.float32)
+
+    best_sam = np.inf
+    best_fake = None
+
+    for _ in range(K):
+        z = torch.randn(1, nz, 1, device=device)
+        with torch.no_grad():
+            fake_norm = netG(z).cpu().numpy().squeeze()
+
+        sam_val = sam_np(real_norm, fake_norm)
+
+        if sam_val < best_sam:
+            best_sam = sam_val
+            best_fake = fake_norm
+
+    best_phys = (best_fake + 1) / 2 * (s_max - s_min) + s_min
+    return best_phys
+
+def augment_extrude(
+    hdr_path,
+    netG,
+    nz,
+    device,
+    K=5,
+    null_threshold=1e-6
+):
+    img = envi.open(str(hdr_path))
+    cube = np.array(img.load(), dtype=np.float32)
+
+    B, H, W = cube.shape
+    cube_aug = np.zeros_like(cube)
+
+    for i in range(H):
+        for j in range(W):
+            s = cube[:, i, j]
+
+            if np.var(s) < null_threshold:
+                cube_aug[:, i, j] = s
+            else:
+                cube_aug[:, i, j] = generate_best_spectrum(
+                    netG,
+                    nz,
+                    device,
+                    s,
+                    K
+                )
+
+    return cube_aug
+
+def augment_all_extrudes(
+    root_dir,
+    output_dir,
+    generators,
+    aug_per_class,
+    K_per_class,
+    nz,
+    device
+):
+    root_dir = Path(root_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+
+    hdr_files = list(root_dir.rglob("*.hdr"))
+
+    for hdr in hdr_files:
+        name = hdr.stem
+        class_name = name.split("_")[0]
+
+        if class_name not in generators:
+            continue
+
+        n_aug = aug_per_class.get(class_name, 1)
+        K = K_per_class.get(class_name, 5)
+
+        print(f"{hdr.name} | classe={class_name} | N_aug={n_aug} | K={K}")
+
+        class_out = output_dir / class_name
+        class_out.mkdir(exist_ok=True)
+
+        for k in range(n_aug):
+            cube_aug = augment_extrude(
+                hdr,
+                generators[class_name],
+                nz,
+                device,
+                K=K
+            )
+
+            out_path = class_out / f"{name}_aug{k+1}"
+            save_envi_cube(cube_aug, hdr, out_path)
+
+AUG_PER_CLASS = {
+    "class0": 5,
+    "class1": 2,
+}
+
+K_PER_CLASS = {
+    "class0": 10,
+    "class1": 5,
+}
