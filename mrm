@@ -1,0 +1,111 @@
+explique moi ce que fait ce code import torch
+from torch.utils.data import Dataset, DataLoader, Subset
+from collections import defaultdict
+import numpy as np
+import matplotlib.pyplot as plt
+from itertools import combinations
+from pymrmr import mRMR
+from spectral import envi
+from pathlib import Path
+
+class SpectralPixelDataset(Dataset):
+    def __init__(self, root_dir, null_threshold=1e-6):
+        self.root_dir = Path(root_dir)
+        self.null_threshold = null_threshold
+        self.samples = []
+        self.class_map = {}
+        self.class_names = []
+        class_counter = 0
+        hdr_files = list(self.root_dir.rglob("*.hdr"))
+        for hdr_file in sorted(hdr_files):
+            name = hdr_file.stem
+            prefix = name.split("_")[0]
+            if prefix not in self.class_map:
+                self.class_map[prefix] = class_counter
+                self.class_names.append(prefix)
+                class_counter += 1
+            class_id = self.class_map[prefix]
+            img = envi.open(str(hdr_file))
+            cube = np.array(img.load(), dtype=np.float32)
+            B,H,W = cube.shape
+            spectra = cube.reshape(B,-1).T
+            for s in spectra:
+                if np.var(s) > self.null_threshold:
+                    s_norm = 2*(s-s.min())/(s.max()-s.min()+1e-8)-1
+                    self.samples.append((torch.tensor(s_norm,dtype=torch.float32), class_id))
+    def __len__(self):
+        return len(self.samples)
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+def create_class_dataloaders(dataset, batch_size=128):
+    class_indices = defaultdict(list)
+    for i, (_, label) in enumerate(dataset):
+        class_indices[label].append(i)
+    loaders = {}
+    for label, indices in class_indices.items():
+        subset = Subset(dataset, indices)
+        loaders[label] = DataLoader(subset, batch_size=batch_size, shuffle=True, drop_last=True)
+    return loaders
+
+def compute_sam(X1,X2):
+    X1 = X1 / (np.linalg.norm(X1,axis=1,keepdims=True)+1e-8)
+    X2 = X2 / (np.linalg.norm(X2,axis=1,keepdims=True)+1e-8)
+    cosine = np.clip(np.sum(X1[:,None,:]*X2[None,:,:],axis=2),-1,1)
+    return np.arccos(cosine)
+
+dataset = SpectralPixelDataset("extrudes_eroded")
+loaders = create_class_dataloaders(dataset)
+class_spectra = {label: torch.vstack([x for x,_ in loader.dataset]).numpy() for label, loader in loaders.items()}
+
+mrmr_selected = {}
+for label,X in class_spectra.items():
+    df = np.round((X+1)*1000).astype(int)  # pymrmr exige des entiers
+    target = np.round((X.mean(axis=1)*1000)).astype(int)
+    df = np.column_stack((df, target))
+    import pandas as pd
+    df_pd = pd.DataFrame(df)
+    selected_idx = mRMR(df_pd, "MIQ", 10)
+    selected_idx = [int(i) for i in selected_idx]
+    mrmr_selected[label] = selected_idx
+    plt.figure(figsize=(10,5))
+    plt.scatter(selected_idx, X[:,selected_idx].mean(0), c=np.arange(len(selected_idx)), cmap="viridis")
+    plt.colorbar(label="MRMR rank")
+    plt.title(f"Classe {dataset.class_names[label]}")
+    plt.xlabel("Band")
+    plt.ylabel("Reflectance")
+    plt.show()
+
+class_labels = list(class_spectra.keys())
+groups = []
+threshold_sam = 0.1
+for i,j in combinations(range(len(class_labels)),2):
+    X1 = class_spectra[class_labels[i]]
+    X2 = class_spectra[class_labels[j]]
+    sam_val = np.mean(compute_sam(X1,X2))
+    if sam_val < threshold_sam:
+        found_group = None
+        for g in groups:
+            if class_labels[i] in g or class_labels[j] in g:
+                g.update([class_labels[i],class_labels[j]])
+                found_group=g
+                break
+        if found_group is None:
+            groups.append(set([class_labels[i],class_labels[j]]))
+
+merged=True
+while merged:
+    merged=False
+    for i in range(len(groups)):
+        for j in range(i+1,len(groups)):
+            if groups[i]&groups[j]:
+                groups[i].update(groups[j])
+                groups.pop(j)
+                merged=True
+                break
+        if merged:
+            break
+
+for idx,g in enumerate(groups):
+    names = [dataset.class_names[l] for l in g]
+    print(f"Groupe {idx}: {names}")
