@@ -110,3 +110,6 @@ while merged:
 for idx,g in enumerate(groups):
     names = [dataset.class_names[l] for l in g]
     print(f"Groupe {idx}: {names}")
+
+target = np.sum(np.abs(np.diff(X, axis=1)), axis=1)
+target = pd.Series(target)
