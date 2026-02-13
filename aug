@@ -1902,3 +1902,25 @@ K_PER_CLASS = {
     "class0": 10,
     "class1": 5,
 }
+
+from PIL import Image
+import os
+
+dossier_images = "images"
+fichiers = sorted(os.listdir(dossier_images))
+
+images = []
+
+for fichier in fichiers:
+    if fichier.endswith((".png", ".jpg", ".jpeg")):
+        chemin = os.path.join(dossier_images, fichier)
+        img = Image.open(chemin)
+        images.append(img)
+
+images[0].save(
+    "animation.gif",
+    save_all=True,
+    append_images=images[1:],
+    duration=500,
+    loop=0
+)
