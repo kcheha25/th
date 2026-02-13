@@ -1,12 +1,13 @@
-explique moi ce que fait ce code import torch
+import torch
 from torch.utils.data import Dataset, DataLoader, Subset
 from collections import defaultdict
 import numpy as np
 import matplotlib.pyplot as plt
 from itertools import combinations
-from pymrmr import mRMR
 from spectral import envi
 from pathlib import Path
+import pandas as pd
+from feature_engine.selection import MRMR
 
 class SpectralPixelDataset(Dataset):
     def __init__(self, root_dir, null_threshold=1e-6):
@@ -59,14 +60,14 @@ loaders = create_class_dataloaders(dataset)
 class_spectra = {label: torch.vstack([x for x,_ in loader.dataset]).numpy() for label, loader in loaders.items()}
 
 mrmr_selected = {}
-for label,X in class_spectra.items():
-    df = np.round((X+1)*1000).astype(int)  # pymrmr exige des entiers
-    target = np.round((X.mean(axis=1)*1000)).astype(int)
-    df = np.column_stack((df, target))
-    import pandas as pd
-    df_pd = pd.DataFrame(df)
-    selected_idx = mRMR(df_pd, "MIQ", 10)
-    selected_idx = [int(i) for i in selected_idx]
+for label, X in class_spectra.items():
+    df = pd.DataFrame(X)
+    # target = spectre moyen pour mettre en évidence les pics/creux
+    target = X.mean(axis=0)
+    target = pd.Series(target)
+    selector = MRMR(features_to_select=10, method="MIQ")
+    selector.fit(df, target)
+    selected_idx = df.columns[selector.features_to_keep_].tolist()
     mrmr_selected[label] = selected_idx
     plt.figure(figsize=(10,5))
     plt.scatter(selected_idx, X[:,selected_idx].mean(0), c=np.arange(len(selected_idx)), cmap="viridis")
