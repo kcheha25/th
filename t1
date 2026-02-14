@@ -2243,19 +2243,16 @@ for label, mask_obj in class_masks.items():
 
 
 
-import tkinter as tk
-from tkinter import Canvas, Scale, HORIZONTAL
-from PIL import Image, ImageTk
 import numpy as np
-import matplotlib.pyplot as plt
-import cv2
 import json
+import cv2
 from specarray import SpecArray
 from pathlib import Path
+import os
 
 data_path = Path("data/sample")
 spec = SpecArray.from_folder(data_path)
-cube = np.array(spec.spectral_albedo)
+cube = np.array(spec.spectral_albedo)  # (y, wavelength, x)
 wavelengths = np.array(spec.wavelengths)
 y, n_wl, x = cube.shape
 
@@ -2265,97 +2262,31 @@ with open(labelme_json) as f:
 
 classes_to_ignore = ["trou", "plot"]
 class_masks = {}
-mask_total_ignore = np.zeros((y, x), dtype=np.uint8)
+mask_trou = np.zeros((y, x), dtype=np.uint8)
 
 for shape in annotation["shapes"]:
     label = shape["label"]
     polygon = np.array(shape["points"], dtype=np.int32)
-    if label in classes_to_ignore:
-        cv2.fillPoly(mask_total_ignore, [polygon], 1)
+    if label == "trou":
+        cv2.fillPoly(mask_trou, [polygon], 1)
         continue
-    if label not in class_masks:
-        class_masks[label] = np.zeros((y, x), dtype=np.uint8)
-    cv2.fillPoly(class_masks[label], [polygon], 1)
+    if label not in classes_to_ignore:
+        if label not in class_masks:
+            class_masks[label] = np.zeros((y, x), dtype=np.uint8)
+        cv2.fillPoly(class_masks[label], [polygon], 1)
 
-class RatioViewer:
-    def __init__(self, master, cube, wavelengths, class_masks, mask_total_ignore):
-        self.master = master
-        self.cube = cube
-        self.wavelengths = wavelengths
-        self.class_masks = class_masks
-        self.mask_total_ignore = mask_total_ignore
-        self.y, self.n_wl, self.x = cube.shape
-        self.idx1 = 0
-        self.idx2 = 1
-        self.image_refs = []  # ⚡ garder références aux images Tkinter
+output_dir = Path("spectra_classes")
+output_dir.mkdir(exist_ok=True)
 
-        self.canvas = Canvas(master, width=self.x, height=self.y)
-        self.canvas.pack()
-        self.canvas_img = self.canvas.create_image(0, 0, anchor="nw")
-
-        self.draw_ratio()
-        self.draw_annotations()
-        self.canvas.bind("<Button-1>", self.on_click)
-
-        self.slider1 = Scale(master, from_=0, to=self.n_wl-1, orient=HORIZONTAL, label="Band 1", command=self.update_band1)
-        self.slider1.pack(fill="x")
-        self.slider2 = Scale(master, from_=0, to=self.n_wl-1, orient=HORIZONTAL, label="Band 2", command=self.update_band2)
-        self.slider2.pack(fill="x")
-
-    def draw_ratio(self):
-        band1 = self.cube[:, self.idx1, :]
-        band2 = self.cube[:, self.idx2, :]
-        ratio = band1 / (band2 + 1e-8)
-        ratio_norm = ((ratio - ratio.min()) / (ratio.max() - ratio.min()) * 255).astype(np.uint8)
-        img_ratio = Image.fromarray(ratio_norm)
-        tkimg = ImageTk.PhotoImage(img_ratio)
-        self.canvas.itemconfig(self.canvas_img, image=tkimg)
-        self.image_refs.append(tkimg)  # ⚡ conserver référence
-
-    def draw_annotations(self):
-        self.poly_coords = {}
-        for label, mask in self.class_masks.items():
-            contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for cnt in contours:
-                coords = cnt.squeeze()
-                if len(coords.shape) != 2 or coords.shape[0] < 3:
-                    continue
-                flat_coords = [coord for point in coords for coord in point]
-                self.poly_coords[label] = coords
-                self.canvas.create_polygon(flat_coords, outline="red", fill="", width=1)
-
-    def update_band1(self, val):
-        self.idx1 = int(val)
-        self.draw_ratio()
-
-    def update_band2(self, val):
-        self.idx2 = int(val)
-        self.draw_ratio()
-
-    def on_click(self, event):
-        x_click, y_click = event.x, event.y
-        for label, coords in self.poly_coords.items():
-            mask_polygon = np.zeros((self.y, self.x), dtype=np.uint8)
-            cv2.fillPoly(mask_polygon, [coords.astype(np.int32)], 1)
-            if mask_polygon[y_click, x_click]:
-                mask_selected = (mask_polygon==1) & (self.mask_total_ignore==0)
-                mask_selected_expanded = np.repeat(mask_selected[:, np.newaxis, :], self.n_wl, axis=1)
-                spectra_pixels = self.cube[mask_selected_expanded].reshape(-1, self.n_wl)
-                if len(spectra_pixels.shape) == 1:
-                    spectra_pixels = spectra_pixels.reshape(1,-1)
-                plt.figure(figsize=(8,5))
-                for s in spectra_pixels:
-                    plt.plot(self.wavelengths, s, alpha=0.2)
-                mean_s = spectra_pixels.mean(axis=0)
-                plt.plot(self.wavelengths, mean_s, color="black", linewidth=3, label="Mean spectrum")
-                plt.ylim(0,1)
-                plt.xlabel("Wavelength (nm)")
-                plt.ylabel("Reflectance")
-                plt.title(f"Spectres - Classe {label}")
-                plt.legend()
-                plt.show()
-                break
-
-root = tk.Tk()
-viewer = RatioViewer(root, cube, wavelengths, class_masks, mask_total_ignore)
-root.mainloop()
+for label, mask in class_masks.items():
+    mask_clean = (mask == 1) & (mask_trou == 0)
+    spectra = []
+    for i in range(y):
+        for j in range(x):
+            if mask_clean[i, j]:
+                s = cube[i, :, j]
+                if np.var(s) > 1e-8:  # spectre non nul
+                    spectra.append(s)
+    spectra = np.array(spectra)
+    print(f"Classe {label}: {spectra.shape[0]} spectres extraits")
+    np.save(output_dir / f"spectra_{label}.npy", spectra)
