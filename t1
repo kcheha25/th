@@ -2175,3 +2175,68 @@ plt.xticks(ticks=tick_indices, labels=tick_labels, rotation=45)
 plt.yticks(ticks=tick_indices, labels=tick_labels)
 
 plt.show()
+
+
+from specarray import SpecArray
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+import json
+import cv2
+from itertools import combinations
+
+data_path = Path("data/sample")
+spec = SpecArray.from_folder(data_path)
+cube = np.array(spec.spectral_albedo)  # (y, wavelength, x)
+wavelengths = np.array(spec.wavelengths)
+y, n_wl, x = cube.shape
+
+labelme_json = "annotations.json"
+with open(labelme_json) as f:
+    annotation = json.load(f)
+
+classes_to_ignore = ["trou"]
+class_masks = {}
+mask_total = np.zeros((y, x), dtype=bool)
+
+for shape in annotation["shapes"]:
+    label = shape["label"]
+    polygon = np.array(shape["points"], dtype=np.int32)
+    if label in classes_to_ignore:
+        cv2.fillPoly(mask_total, [polygon], 1)
+        continue
+    if label not in class_masks:
+        class_masks[label] = np.zeros((y, x), dtype=bool)
+    cv2.fillPoly(class_masks[label], [polygon], 1)
+    mask_total[class_masks[label]] = True
+
+mask_background = ~mask_total
+
+def compute_contrast_ratio(cube, mask_obj, mask_bg):
+    contrast_scores = np.zeros((n_wl, n_wl))
+    for i,j in combinations(range(n_wl),2):
+        band_i = cube[:, i, :]
+        band_j = cube[:, j, :]
+        ratio = band_i / (band_j + 1e-8)
+        obj_pixels = ratio[mask_obj]
+        bg_pixels  = ratio[mask_bg]
+        score = np.abs(obj_pixels.mean() - bg_pixels.mean())
+        contrast_scores[i,j] = score
+    return contrast_scores
+
+top_n = 5
+for label, mask_obj in class_masks.items():
+    scores = compute_contrast_ratio(cube, mask_obj, mask_background)
+    idx_flat = np.argsort(scores.flatten())[::-1]
+    pairs = [np.unravel_index(idx, scores.shape) for idx in idx_flat[:top_n]]
+    print(f"Classe {label} - top {top_n} paires bandes (wl1, wl2) avec meilleur contraste:")
+    for (i,j) in pairs:
+        print(f"{wavelengths[i]:.1f} nm / {wavelengths[j]:.1f} nm -> score {scores[i,j]:.4f}")
+
+        ratio_img = cube[:, i, :] / (cube[:, j, :] + 1e-8)
+        ratio_norm = (ratio_img - ratio_img.min()) / (ratio_img.max() - ratio_img.min())
+        plt.figure(figsize=(5,5))
+        plt.imshow(ratio_norm, cmap="gray")
+        plt.title(f"{label} - Ratio {wavelengths[i]:.1f}/{wavelengths[j]:.1f}")
+        plt.axis("off")
+        plt.show()
