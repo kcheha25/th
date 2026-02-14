@@ -1809,17 +1809,23 @@ with open(labelme_json) as f:
     annotation = json.load(f)
 
 target_class = "nom_de_ta_classe"
+exclude_class = "trou"
 
 mask = np.zeros((y, x), dtype=np.uint8)
+mask_exclude = np.zeros((y, x), dtype=np.uint8)
 
 for shape in annotation["shapes"]:
+    polygon = np.array(shape["points"], dtype=np.int32)
     if shape["label"] == target_class:
-        polygon = np.array(shape["points"], dtype=np.int32)
         cv2.fillPoly(mask, [polygon], 1)
+    if shape["label"] == exclude_class:
+        cv2.fillPoly(mask_exclude, [polygon], 1)
+
+mask[mask_exclude == 1] = 0
 
 plt.figure()
 plt.imshow(mask, cmap="gray")
-plt.title(f"Masque classe: {target_class}")
+plt.title(f"Masque classe: {target_class} sans trou")
 plt.axis("off")
 plt.show()
 
