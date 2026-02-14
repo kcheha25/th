@@ -2244,8 +2244,7 @@ for label, mask_obj in class_masks.items():
 
 
 import tkinter as tk
-from tkinter import ttk
-from tkinter import Canvas
+from tkinter import Canvas, Scale, HORIZONTAL
 from PIL import Image, ImageTk
 import numpy as np
 import matplotlib.pyplot as plt
@@ -2256,7 +2255,7 @@ from pathlib import Path
 
 data_path = Path("data/sample")
 spec = SpecArray.from_folder(data_path)
-cube = np.array(spec.spectral_albedo)
+cube = np.array(spec.spectral_albedo)  # (y, n_wl, x)
 wavelengths = np.array(spec.wavelengths)
 y, n_wl, x = cube.shape
 
@@ -2287,48 +2286,63 @@ ratio_norm = ((ratio - ratio.min()) / (ratio.max() - ratio.min()) * 255).astype(
 img_ratio = Image.fromarray(ratio_norm)
 
 class RatioViewer:
-    def __init__(self, master, img_ratio, class_masks, mask_total_ignore):
+    def __init__(self, master, cube, wavelengths, img_ratio, class_masks, mask_total_ignore):
         self.master = master
+        self.cube = cube
+        self.wavelengths = wavelengths
         self.img_ratio = img_ratio
         self.class_masks = class_masks
         self.mask_total_ignore = mask_total_ignore
-        self.polygons = list(class_masks.keys())
+        self.y, self.n_wl, self.x = cube.shape
+
         self.canvas = Canvas(master, width=img_ratio.width, height=img_ratio.height)
         self.canvas.pack()
         self.tkimg = ImageTk.PhotoImage(img_ratio)
         self.canvas_img = self.canvas.create_image(0,0, anchor="nw", image=self.tkimg)
         self.canvas.bind("<Button-1>", self.on_click)
+
+        self.slider = Scale(master, from_=0, to=self.n_wl-1, orient=HORIZONTAL, label="Band Index", command=self.update_band)
+        self.slider.pack(fill="x")
+
+        self.current_band = idx_996
         self.draw_annotations()
-    
+
     def draw_annotations(self):
         self.poly_coords = {}
         for label, mask in self.class_masks.items():
             contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for cnt in contours:
-                coords = cnt.squeeze().tolist()
-                if len(coords) < 3:
+                coords = cnt.squeeze()
+                if coords.ndim == 1 or len(coords) < 3:
                     continue
                 flat_coords = [coord for point in coords for coord in point]
                 self.poly_coords[label] = coords
                 self.canvas.create_polygon(flat_coords, outline="red", fill="", width=1)
 
+    def update_band(self, val):
+        band_idx = int(val)
+        band_img = self.cube[:, band_idx, :]
+        band_norm = ((band_img - band_img.min()) / (band_img.max() - band_img.min()) * 255).astype(np.uint8)
+        img = Image.fromarray(band_norm)
+        self.tkimg = ImageTk.PhotoImage(img)
+        self.canvas.itemconfig(self.canvas_img, image=self.tkimg)
+
     def on_click(self, event):
         x_click, y_click = event.x, event.y
         for label, coords in self.poly_coords.items():
-            mask_polygon = np.zeros((y,x), dtype=np.uint8)
+            mask_polygon = np.zeros((self.y, self.x), dtype=np.uint8)
             cv2.fillPoly(mask_polygon, [np.array(coords, dtype=np.int32)], 1)
-            if mask_polygon[y_click,x_click]:
+            if mask_polygon[y_click, x_click]:
                 mask_selected = (mask_polygon==1) & (self.mask_total_ignore==0)
-                mask_selected_expanded = np.repeat(mask_selected[:, np.newaxis, :], n_wl, axis=1)
-                spectra_pixels = cube[mask_selected_expanded].reshape(-1, n_wl)
-
-                if len(spectra_pixels.shape)==1:
-                    spectra_pixels = spectra_pixels.reshape(1,-1)
+                mask_selected_expanded = np.repeat(mask_selected[:, np.newaxis, :], self.n_wl, axis=1)
+                spectra_pixels = self.cube[mask_selected_expanded].reshape(-1, self.n_wl)
+                if spectra_pixels.ndim == 1:
+                    spectra_pixels = spectra_pixels.reshape(1, -1)
                 plt.figure(figsize=(8,5))
                 for s in spectra_pixels:
-                    plt.plot(wavelengths, s, alpha=0.2)
+                    plt.plot(self.wavelengths, s, alpha=0.2)
                 mean_s = spectra_pixels.mean(axis=0)
-                plt.plot(wavelengths, mean_s, color="black", linewidth=3, label="Mean spectrum")
+                plt.plot(self.wavelengths, mean_s, color="black", linewidth=3, label="Mean spectrum")
                 plt.ylim(0,1)
                 plt.xlabel("Wavelength (nm)")
                 plt.ylabel("Reflectance")
@@ -2338,5 +2352,5 @@ class RatioViewer:
                 break
 
 root = tk.Tk()
-viewer = RatioViewer(root, img_ratio, class_masks, mask_total_ignore)
+viewer = RatioViewer(root, cube, wavelengths, img_ratio, class_masks, mask_total_ignore)
 root.mainloop()
