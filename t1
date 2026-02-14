@@ -2187,7 +2187,7 @@ from itertools import combinations
 
 data_path = Path("data/sample")
 spec = SpecArray.from_folder(data_path)
-cube = np.array(spec.spectral_albedo)  # (y, wavelength, x)
+cube = np.array(spec.spectral_albedo)
 wavelengths = np.array(spec.wavelengths)
 y, n_wl, x = cube.shape
 
@@ -2195,9 +2195,9 @@ labelme_json = "annotations.json"
 with open(labelme_json) as f:
     annotation = json.load(f)
 
-classes_to_ignore = ["trou"]
+classes_to_ignore = ["trou", "plot"]
 class_masks = {}
-mask_total = np.zeros((y, x), dtype=bool)
+mask_total = np.zeros((y, x), dtype=np.uint8)
 
 for shape in annotation["shapes"]:
     label = shape["label"]
@@ -2206,11 +2206,11 @@ for shape in annotation["shapes"]:
         cv2.fillPoly(mask_total, [polygon], 1)
         continue
     if label not in class_masks:
-        class_masks[label] = np.zeros((y, x), dtype=bool)
+        class_masks[label] = np.zeros((y, x), dtype=np.uint8)
     cv2.fillPoly(class_masks[label], [polygon], 1)
-    mask_total[class_masks[label]] = True
+    mask_total[class_masks[label] == 1] = 1
 
-mask_background = ~mask_total
+mask_background = mask_total == 0
 
 def compute_contrast_ratio(cube, mask_obj, mask_bg):
     contrast_scores = np.zeros((n_wl, n_wl))
