@@ -1785,3 +1785,89 @@ plt.imshow(ratio_opt_norm, cmap='gray')
 plt.title(f"Meilleur ratio {wavelengths[i_best]} nm / {wavelengths[j_best]} nm")
 plt.axis('off')
 plt.show()
+
+
+from specarray import SpecArray
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+import json
+import cv2
+
+data_path = Path("data/sample")
+spec = SpecArray.from_folder(data_path)
+
+cube = np.array(spec.spectral_albedo)
+wavelengths = np.array(spec.wavelengths)
+
+y, n_wl, x = cube.shape
+print(f"Cube shape: {cube.shape}")
+
+labelme_json = "annotations.json"
+
+with open(labelme_json) as f:
+    annotation = json.load(f)
+
+target_class = "nom_de_ta_classe"
+
+mask = np.zeros((y, x), dtype=np.uint8)
+
+for shape in annotation["shapes"]:
+    if shape["label"] == target_class:
+        polygon = np.array(shape["points"], dtype=np.int32)
+        cv2.fillPoly(mask, [polygon], 1)
+
+plt.figure()
+plt.imshow(mask, cmap="gray")
+plt.title(f"Masque classe: {target_class}")
+plt.axis("off")
+plt.show()
+
+spectra = []
+
+for i in range(y):
+    for j in range(x):
+        if mask[i, j] == 1:
+            s = cube[i, :, j]
+            if np.var(s) > 1e-8:
+                spectra.append(s)
+
+spectra = np.array(spectra)
+print(f"Nombre de spectres extraits: {spectra.shape[0]}")
+
+def find_nearest_idx(target_wl, wavelengths):
+    return np.argmin(np.abs(wavelengths - target_wl))
+
+idx_996 = find_nearest_idx(996, wavelengths)
+idx_1197 = find_nearest_idx(1197, wavelengths)
+
+print("Bande réelle proche de 996 nm:", wavelengths[idx_996])
+print("Bande réelle proche de 1197 nm:", wavelengths[idx_1197])
+
+plt.figure(figsize=(10,6))
+
+for s in spectra:
+    plt.plot(wavelengths, s, alpha=0.2)
+
+mean_spectrum = spectra.mean(axis=0)
+plt.plot(wavelengths, mean_spectrum, color="black", linewidth=3, label="Mean spectrum")
+
+plt.axvline(wavelengths[idx_996], color="red", linestyle="--", label="996 nm")
+plt.axvline(wavelengths[idx_1197], color="blue", linestyle="--", label="1197 nm")
+
+plt.xlabel("Wavelength (nm)")
+plt.ylabel("Reflectance")
+plt.title(f"Spectres - Classe {target_class}")
+plt.legend()
+plt.show()
+
+ratio_spectra = spectra[:, idx_996] / (spectra[:, idx_1197] + 1e-8)
+
+plt.figure(figsize=(6,4))
+plt.hist(ratio_spectra, bins=30)
+plt.title(f"Distribution Ratio 996/1197 - {target_class}")
+plt.xlabel("Ratio")
+plt.ylabel("Frequency")
+plt.show()
+
+print("Ratio moyen:", ratio_spectra.mean())
