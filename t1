@@ -2240,3 +2240,102 @@ for label, mask_obj in class_masks.items():
         plt.title(f"{label} - Ratio {wavelengths[i]:.1f}/{wavelengths[j]:.1f}")
         plt.axis("off")
         plt.show()
+
+
+
+import tkinter as tk
+from tkinter import ttk
+from tkinter import Canvas
+from PIL import Image, ImageTk
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+import json
+from specarray import SpecArray
+from pathlib import Path
+
+data_path = Path("data/sample")
+spec = SpecArray.from_folder(data_path)
+cube = np.array(spec.spectral_albedo)
+wavelengths = np.array(spec.wavelengths)
+y, n_wl, x = cube.shape
+
+labelme_json = "annotations.json"
+with open(labelme_json) as f:
+    annotation = json.load(f)
+
+classes_to_ignore = ["trou", "plot"]
+class_masks = {}
+mask_total_ignore = np.zeros((y, x), dtype=np.uint8)
+
+for shape in annotation["shapes"]:
+    label = shape["label"]
+    polygon = np.array(shape["points"], dtype=np.int32)
+    if label in classes_to_ignore:
+        cv2.fillPoly(mask_total_ignore, [polygon], 1)
+        continue
+    if label not in class_masks:
+        class_masks[label] = np.zeros((y, x), dtype=np.uint8)
+    cv2.fillPoly(class_masks[label], [polygon], 1)
+
+idx_996 = np.argmin(np.abs(wavelengths - 996))
+idx_1197 = np.argmin(np.abs(wavelengths - 1197))
+band1 = cube[:, idx_996, :]
+band2 = cube[:, idx_1197, :]
+ratio = band1 / (band2 + 1e-8)
+ratio_norm = ((ratio - ratio.min()) / (ratio.max() - ratio.min()) * 255).astype(np.uint8)
+img_ratio = Image.fromarray(ratio_norm)
+
+class RatioViewer:
+    def __init__(self, master, img_ratio, class_masks, mask_total_ignore):
+        self.master = master
+        self.img_ratio = img_ratio
+        self.class_masks = class_masks
+        self.mask_total_ignore = mask_total_ignore
+        self.polygons = list(class_masks.keys())
+        self.canvas = Canvas(master, width=img_ratio.width, height=img_ratio.height)
+        self.canvas.pack()
+        self.tkimg = ImageTk.PhotoImage(img_ratio)
+        self.canvas_img = self.canvas.create_image(0,0, anchor="nw", image=self.tkimg)
+        self.canvas.bind("<Button-1>", self.on_click)
+        self.draw_annotations()
+    
+    def draw_annotations(self):
+        self.poly_coords = {}
+        for label, mask in self.class_masks.items():
+            contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                coords = cnt.squeeze().tolist()
+                if len(coords) < 3:
+                    continue
+                flat_coords = [coord for point in coords for coord in point]
+                self.poly_coords[label] = coords
+                self.canvas.create_polygon(flat_coords, outline="red", fill="", width=1)
+
+    def on_click(self, event):
+        x_click, y_click = event.x, event.y
+        for label, coords in self.poly_coords.items():
+            mask_polygon = np.zeros((y,x), dtype=np.uint8)
+            cv2.fillPoly(mask_polygon, [np.array(coords, dtype=np.int32)], 1)
+            if mask_polygon[y_click,x_click]:
+                mask_selected = (mask_polygon==1) & (self.mask_total_ignore==0)
+                spectra = cube[mask_selected,:,:] if cube.ndim==3 else cube
+                spectra_pixels = cube[mask_selected]
+                if len(spectra_pixels.shape)==1:
+                    spectra_pixels = spectra_pixels.reshape(1,-1)
+                plt.figure(figsize=(8,5))
+                for s in spectra_pixels:
+                    plt.plot(wavelengths, s, alpha=0.2)
+                mean_s = spectra_pixels.mean(axis=0)
+                plt.plot(wavelengths, mean_s, color="black", linewidth=3, label="Mean spectrum")
+                plt.ylim(0,1)
+                plt.xlabel("Wavelength (nm)")
+                plt.ylabel("Reflectance")
+                plt.title(f"Spectres - Classe {label}")
+                plt.legend()
+                plt.show()
+                break
+
+root = tk.Tk()
+viewer = RatioViewer(root, img_ratio, class_masks, mask_total_ignore)
+root.mainloop()
