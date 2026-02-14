@@ -2319,8 +2319,9 @@ class RatioViewer:
             cv2.fillPoly(mask_polygon, [np.array(coords, dtype=np.int32)], 1)
             if mask_polygon[y_click,x_click]:
                 mask_selected = (mask_polygon==1) & (self.mask_total_ignore==0)
-                spectra = cube[mask_selected,:,:] if cube.ndim==3 else cube
-                spectra_pixels = cube[mask_selected]
+                mask_selected_expanded = np.repeat(mask_selected[:, np.newaxis, :], n_wl, axis=1)
+                spectra_pixels = cube[mask_selected_expanded].reshape(-1, n_wl)
+
                 if len(spectra_pixels.shape)==1:
                     spectra_pixels = spectra_pixels.reshape(1,-1)
                 plt.figure(figsize=(8,5))
