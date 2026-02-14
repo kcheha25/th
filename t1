@@ -2248,11 +2248,12 @@ import json
 import cv2
 from specarray import SpecArray
 from pathlib import Path
+import matplotlib.pyplot as plt
 import os
 
 data_path = Path("data/sample")
 spec = SpecArray.from_folder(data_path)
-cube = np.array(spec.spectral_albedo)  # (y, wavelength, x)
+cube = np.array(spec.spectral_albedo)
 wavelengths = np.array(spec.wavelengths)
 y, n_wl, x = cube.shape
 
@@ -2285,8 +2286,23 @@ for label, mask in class_masks.items():
         for j in range(x):
             if mask_clean[i, j]:
                 s = cube[i, :, j]
-                if np.var(s) > 1e-8:  # spectre non nul
+                if np.var(s) > 1e-8:
                     spectra.append(s)
     spectra = np.array(spectra)
     print(f"Classe {label}: {spectra.shape[0]} spectres extraits")
     np.save(output_dir / f"spectra_{label}.npy", spectra)
+    
+    # --- Plot visible même pour des milliers de spectres ---
+    plt.figure(figsize=(12,6))
+    for s in spectra:
+        plt.plot(wavelengths, s, color="blue", alpha=0.05)
+    mean_s = spectra.mean(axis=0)
+    plt.plot(wavelengths, mean_s, color="red", linewidth=2, label="Mean spectrum")
+    plt.ylim(0, 1)
+    plt.xlabel("Wavelength (nm)")
+    plt.ylabel("Reflectance")
+    plt.title(f"Spectres - Classe {label}")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / f"spectres_plot_{label}.png", dpi=200)
+    plt.close()
