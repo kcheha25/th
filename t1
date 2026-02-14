@@ -1877,3 +1877,98 @@ plt.ylabel("Frequency")
 plt.show()
 
 print("Ratio moyen:", ratio_spectra.mean())
+
+
+
+import tkinter as tk
+from PIL import Image, ImageTk
+import numpy as np
+import matplotlib.pyplot as plt
+from specarray import SpecArray
+from pathlib import Path
+
+# -------------------------
+# Charger cube hyperspectral
+# -------------------------
+
+data_path = Path("data/sample")
+spec = SpecArray.from_folder(data_path)
+
+cube = np.array(spec.spectral_albedo)
+wavelengths = np.array(spec.wavelengths)
+
+y, n_wl, x = cube.shape
+
+def find_nearest_idx(target_wl, wavelengths):
+    return np.argmin(np.abs(wavelengths - target_wl))
+
+idx1 = find_nearest_idx(996, wavelengths)
+idx2 = find_nearest_idx(1197, wavelengths)
+
+band1 = cube[:, idx1, :]
+band2 = cube[:, idx2, :]
+
+ratio = band1 / (band2 + 1e-8)
+ratio_norm = (ratio - ratio.min()) / (ratio.max() - ratio.min())
+ratio_img = (ratio_norm * 255).astype(np.uint8)
+
+# -------------------------
+# Interface Tkinter
+# -------------------------
+
+class RatioViewer:
+
+    def __init__(self, master, image_array):
+        self.master = master
+        self.master.title("Ratio Viewer")
+
+        self.scale = 1.0
+        self.original = image_array
+        self.image = Image.fromarray(self.original)
+        self.tk_image = ImageTk.PhotoImage(self.image)
+
+        self.canvas = tk.Canvas(master, width=self.image.width, height=self.image.height)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.image_on_canvas = self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
+
+        self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<MouseWheel>", self.zoom)
+
+    def zoom(self, event):
+        if event.delta > 0:
+            self.scale *= 1.1
+        else:
+            self.scale /= 1.1
+
+        new_size = (int(self.original.shape[1] * self.scale),
+                    int(self.original.shape[0] * self.scale))
+
+        resized = cv2.resize(self.original, new_size, interpolation=cv2.INTER_NEAREST)
+        self.image = Image.fromarray(resized)
+        self.tk_image = ImageTk.PhotoImage(self.image)
+
+        self.canvas.config(width=new_size[0], height=new_size[1])
+        self.canvas.itemconfig(self.image_on_canvas, image=self.tk_image)
+
+    def on_click(self, event):
+        x_click = int(event.x / self.scale)
+        y_click = int(event.y / self.scale)
+
+        if 0 <= x_click < x and 0 <= y_click < y:
+            spectrum = cube[y_click, :, x_click]
+
+            plt.figure()
+            plt.plot(wavelengths, spectrum)
+            plt.axvline(wavelengths[idx1], color='r')
+            plt.axvline(wavelengths[idx2], color='b')
+            plt.title(f"Spectrum at ({x_click},{y_click})")
+            plt.xlabel("Wavelength (nm)")
+            plt.ylabel("Reflectance")
+            plt.show()
+
+import cv2
+
+root = tk.Tk()
+viewer = RatioViewer(root, ratio_img)
+root.mainloop()
