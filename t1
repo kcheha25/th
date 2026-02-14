@@ -2303,3 +2303,84 @@ for label, mask in class_masks.items():
     plt.tight_layout()
     plt.savefig(output_dir / f"spectres_plot_{label}.png", dpi=200)
     plt.close()
+
+
+
+
+import numpy as np
+import json
+import cv2
+from specarray import SpecArray
+from pathlib import Path
+import matplotlib.pyplot as plt
+import os
+
+data_path = Path("data/sample")
+spec = SpecArray.from_folder(data_path)
+cube = np.array(spec.spectral_albedo)
+wavelengths = np.array(spec.wavelengths)
+y, n_wl, x = cube.shape
+
+labelme_json = "annotations.json"
+with open(labelme_json) as f:
+    annotation = json.load(f)
+
+classes_to_ignore = ["trou", "plot"]
+class_masks = {}
+mask_trou = np.zeros((y, x), dtype=np.uint8)
+
+# Taille du kernel pour erosion (ajuster selon la finesse désirée)
+kernel_size = 3
+kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+
+for shape in annotation["shapes"]:
+    label = shape["label"]
+    polygon = np.array(shape["points"], dtype=np.int32)
+    if label == "trou":
+        cv2.fillPoly(mask_trou, [polygon], 1)
+        continue
+    if label not in classes_to_ignore:
+        if label not in class_masks:
+            class_masks[label] = np.zeros((y, x), dtype=np.uint8)
+        cv2.fillPoly(class_masks[label], [polygon], 1)
+
+output_dir = Path("spectra_classes")
+output_dir.mkdir(exist_ok=True)
+
+for label, mask in class_masks.items():
+    # Erosion du masque pour "rétrécir" les polygons
+    mask_eroded = cv2.erode(mask, kernel, iterations=1)
+    mask_clean = (mask_eroded == 1) & (mask_trou == 0)
+    
+    # Afficher le masque érodé
+    plt.figure(figsize=(6,6))
+    plt.imshow(mask_clean, cmap='gray')
+    plt.title(f"Masque érodé - Classe {label}")
+    plt.axis('off')
+    plt.show()
+    
+    # Extraire les spectres
+    spectra = []
+    for i in range(y):
+        for j in range(x):
+            if mask_clean[i, j]:
+                s = cube[i, :, j]
+                if np.var(s) > 1e-8:
+                    spectra.append(s)
+    spectra = np.array(spectra)
+    print(f"Classe {label}: {spectra.shape[0]} spectres extraits")
+    np.save(output_dir / f"spectra_{label}.npy", spectra)
+    
+    # Affichage des spectres
+    plt.figure(figsize=(12,6))
+    for s in spectra:
+        plt.plot(wavelengths, s, color="blue", alpha=0.05)
+    mean_s = spectra.mean(axis=0)
+    plt.plot(wavelengths, mean_s, color="red", linewidth=2, label="Mean spectrum")
+    plt.xlabel("Wavelength (nm)")
+    plt.ylabel("Reflectance")
+    plt.title(f"Spectres - Classe {label}")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / f"spectres_plot_{label}.png", dpi=200)
+    plt.close()
