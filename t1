@@ -2142,7 +2142,6 @@ if __name__ == "__main__":
     root.mainloop()
 
 
-
 import numpy as np
 import matplotlib.pyplot as plt
 from specarray import SpecArray
@@ -2154,17 +2153,20 @@ spec = SpecArray.from_folder(data_path)
 cube = np.array(spec.spectral_albedo)  # (y, wavelength, x)
 wavelengths = np.array(spec.wavelengths)
 
-# Reshape en (pixels, bands)
 y, n_wl, x = cube.shape
 pixels = cube.reshape(y*x, n_wl)
 
-# Calcul de la matrice de corrélation entre bandes
-corr_matrix = np.corrcoef(pixels.T)  # transpose pour corrélation bandes x bandes
+corr_matrix = np.corrcoef(pixels.T)
 
-plt.figure(figsize=(10,8))
-plt.imshow(corr_matrix, cmap='bwr', vmin=-1, vmax=1)
-plt.colorbar(label='Correlation coefficient')
+plt.figure(figsize=(12,10))
+im = plt.imshow(corr_matrix, cmap='bwr', vmin=-1, vmax=1)
+
+plt.colorbar(im, label='Correlation coefficient')
 plt.title("Carte de corrélation entre bandes")
-plt.xlabel("Band index")
-plt.ylabel("Band index")
+plt.xlabel("Wavelength (nm)")
+plt.ylabel("Wavelength (nm)")
+
+plt.xticks(ticks=np.linspace(0, n_wl-1, 10), labels=np.round(np.linspace(wavelengths[0], wavelengths[-1], 10)).astype(int))
+plt.yticks(ticks=np.linspace(0, n_wl-1, 10), labels=np.round(np.linspace(wavelengths[0], wavelengths[-1], 10)).astype(int))
+
 plt.show()
