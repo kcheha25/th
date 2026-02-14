@@ -2055,3 +2055,88 @@ root = tk.Tk()
 root.title("Hyperspectral Ratio Viewer")
 viewer = RatioViewer(root, cube, wavelengths)
 root.mainloop()
+
+
+import tkinter as tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
+from specarray import SpecArray
+import numpy as np
+from pathlib import Path
+
+class RatioViewer:
+    def __init__(self, master, spec_folder):
+        self.master = master
+        self.spec = SpecArray.from_folder(Path(spec_folder))
+        self.cube = np.array(self.spec.spectral_albedo)  # (y, wavelength, x)
+        self.wavelengths = np.array(self.spec.wavelengths)
+        self.y, self.n_wl, self.x = self.cube.shape
+        self.idx_red = 0
+        self.idx_blue = 0
+
+        self.fig, (self.ax_ratio, self.ax_spectrum) = plt.subplots(1, 2, figsize=(10,5))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=master)
+        self.canvas.get_tk_widget().pack()
+
+        self.red_label = tk.Label(master, text="Red nm:")
+        self.red_label.pack(side="left")
+        self.red_entry = tk.Entry(master)
+        self.red_entry.pack(side="left")
+        self.red_entry.insert(0, str(self.wavelengths[0]))
+
+        self.blue_label = tk.Label(master, text="Blue nm:")
+        self.blue_label.pack(side="left")
+        self.blue_entry = tk.Entry(master)
+        self.blue_entry.pack(side="left")
+        self.blue_entry.insert(0, str(self.wavelengths[10]))
+
+        self.update_button = tk.Button(master, text="Update Ratio", command=self.update_ratio)
+        self.update_button.pack(side="left")
+
+        self.canvas.mpl_connect("button_press_event", self.on_click)
+        self.update_ratio()
+
+    def find_nearest_idx(self, target_nm):
+        return np.argmin(np.abs(self.wavelengths - target_nm))
+
+    def update_ratio(self):
+        red_nm = float(self.red_entry.get())
+        blue_nm = float(self.blue_entry.get())
+        self.idx_red = self.find_nearest_idx(red_nm)
+        self.idx_blue = self.find_nearest_idx(blue_nm)
+
+        band_red = self.cube[:, self.idx_red, :]
+        band_blue = self.cube[:, self.idx_blue, :]
+        ratio = band_red / (band_blue + 1e-8)
+        ratio = (ratio - ratio.min()) / (ratio.max() - ratio.min())
+        self.ratio_image = ratio
+
+        self.ax_ratio.clear()
+        self.ax_ratio.imshow(ratio, cmap="gray", vmin=0, vmax=1)
+        self.ax_ratio.set_title(f"Ratio {red_nm:.0f}nm / {blue_nm:.0f}nm")
+
+        self.ax_spectrum.clear()
+        self.ax_spectrum.set_ylim(0, 1)  # fixe l'axe vertical pour spectre
+        self.ax_spectrum.set_title("Spectre du pixel cliqué")
+        self.canvas.draw()
+
+    def on_click(self, event):
+        if event.inaxes != self.ax_ratio:
+            return
+        x_pix = int(event.xdata)
+        y_pix = int(event.ydata)
+        s = self.cube[y_pix, :, x_pix]
+
+        self.ax_spectrum.clear()
+        self.ax_spectrum.plot(self.wavelengths, s, color="blue")
+        self.ax_spectrum.set_ylim(0, 1)  # axe vertical fixe
+        self.ax_spectrum.set_xlabel("Wavelength (nm)")
+        self.ax_spectrum.set_ylabel("Reflectance")
+        self.ax_spectrum.set_title(f"Pixel ({x_pix}, {y_pix})")
+        self.canvas.draw()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    viewer = RatioViewer(root, "data/sample")
+    root.mainloop()
