@@ -2166,7 +2166,12 @@ plt.title("Carte de corrélation entre bandes")
 plt.xlabel("Wavelength (nm)")
 plt.ylabel("Wavelength (nm)")
 
-plt.xticks(ticks=np.linspace(0, n_wl-1, 10), labels=np.round(np.linspace(wavelengths[0], wavelengths[-1], 10)).astype(int))
-plt.yticks(ticks=np.linspace(0, n_wl-1, 10), labels=np.round(np.linspace(wavelengths[0], wavelengths[-1], 10)).astype(int))
+# Choisir par exemple 10 ticks espacés uniformément
+num_ticks = 10
+tick_indices = np.linspace(0, n_wl-1, num_ticks, dtype=int)
+tick_labels = np.round(wavelengths[tick_indices]).astype(int)
+
+plt.xticks(ticks=tick_indices, labels=tick_labels, rotation=45)
+plt.yticks(ticks=tick_indices, labels=tick_labels)
 
 plt.show()
