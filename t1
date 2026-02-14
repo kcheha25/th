@@ -2242,7 +2242,6 @@ for label, mask_obj in class_masks.items():
         plt.show()
 
 
-
 import numpy as np
 import json
 import cv2
@@ -2292,13 +2291,11 @@ for label, mask in class_masks.items():
     print(f"Classe {label}: {spectra.shape[0]} spectres extraits")
     np.save(output_dir / f"spectra_{label}.npy", spectra)
     
-    # --- Plot visible même pour des milliers de spectres ---
     plt.figure(figsize=(12,6))
     for s in spectra:
         plt.plot(wavelengths, s, color="blue", alpha=0.05)
     mean_s = spectra.mean(axis=0)
     plt.plot(wavelengths, mean_s, color="red", linewidth=2, label="Mean spectrum")
-    plt.ylim(0, 1)
     plt.xlabel("Wavelength (nm)")
     plt.ylabel("Reflectance")
     plt.title(f"Spectres - Classe {label}")
