@@ -2140,3 +2140,31 @@ if __name__ == "__main__":
     root = tk.Tk()
     viewer = RatioViewer(root, "data/sample")
     root.mainloop()
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from specarray import SpecArray
+from pathlib import Path
+
+data_path = Path("data/sample")
+spec = SpecArray.from_folder(data_path)
+
+cube = np.array(spec.spectral_albedo)  # (y, wavelength, x)
+wavelengths = np.array(spec.wavelengths)
+
+# Reshape en (pixels, bands)
+y, n_wl, x = cube.shape
+pixels = cube.reshape(y*x, n_wl)
+
+# Calcul de la matrice de corrélation entre bandes
+corr_matrix = np.corrcoef(pixels.T)  # transpose pour corrélation bandes x bandes
+
+plt.figure(figsize=(10,8))
+plt.imshow(corr_matrix, cmap='bwr', vmin=-1, vmax=1)
+plt.colorbar(label='Correlation coefficient')
+plt.title("Carte de corrélation entre bandes")
+plt.xlabel("Band index")
+plt.ylabel("Band index")
+plt.show()
