@@ -2285,17 +2285,15 @@ class RatioViewer:
         self.class_masks = class_masks
         self.mask_total_ignore = mask_total_ignore
         self.y, self.n_wl, self.x = cube.shape
-
         self.idx1 = 0
         self.idx2 = 1
+        self.image_refs = []  # ⚡ garder références aux images Tkinter
 
         self.canvas = Canvas(master, width=self.x, height=self.y)
         self.canvas.pack()
-
-        self.tkimg = None
         self.canvas_img = self.canvas.create_image(0, 0, anchor="nw")
-        self.draw_ratio()
 
+        self.draw_ratio()
         self.draw_annotations()
         self.canvas.bind("<Button-1>", self.on_click)
 
@@ -2310,9 +2308,9 @@ class RatioViewer:
         ratio = band1 / (band2 + 1e-8)
         ratio_norm = ((ratio - ratio.min()) / (ratio.max() - ratio.min()) * 255).astype(np.uint8)
         img_ratio = Image.fromarray(ratio_norm)
-        self.tkimg = ImageTk.PhotoImage(img_ratio)
-        self.canvas.itemconfig(self.canvas_img, image=self.tkimg)
-        self.canvas.image = self.tkimg
+        tkimg = ImageTk.PhotoImage(img_ratio)
+        self.canvas.itemconfig(self.canvas_img, image=tkimg)
+        self.image_refs.append(tkimg)  # ⚡ conserver référence
 
     def draw_annotations(self):
         self.poly_coords = {}
