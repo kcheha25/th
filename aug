@@ -1277,7 +1277,7 @@ class SpectralPixelDataset(Dataset):
             spectra = cube.reshape(B, -1).T
             for s in spectra:
                 if np.var(s) > self.null_threshold:
-                    s_norm = 2 * (s - s.min()) / (s.max() - s.min() + 1e-8) - 1
+                    s_norm = 2 * s - 1
                     self.samples.append((torch.tensor(s_norm, dtype=torch.float32), class_id))
 
         print(f"Dataset chargé : {len(self.samples)} spectres non nuls")
@@ -1924,3 +1924,375 @@ images[0].save(
     duration=500,
     loop=0
 )
+
+
+import torch
+from torch.utils.data import Dataset, DataLoader, Subset
+from collections import defaultdict
+import numpy as np
+import matplotlib.pyplot as plt
+
+def compute_sam(s1, s2):
+    s1_norm = s1 / (np.linalg.norm(s1) + 1e-8)
+    s2_norm = s2 / (np.linalg.norm(s2) + 1e-8)
+    cosine = np.clip(np.dot(s1_norm, s2_norm), -1, 1)
+    return np.arccos(cosine)
+
+def get_class_spectra(dataset):
+    class_indices = defaultdict(list)
+    for i, (_, label) in enumerate(dataset):
+        class_indices[label].append(i)
+    class_spectra = {}
+    for label, indices in class_indices.items():
+        spectra_list = [dataset[idx][0].numpy() for idx in indices]
+        spectra_stack = np.vstack(spectra_list)
+        class_spectra[label] = spectra_stack
+    return class_spectra
+
+def group_classes(class_spectra, sam_thresh=0.1):
+    labels = list(class_spectra.keys())
+    class_mean = {lbl: spectra.mean(axis=0) for lbl, spectra in class_spectra.items()}
+    groups = [{lbl} for lbl in labels]
+    merged = True
+    while merged:
+        merged = False
+        new_groups = []
+        skip = set()
+        for i in range(len(groups)):
+            if i in skip:
+                continue
+            g1 = groups[i]
+            for j in range(i+1, len(groups)):
+                if j in skip:
+                    continue
+                g2 = groups[j]
+                sam_close = any(compute_sam(class_mean[l1], class_mean[l2]) < sam_thresh for l1 in g1 for l2 in g2)
+                if sam_close:
+                    g1 = g1.union(g2)
+                    skip.add(j)
+                    merged = True
+            new_groups.append(g1)
+        groups = new_groups
+    return groups
+
+def plot_groups(class_spectra, groups):
+    colors = plt.cm.get_cmap("tab20").colors
+    for g_idx, group in enumerate(groups):
+        plt.figure(figsize=(10,6))
+        for idx, label in enumerate(group):
+            spectra = class_spectra[label]
+            mean_s = spectra.mean(axis=0)
+            for s in spectra:
+                plt.plot(s, color=colors[idx % len(colors)], alpha=0.1)
+            plt.plot(mean_s, color=colors[idx % len(colors)], linewidth=2, label=f"{label} mean")
+        plt.title(f"Groupe {g_idx}")
+        plt.xlabel("Band index")
+        plt.ylabel("Reflectance")
+        plt.legend()
+        plt.show()
+
+dataset = SpectralPixelDataset("chemin/vers/tes/hdrs")
+class_spectra = get_class_spectra(dataset)
+groups = group_classes(class_spectra, sam_thresh=0.1)
+plot_groups(class_spectra, groups)
+'''
+
+'''
+
+
+import torch
+from torch.utils.data import Dataset, DataLoader, Subset
+from collections import defaultdict
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from feature_engine.selection import MRMR
+
+def compute_sam(s1, s2):
+    s1_norm = s1 / (np.linalg.norm(s1) + 1e-8)
+    s2_norm = s2 / (np.linalg.norm(s2) + 1e-8)
+    cosine = np.clip(np.dot(s1_norm, s2_norm), -1, 1)
+    return np.arccos(cosine)
+
+def get_class_spectra(dataset):
+    class_indices = defaultdict(list)
+    for i, (_, label) in enumerate(dataset):
+        class_indices[label].append(i)
+    class_spectra = {}
+    for label, indices in class_indices.items():
+        spectra_list = [dataset[idx][0].numpy() for idx in indices]
+        spectra_stack = np.vstack(spectra_list)
+        class_spectra[label] = spectra_stack
+    return class_spectra
+
+def group_classes(class_spectra, sam_thresh=0.1):
+    labels = list(class_spectra.keys())
+    class_mean = {lbl: spectra.mean(axis=0) for lbl, spectra in class_spectra.items()}
+    groups = [{lbl} for lbl in labels]
+    merged = True
+    while merged:
+        merged = False
+        new_groups = []
+        skip = set()
+        for i in range(len(groups)):
+            if i in skip:
+                continue
+            g1 = groups[i]
+            for j in range(i+1, len(groups)):
+                if j in skip:
+                    continue
+                g2 = groups[j]
+                sam_close = any(compute_sam(class_mean[l1], class_mean[l2]) < sam_thresh for l1 in g1 for l2 in g2)
+                if sam_close:
+                    g1 = g1.union(g2)
+                    skip.add(j)
+                    merged = True
+            new_groups.append(g1)
+        groups = new_groups
+    return groups
+
+def select_mrmr_bands_for_group(class_spectra, group, n_features=10):
+    all_specs = []
+    all_labels = []
+    for label in group:
+        specs = class_spectra[label]
+        all_specs.append(specs)
+        all_labels.append(np.full(specs.shape[0], label))
+    X = np.vstack(all_specs)
+    y = np.concatenate(all_labels)
+    wavelengths = np.arange(X.shape[1])
+    df = pd.DataFrame(X, columns=wavelengths)
+    mrmr = MRMR(method="MIQ", max_features=n_features, regression=False, random_state=0)
+    df_selected = mrmr.fit_transform(df, y)
+    selected = mrmr.get_feature_names_out()
+    return list(map(int, selected))
+
+def plot_groups_and_selected(class_spectra, groups, selected_bands):
+    colors = plt.cm.get_cmap("tab20").colors
+    for g_idx, group in enumerate(groups):
+        plt.figure(figsize=(10,6))
+        for idx, label in enumerate(group):
+            spectra = class_spectra[label]
+            for s in spectra:
+                plt.plot(s, color=colors[idx % len(colors)], alpha=0.1)
+            mean_spec = spectra.mean(axis=0)
+            plt.plot(mean_spec, color=colors[idx % len(colors)], linewidth=2, label=f"{label} mean")
+        sel = selected_bands[g_idx]
+        for b in sel:
+            plt.axvline(b, linestyle="--", color="black")
+        plt.title(f"Groupe {g_idx} - bandes MRMR")
+        plt.xlabel("Indice de bande")
+        plt.ylabel("Reflectance")
+        plt.legend()
+        plt.show()
+
+dataset = SpectralPixelDataset("chemin/vers/tes/hdrs")
+class_spectra = get_class_spectra(dataset)
+groups = group_classes(class_spectra, sam_thresh=0.05)
+selected_bands = []
+for group in groups:
+    sel = select_mrmr_bands_for_group(class_spectra, group, n_features=10)
+    selected_bands.append(sel)
+plot_groups_and_selected(class_spectra, groups, selected_bands)
+
+
+
+
+
+
+
+
+
+
+import torch
+from torch.utils.data import Dataset, DataLoader, Subset
+from collections import defaultdict
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from feature_engine.selection import MRMR
+
+def compute_sam(s1, s2):
+    s1_norm = s1 / (np.linalg.norm(s1) + 1e-8)
+    s2_norm = s2 / (np.linalg.norm(s2) + 1e-8)
+    cosine = np.clip(np.dot(s1_norm, s2_norm), -1, 1)
+    return np.arccos(cosine)
+
+def get_class_spectra(dataset):
+    class_indices = defaultdict(list)
+    for i, (_, label) in enumerate(dataset):
+        class_indices[label].append(i)
+    class_spectra = {}
+    for label, indices in class_indices.items():
+        spectra_list = [dataset[idx][0].numpy() for idx in indices]
+        spectra_stack = np.vstack(spectra_list)
+        class_spectra[label] = spectra_stack
+    return class_spectra
+
+def group_classes(class_spectra, sam_thresh=0.1):
+    labels = list(class_spectra.keys())
+    class_mean = {lbl: spectra.mean(axis=0) for lbl, spectra in class_spectra.items()}
+    groups = [{lbl} for lbl in labels]
+    merged = True
+    while merged:
+        merged = False
+        new_groups = []
+        skip = set()
+        for i in range(len(groups)):
+            if i in skip:
+                continue
+            g1 = groups[i]
+            for j in range(i+1, len(groups)):
+                if j in skip:
+                    continue
+                g2 = groups[j]
+                sam_close = any(compute_sam(class_mean[l1], class_mean[l2]) < sam_thresh for l1 in g1 for l2 in g2)
+                if sam_close:
+                    g1 = g1.union(g2)
+                    skip.add(j)
+                    merged = True
+            new_groups.append(g1)
+        groups = new_groups
+    return groups
+
+def select_mrmr_bands_for_group_all_spectra(class_spectra, group, n_features=10):
+    all_specs = []
+    all_labels = []
+    for label in group:
+        specs = class_spectra[label]
+        all_specs.append(specs)
+        all_labels.append(np.full(specs.shape[0], label))
+    X = np.vstack(all_specs)
+    y = np.concatenate(all_labels)
+    wavelengths = np.arange(X.shape[1])
+    df = pd.DataFrame(X, columns=wavelengths)
+    mrmr = MRMR(method="MIQ", max_features=n_features, random_state=0)
+    df_sel = mrmr.fit_transform(df, y)
+    sel = mrmr.get_feature_names_out()
+    return list(map(int, sel))
+
+def plot_groups_and_selected(class_spectra, groups, selected_bands):
+    colors = plt.cm.get_cmap("tab20").colors
+    for g_idx, group in enumerate(groups):
+        plt.figure(figsize=(10,6))
+        for idx, label in enumerate(group):
+            spectra = class_spectra[label]
+            for s in spectra:
+                plt.plot(s, color=colors[idx % len(colors)], alpha=0.1)
+            mean_spec = spectra.mean(axis=0)
+            plt.plot(mean_spec, color=colors[idx % len(colors)], linewidth=2, label=f"{label} mean")
+        sel = selected_bands[g_idx]
+        for b in sel:
+            plt.axvline(b, linestyle="--", color="black")
+        plt.title(f"Groupe {g_idx} - bandes MRMR")
+        plt.xlabel("Indice de bande")
+        plt.ylabel("Reflectance")
+        plt.legend()
+        plt.show()
+
+dataset = SpectralPixelDataset("chemin/vers/tes/hdrs")
+class_spectra = get_class_spectra(dataset)
+groups = group_classes(class_spectra, sam_thresh=0.1)
+selected_bands = []
+for group in groups:
+    sel = select_mrmr_bands_for_group_all_spectra(class_spectra, group, n_features=15)
+    selected_bands.append(sel)
+plot_groups_and_selected(class_spectra, groups, selected_bands)
+
+
+
+
+
+
+import torch
+from torch.utils.data import Dataset, DataLoader, Subset
+from collections import defaultdict
+import numpy as np
+import matplotlib.pyplot as plt
+from skfeature.function.information_theoretical_based import MRMR
+
+def compute_sam(s1, s2):
+    s1_norm = s1 / (np.linalg.norm(s1) + 1e-8)
+    s2_norm = s2 / (np.linalg.norm(s2) + 1e-8)
+    cosine = np.clip(np.dot(s1_norm, s2_norm), -1, 1)
+    return np.arccos(cosine)
+
+def get_class_spectra(dataset):
+    class_indices = defaultdict(list)
+    for i, (_, label) in enumerate(dataset):
+        class_indices[label].append(i)
+    class_spectra = {}
+    for label, indices in class_indices.items():
+        spectra_list = [dataset[idx][0].numpy() for idx in indices]
+        spectra_stack = np.vstack(spectra_list)
+        class_spectra[label] = spectra_stack
+    return class_spectra
+
+def group_classes(class_spectra, sam_thresh=0.1):
+    labels = list(class_spectra.keys())
+    class_mean = {lbl: spectra.mean(axis=0) for lbl, spectra in class_spectra.items()}
+    groups = [{lbl} for lbl in labels]
+    merged = True
+    while merged:
+        merged = False
+        new_groups = []
+        skip = set()
+        for i in range(len(groups)):
+            if i in skip:
+                continue
+            g1 = groups[i]
+            for j in range(i+1, len(groups)):
+                if j in skip:
+                    continue
+                g2 = groups[j]
+                sam_close = any(
+                    compute_sam(class_mean[l1], class_mean[l2]) < sam_thresh
+                    for l1 in g1 for l2 in g2
+                )
+                if sam_close:
+                    g1 = g1.union(g2)
+                    skip.add(j)
+                    merged = True
+            new_groups.append(g1)
+        groups = new_groups
+    return groups
+
+def select_mrmr_bands_skfeature(class_spectra, group, n_selected):
+    all_specs = []
+    all_labels = []
+    for label in group:
+        specs = class_spectra[label]
+        all_specs.append(specs)
+        all_labels.append(np.full(specs.shape[0], label))
+    X = np.vstack(all_specs).astype(int)  
+    y = np.concatenate(all_labels).astype(int)
+
+    selected_idx = MRMR.mrmr(X, y, n_selected_features=n_selected)
+    return selected_idx
+
+def plot_groups_and_selected(class_spectra, groups, sel_bands):
+    colors = plt.cm.get_cmap("tab20").colors
+    for g_idx, group in enumerate(groups):
+        plt.figure(figsize=(10,6))
+        for idx, label in enumerate(group):
+            spectra = class_spectra[label]
+            for s in spectra:
+                plt.plot(s, color=colors[idx % len(colors)], alpha=0.1)
+            mean_s = spectra.mean(axis=0)
+            plt.plot(mean_s, color=colors[idx % len(colors)], linewidth=2, label=f"{label} mean")
+        for b in sel_bands[g_idx]:
+            plt.axvline(b, linestyle="--", color="black")
+        plt.title(f"Groupe {g_idx} - bandes MRMR")
+        plt.xlabel("Band index")
+        plt.ylabel("Reflectance")
+        plt.legend()
+        plt.show()
+
+dataset = SpectralPixelDataset("chemin/vers/tes/hdrs")
+class_spectra = get_class_spectra(dataset)
+groups = group_classes(class_spectra, sam_thresh=0.1)
+selected_bands_per_group = []
+for group in groups:
+    sel = select_mrmr_bands_skfeature(class_spectra, group, n_selected=10)
+    selected_bands_per_group.append(sel)
+plot_groups_and_selected(class_spectra, groups, selected_bands_per_group)
