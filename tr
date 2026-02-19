@@ -1,0 +1,205 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+import spectral.io.envi as envi
+from pathlib import Path
+import numpy as np
+from einops import rearrange, repeat
+from sklearn.metrics import confusion_matrix
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+class SpectralPatchDataset(Dataset):
+    def __init__(self, root_dir, patch_size=5, stride=5):
+        self.root_dir = Path(root_dir)
+        self.patch_size = patch_size
+        self.stride = stride
+        self.samples = []
+        self.class_map = {}
+        self.class_names = []
+        class_counter = 0
+        hdr_files = sorted(self.root_dir.rglob("*.hdr"))
+
+        for hdr_file in hdr_files:
+            name = hdr_file.stem
+            prefix = name.split("_")[0]
+            if prefix not in self.class_map:
+                self.class_map[prefix] = class_counter
+                self.class_names.append(prefix)
+                class_counter += 1
+            class_id = self.class_map[prefix]
+
+            img = envi.open(str(hdr_file))
+            cube = np.array(img.load(), dtype=np.float32)
+            B, H, W = cube.shape
+
+            cube_tensor = torch.from_numpy(cube).unsqueeze(0)
+            patches = cube_tensor.unfold(2, patch_size, stride).unfold(3, patch_size, stride)
+            patches = patches.contiguous().view(1, B, -1, patch_size, patch_size)
+            patches = patches.squeeze(0).permute(1,0,2,3)
+
+            for p in patches:
+                self.samples.append((p, class_id))
+
+        self.num_classes = len(self.class_names)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        x, y = self.samples[idx]
+        x = x.reshape(x.shape[0], -1).permute(1,0)
+        return x, y
+
+class Residual(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+    def forward(self, x):
+        return self.fn(x) + x
+
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+    def forward(self, x):
+        return self.fn(self.norm(x))
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout=0.):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class Attention(nn.Module):
+    def __init__(self, dim, heads, dim_head, dropout):
+        super().__init__()
+        inner_dim = dim_head * heads
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+    def forward(self, x):
+        b, n, _ = x.shape
+        h = self.heads
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=h), qkv)
+        dots = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
+        attn = dots.softmax(dim=-1)
+        out = torch.einsum('bhij,bhjd->bhid', attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+
+class Transformer(nn.Module):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            nn.ModuleList([
+                Residual(PreNorm(dim, Attention(dim, heads, dim_head, dropout))),
+                Residual(PreNorm(dim, FeedForward(dim, mlp_dim, dropout)))
+            ]) for _ in range(depth)
+        ])
+    def forward(self, x):
+        for attn, ff in self.layers:
+            x = attn(x)
+            x = ff(x)
+        return x
+
+class SpectralFormer(nn.Module):
+    def __init__(self, patch_dim, num_patches, num_classes):
+        super().__init__()
+        dim = 64
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1,1,dim))
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches+1, dim))
+        self.transformer = Transformer(dim, depth=4, heads=4, dim_head=16, mlp_dim=128, dropout=0.1)
+        self.mlp_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, num_classes))
+
+    def forward(self, x):
+        x = self.patch_to_embedding(x)
+        b, n, _ = x.shape
+        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=b)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding[:, :(n+1)]
+        x = self.transformer(x)
+        return self.mlp_head(x[:,0])
+
+def cal_results(matrix):
+    shape = np.shape(matrix)
+    number = 0
+    summ = 0
+    AA = np.zeros([shape[0]], dtype=float)
+    for i in range(shape[0]):
+        number += matrix[i, i]
+        AA[i] = matrix[i, i] / np.sum(matrix[i, :]) if np.sum(matrix[i, :]) != 0 else 0
+        summ += np.sum(matrix[i, :]) * np.sum(matrix[:, i])
+    OA = number / np.sum(matrix)
+    AA_mean = np.mean(AA)
+    pe = summ / (np.sum(matrix) ** 2)
+    Kappa = (OA - pe) / (1 - pe)
+    return OA, AA_mean, Kappa, AA
+
+dataset = SpectralPatchDataset("extrudes_eroded", patch_size=5, stride=5)
+
+if len(dataset) > 1:
+    train_size = int(0.8 * len(dataset))
+    test_size = len(dataset) - train_size
+else:
+    train_size = len(dataset)
+    test_size = 0
+
+train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+sample_x, _ = dataset[0]
+
+model = SpectralFormer(
+    patch_dim=sample_x.shape[1],
+    num_patches=sample_x.shape[0],
+    num_classes=dataset.num_classes
+).to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=5e-4)
+
+for epoch in range(50):
+    model.train()
+    for x,y in train_loader:
+        x,y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        out = model(x)
+        loss = criterion(out,y)
+        loss.backward()
+        optimizer.step()
+
+model.eval()
+all_preds = []
+all_labels = []
+
+with torch.no_grad():
+    for x,y in test_loader:
+        x = x.to(device)
+        out = model(x)
+        _,pred = torch.max(out,1)
+        all_preds.extend(pred.cpu().numpy())
+        all_labels.extend(y.numpy())
+
+matrix = confusion_matrix(all_labels, all_preds)
+OA, AA_mean, Kappa, AA = cal_results(matrix)
+
+print("Final result:")
+print("OA:", OA)
+print("AA:", AA_mean)
+print("Kappa:", Kappa)
+print("Per-class AA:", AA)
