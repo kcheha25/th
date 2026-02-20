@@ -518,9 +518,7 @@ def generate_augmented_cube(
             new_spec = best_fake_aligned.copy()
             new_spec[selected] = real_spec[selected]
 
-            new_spec = new_spec / (np.linalg.norm(new_spec) + 1e-8)
-            new_spec = best_fake * (np.linalg.norm(best_fake) / np.linalg.norm(new_spec))
-
+            new_spec = new_spec / (np.linalg.norm(new_spec) + 1e-8) * gan_energy
             augmented_cube[:, i, j] = new_spec
 
             if save_plots and plot_count < 10:
