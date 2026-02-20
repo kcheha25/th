@@ -504,49 +504,30 @@ def generate_augmented_cube(
                     best_sam = sam
                     best_fake = fake_denorm
 
-            # -------------------------
-            # 🔹 Sauvegarder intensité originale GAN
-            # -------------------------
             gan_energy = np.linalg.norm(best_fake) + 1e-8
+            best_fake_aligned = best_fake * (np.linalg.norm(real_spec) / gan_energy)
 
-            # -------------------------
-            # 🔹 Aligner le réel sur le GAN
-            # -------------------------
-            # simple scaling par énergie
-            real_aligned = real_spec * (gan_energy / (np.linalg.norm(real_spec) + 1e-8))
-
-            # -------------------------
-            # 🔹 Fusion sur bandes sélectionnées
-            # -------------------------
             if best_sam < sam_threshold1:
                 selected = selected_10
             elif best_sam < sam_threshold2:
                 selected = selected_20
             else:
-                augmented_cube[:, i, j] = best_fake  # si SAM trop mauvais, on garde GAN
+                augmented_cube[:, i, j] = best_fake
                 continue
 
-            # Copier GAN partout
-            new_spec = best_fake.copy()
+            new_spec = best_fake_aligned.copy()
+            new_spec[selected] = real_spec[selected]
 
-            # Injecter seulement sur les bandes sélectionnées
-            new_spec[selected] = real_aligned[selected]
-
-            # -------------------------
-            # 🔹 Revenir à l’intensité GAN originale
-            # -------------------------
             new_spec = new_spec / (np.linalg.norm(new_spec) + 1e-8)
-            new_spec = gan_energy * new_spec
+            new_spec = best_fake * (np.linalg.norm(best_fake) / np.linalg.norm(new_spec))
 
             augmented_cube[:, i, j] = new_spec
 
-            # -------------------------
-            # Plot debug
-            # -------------------------
             if save_plots and plot_count < 10:
                 plt.figure(figsize=(8,5))
                 plt.plot(real_spec, label="Real Spectrum", linewidth=2)
                 plt.plot(best_fake, label="Best GAN Spectrum", linestyle="--")
+                plt.plot(best_fake_aligned, label="GAN Aligned Spectrum", linestyle="-.")
                 plt.plot(new_spec, label="Final Augmented Spectrum", linewidth=2)
                 plt.title(f"{class_name} - SAM={best_sam:.4f}")
                 plt.xlabel("Band Index")
