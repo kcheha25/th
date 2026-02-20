@@ -728,16 +728,48 @@ def _add_spectral_neighborhood(self, spatial_patch):
     # Centre
     x_train_band[:, nn*patch_area:(nn+1)*patch_area] = x_train_reshape
     
-    # Gauche (utilisation de np.roll)
+    # Gauche
     for i in range(nn):
         if i < nn:
-            # Décale vers la gauche
             x_train_band[:, i*patch_area:(i+1)*patch_area] = np.roll(x_train_reshape, -(i+1), axis=1)
     
-    # Droite (utilisation de np.roll)
+    # Droite
     for i in range(nn):
         if nn + i + 1 < self.band_patch:
-            # Décale vers la droite
             x_train_band[:, (nn+i+1)*patch_area:(nn+i+2)*patch_area] = np.roll(x_train_reshape, i+1, axis=1)
     
-    return x_train_band.flatten()
+    return x_train_band  # Shape: (B, patch_area * band_patch)
+
+
+def _extract_patches_with_mask(self, cube_tensor, patch_size, stride, mask):
+    B, H, W = cube_tensor.shape
+    padding = patch_size // 2
+    patch_list = []
+    
+    for i in range(0, H - patch_size + 1, stride):
+        for j in range(0, W - patch_size + 1, stride):
+            center_i = i + patch_size//2 - padding
+            center_j = j + patch_size//2 - padding
+            
+            if 0 <= center_i < mask.shape[0] and 0 <= center_j < mask.shape[1]:
+                if self.mode == 'train' and mask[center_i, center_j]:
+                    patch = cube_tensor[:, i:i+patch_size, j:j+patch_size]
+                    patch_np = patch.numpy()
+                    # Cette fonction retourne maintenant [B, features] sans flatten
+                    band_patches = self._add_spectral_neighborhood(patch_np)
+                    patch_list.append(band_patches)
+                elif self.mode == 'test' and not mask[center_i, center_j]:
+                    patch = cube_tensor[:, i:i+patch_size, j:j+patch_size]
+                    patch_np = patch.numpy()
+                    band_patches = self._add_spectral_neighborhood(patch_np)
+                    patch_list.append(band_patches)
+    
+    return patch_list  # Liste de tableaux de forme [B, features]
+
+def __getitem__(self, idx):
+    x = self.data[idx]  # x est maintenant de forme [B, features]
+    y = self.labels[idx]
+    
+    # x doit avoir la forme [num_bands, features] pour le modèle
+    # Donc on le retourne tel quel, sans reshape supplémentaire
+    return torch.FloatTensor(x), torch.LongTensor([y])[0]
