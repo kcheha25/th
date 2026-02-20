@@ -127,16 +127,18 @@ class SpectralFormer(nn.Module):
 
 class SpectralFormerDataset(Dataset):
     def __init__(self, root_dir, patch_size=5, band_patch=3, stride=5, 
-                 class_mapping_file=None, file_list=None):
+                 class_mapping_file=None, file_list=None, mode='train'):
         self.root_dir = Path(root_dir)
         self.patch_size = patch_size
         self.band_patch = band_patch
         self.stride = stride
+        self.mode = mode  # 'train' ou 'test'
         self.samples = []
         self.labels = []
         self.original_class_names = []
         self.mapped_class_names = []
         self.file_patches = {}
+        self.single_file_classes = {}  # Stocke les infos pour les classes avec un seul fichier
         
         # Charger le mapping des classes
         self.class_mapping = {}
@@ -189,6 +191,19 @@ class SpectralFormerDataset(Dataset):
         print(f"Classes après mapping: {self.mapped_class_names}")
         print(f"Nombre de classes finales: {self.num_classes}")
         
+        # Compter le nombre de fichiers par classe mappée
+        class_file_count = {}
+        for hdr_file in hdr_files:
+            name = hdr_file.stem
+            prefix = name.split("_")[0]
+            if prefix in self.original_to_mapped:
+                mapped_class = self.original_to_mapped[prefix]
+                class_file_count[mapped_class] = class_file_count.get(mapped_class, 0) + 1
+        
+        # Identifier les classes avec un seul fichier
+        single_file_classes = {cls for cls, count in class_file_count.items() if count == 1}
+        print(f"Classes avec un seul fichier: {single_file_classes}")
+        
         # Charger et préparer les données
         all_data = []
         all_labels = []
@@ -208,7 +223,25 @@ class SpectralFormerDataset(Dataset):
             
             padded_cube = self._mirror_hsi(cube, patch_size)
             cube_tensor = torch.from_numpy(padded_cube).float()
-            patches = self._extract_patches_unfold(cube_tensor, patch_size, stride)
+            
+            # Vérifier si c'est une classe avec un seul fichier
+            if mapped_class_name in single_file_classes:
+                # Créer un masque checkerboard pour ce fichier
+                H, W = cube.shape[1], cube.shape[2]  # Dimensions originales
+                mask = self._create_checkerboard_mask(H, W)
+                
+                # Sauvegarder le masque pour référence
+                self.single_file_classes[hdr_file.name] = {
+                    'class': mapped_class_name,
+                    'class_id': class_id,
+                    'mask': mask
+                }
+                
+                # Extraire les patches avec le masque selon le mode
+                patches = self._extract_patches_with_mask(cube_tensor, patch_size, stride, mask)
+            else:
+                # Extraction normale sans masque
+                patches = self._extract_patches_unfold(cube_tensor, patch_size, stride)
             
             self.file_patches[hdr_file.name] = {
                 'patches': patches,
@@ -225,7 +258,55 @@ class SpectralFormerDataset(Dataset):
         
         print(f"Données chargées: {self.data.shape}")
         print(f"Labels: {self.labels.shape}")
+        print(f"Mode {self.mode}: {len(self.data)} patches")
+    
+    def _create_checkerboard_mask(self, height, width, cell_size=4):
+        """
+        Crée un masque en damier pour diviser l'image en train/test
+        Retourne: mask (bool) avec True pour train, False pour test
+        """
+        mask = np.zeros((height, width), dtype=bool)
+        for i in range(height):
+            for j in range(width):
+                # Alterne comme un damier
+                if ((i // cell_size) + (j // cell_size)) % 2 == 0:
+                    mask[i, j] = True  # Train
+                else:
+                    mask[i, j] = False  # Test
+        return mask
+    
+    def _extract_patches_with_mask(self, cube_tensor, patch_size, stride, mask):
+        """
+        Extrait les patches selon le masque et le mode (train/test)
+        """
+        B, H, W = cube_tensor.shape
+        padding = patch_size // 2
+        patch_list = []
         
+        for i in range(0, H - patch_size + 1, stride):
+            for j in range(0, W - patch_size + 1, stride):
+                # Position du centre du patch dans l'image originale
+                center_i = i + patch_size//2 - padding
+                center_j = j + patch_size//2 - padding
+                
+                # Vérifier si le centre est dans les limites
+                if 0 <= center_i < mask.shape[0] and 0 <= center_j < mask.shape[1]:
+                    # Selon le mode, on prend les patches des zones différentes
+                    if self.mode == 'train' and mask[center_i, center_j]:
+                        # Train: zones où mask = True
+                        patch = cube_tensor[:, i:i+patch_size, j:j+patch_size]
+                        patch_np = patch.numpy()
+                        band_patches = self._add_spectral_neighborhood(patch_np)
+                        patch_list.append(band_patches)
+                    elif self.mode == 'test' and not mask[center_i, center_j]:
+                        # Test: zones où mask = False
+                        patch = cube_tensor[:, i:i+patch_size, j:j+patch_size]
+                        patch_np = patch.numpy()
+                        band_patches = self._add_spectral_neighborhood(patch_np)
+                        patch_list.append(band_patches)
+        
+        return patch_list
+    
     def _mirror_hsi(self, cube, patch):
         B, H, W = cube.shape
         padding = patch // 2
@@ -567,3 +648,70 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+def split_files_by_class(hdr_files, class_mapping, train_ratio=0.7, random_seed=42):
+    """
+    Divise les fichiers en train/test en préservant la proportion par classe
+    après application du mapping
+    """
+    random.seed(random_seed)
+    
+    # Grouper les fichiers par classe originale
+    files_by_original_class = {}
+    for f in hdr_files:
+        prefix = f.stem.split("_")[0]
+        if prefix not in files_by_original_class:
+            files_by_original_class[prefix] = []
+        files_by_original_class[prefix].append(f)
+    
+    # Créer le mapping inverse pour savoir quelle classe originale va dans quelle classe mappée
+    original_to_mapped = {}
+    for new_class, old_classes in class_mapping.items():
+        for old_class in old_classes:
+            original_to_mapped[old_class] = new_class
+    
+    # Grouper les fichiers par classe mappée
+    files_by_mapped_class = {}
+    for old_class, files in files_by_original_class.items():
+        if old_class in original_to_mapped:
+            mapped_class = original_to_mapped[old_class]
+            if mapped_class not in files_by_mapped_class:
+                files_by_mapped_class[mapped_class] = []
+            files_by_mapped_class[mapped_class].extend(files)
+    
+    train_files = []
+    test_files = []
+    
+    # Pour chaque classe mappée, diviser ses fichiers
+    for mapped_class, files in files_by_mapped_class.items():
+        random.shuffle(files)
+        n_files = len(files)
+        
+        if n_files == 1:
+            # CAS SPÉCIAL: Un seul fichier
+            print(f"\nClasse {mapped_class}: 1 seul fichier - {files[0].name}")
+            print(f"   → Utilisation d'un masque spatial (checkerboard) pour diviser en train/test")
+            print(f"   → Le même fichier sera utilisé pour train ET test avec des masques inversés")
+            
+            # Le même fichier va dans train ET test
+            train_files.append(files[0])
+            test_files.append(files[0])
+            
+        else:
+            # Cas normal: plusieurs fichiers
+            n_train = max(1, int(train_ratio * n_files))
+            n_test = n_files - n_train
+            
+            # S'assurer d'avoir au moins 1 fichier en test si possible
+            if n_test == 0 and n_files > 1:
+                n_train = n_files - 1
+                n_test = 1
+                
+            train_files.extend(files[:n_train])
+            test_files.extend(files[n_train:])
+            
+            print(f"classe {mapped_class}: {n_files} fichiers → {n_train} train, {n_test} test")
+    
+    return train_files, test_files
