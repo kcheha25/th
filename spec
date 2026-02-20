@@ -773,3 +773,38 @@ def __getitem__(self, idx):
     # x doit avoir la forme [num_bands, features] pour le modèle
     # Donc on le retourne tel quel, sans reshape supplémentaire
     return torch.FloatTensor(x), torch.LongTensor([y])[0]
+
+
+class SpectralFormer(nn.Module):
+    def __init__(self, num_bands, num_patches, num_classes, dim=64, depth=5, heads=4, 
+                 mlp_dim=8, dim_head=16, dropout=0.1, emb_dropout=0.1, mode='CAF'):
+        super().__init__()
+        patch_dim = num_patches * num_bands
+        self.num_bands = num_bands
+        self.num_patches = num_patches
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_bands + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout, num_bands, mode)
+        self.pool = 'cls'
+        self.to_latent = nn.Identity()
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+        
+    def forward(self, x, mask=None):
+        batch_size = x.shape[0]
+        x = x.reshape(batch_size, self.num_bands, self.num_patches, -1).mean(dim=3)
+        x = x.reshape(batch_size, -1)
+        x = self.patch_to_embedding(x)
+        x = x.unsqueeze(1)
+        b = x.shape[0]
+        cls_tokens = repeat(self.cls_token, '() n d -> b n d', b=b)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding[:, :2]
+        x = self.dropout(x)
+        x = self.transformer(x, mask)
+        x = self.to_latent(x[:, 0])
+        return self.mlp_head(x)
