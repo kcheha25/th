@@ -517,19 +517,17 @@ def generate_augmented_cube(
             new_spec = best_fake.copy()
 
             for band in selected:
-                start = max(0, band - trend_window)
-                end = min(B, band + trend_window + 1)
+                if band == 0:
+                    continue  # pas de point précédent pour le premier indice
 
-                local_real = real_spec[start:end]
-                local_gan = new_spec[start:end]
+                delta_real = real_spec[band] - real_spec[band-1]
+                delta_gan = new_spec[band] - new_spec[band-1]
 
-                real_trend = local_real - np.mean(local_real)
-                gan_mean = np.mean(local_gan)
+                # injecter la pente réelle sur le GAN, en conservant proportion GAN
+                scale = abs(delta_gan) / (abs(delta_real) + 1e-8)
+                new_spec[band] = new_spec[band-1] + delta_real * scale
 
-                # injecte la tendance du réel en gardant les proportions du GAN
-                local_new = gan_mean + real_trend * (np.linalg.norm(local_gan) / (np.linalg.norm(real_trend) + 1e-8))
-                new_spec[start:end] = local_new
-
+            # remettre le spectre final sur la norme originale du GAN
             new_spec = new_spec / (np.linalg.norm(new_spec) + 1e-8) * gan_energy
             augmented_cube[:, i, j] = new_spec
 
