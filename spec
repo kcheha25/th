@@ -715,3 +715,29 @@ def split_files_by_class(hdr_files, class_mapping, train_ratio=0.7, random_seed=
             print(f"classe {mapped_class}: {n_files} fichiers → {n_train} train, {n_test} test")
     
     return train_files, test_files
+
+
+def _add_spectral_neighborhood(self, spatial_patch):
+    B, H, W = spatial_patch.shape
+    nn = self.band_patch // 2
+    patch_area = H * W
+    
+    x_train_reshape = spatial_patch.reshape(B, patch_area)
+    x_train_band = np.zeros((B, patch_area * self.band_patch), dtype=float)
+    
+    # Centre
+    x_train_band[:, nn*patch_area:(nn+1)*patch_area] = x_train_reshape
+    
+    # Gauche (utilisation de np.roll)
+    for i in range(nn):
+        if i < nn:
+            # Décale vers la gauche
+            x_train_band[:, i*patch_area:(i+1)*patch_area] = np.roll(x_train_reshape, -(i+1), axis=1)
+    
+    # Droite (utilisation de np.roll)
+    for i in range(nn):
+        if nn + i + 1 < self.band_patch:
+            # Décale vers la droite
+            x_train_band[:, (nn+i+1)*patch_area:(nn+i+2)*patch_area] = np.roll(x_train_reshape, i+1, axis=1)
+    
+    return x_train_band.flatten()
