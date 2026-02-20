@@ -505,7 +505,6 @@ def generate_augmented_cube(
                     best_fake = fake_denorm
 
             gan_energy = np.linalg.norm(best_fake) + 1e-8
-            best_fake_aligned = best_fake * (np.linalg.norm(real_spec) / gan_energy)
 
             if best_sam < sam_threshold1:
                 selected = selected_10
@@ -515,8 +514,21 @@ def generate_augmented_cube(
                 augmented_cube[:, i, j] = best_fake
                 continue
 
-            new_spec = best_fake_aligned.copy()
-            new_spec[selected] = real_spec[selected]
+            new_spec = best_fake.copy()
+
+            for band in selected:
+                start = max(0, band - trend_window)
+                end = min(B, band + trend_window + 1)
+
+                local_real = real_spec[start:end]
+                local_gan = new_spec[start:end]
+
+                real_trend = local_real - np.mean(local_real)
+                gan_mean = np.mean(local_gan)
+
+                # injecte la tendance du réel en gardant les proportions du GAN
+                local_new = gan_mean + real_trend * (np.linalg.norm(local_gan) / (np.linalg.norm(real_trend) + 1e-8))
+                new_spec[start:end] = local_new
 
             new_spec = new_spec / (np.linalg.norm(new_spec) + 1e-8) * gan_energy
             augmented_cube[:, i, j] = new_spec
@@ -525,7 +537,6 @@ def generate_augmented_cube(
                 plt.figure(figsize=(8,5))
                 plt.plot(real_spec, label="Real Spectrum", linewidth=2)
                 plt.plot(best_fake, label="Best GAN Spectrum", linestyle="--")
-                plt.plot(best_fake_aligned, label="GAN Aligned Spectrum", linestyle="-.")
                 plt.plot(new_spec, label="Final Augmented Spectrum", linewidth=2)
                 plt.title(f"{class_name} - SAM={best_sam:.4f}")
                 plt.xlabel("Band Index")
