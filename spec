@@ -717,63 +717,40 @@ def split_files_by_class(hdr_files, class_mapping, train_ratio=0.7, random_seed=
     return train_files, test_files
 
 
-def _add_spectral_neighborhood(self, spatial_patch):
-    B, H, W = spatial_patch.shape
-    nn = self.band_patch // 2
-    patch_area = H * W
-    
-    x_train_reshape = spatial_patch.reshape(B, patch_area)
-    x_train_band = np.zeros((B, patch_area * self.band_patch), dtype=float)
-    
-    # Centre
-    x_train_band[:, nn*patch_area:(nn+1)*patch_area] = x_train_reshape
-    
-    # Gauche
-    for i in range(nn):
-        if i < nn:
-            x_train_band[:, i*patch_area:(i+1)*patch_area] = np.roll(x_train_reshape, -(i+1), axis=1)
-    
-    # Droite
-    for i in range(nn):
-        if nn + i + 1 < self.band_patch:
-            x_train_band[:, (nn+i+1)*patch_area:(nn+i+2)*patch_area] = np.roll(x_train_reshape, i+1, axis=1)
-    
-    return x_train_band  # Shape: (B, patch_area * band_patch)
-
-
-def _extract_patches_with_mask(self, cube_tensor, patch_size, stride, mask):
-    B, H, W = cube_tensor.shape
-    padding = patch_size // 2
-    patch_list = []
-    
-    for i in range(0, H - patch_size + 1, stride):
-        for j in range(0, W - patch_size + 1, stride):
-            center_i = i + patch_size//2 - padding
-            center_j = j + patch_size//2 - padding
-            
-            if 0 <= center_i < mask.shape[0] and 0 <= center_j < mask.shape[1]:
-                if self.mode == 'train' and mask[center_i, center_j]:
-                    patch = cube_tensor[:, i:i+patch_size, j:j+patch_size]
-                    patch_np = patch.numpy()
-                    # Cette fonction retourne maintenant [B, features] sans flatten
-                    band_patches = self._add_spectral_neighborhood(patch_np)
-                    patch_list.append(band_patches)
-                elif self.mode == 'test' and not mask[center_i, center_j]:
-                    patch = cube_tensor[:, i:i+patch_size, j:j+patch_size]
-                    patch_np = patch.numpy()
-                    band_patches = self._add_spectral_neighborhood(patch_np)
-                    patch_list.append(band_patches)
-    
-    return patch_list  # Liste de tableaux de forme [B, features]
-
-def __getitem__(self, idx):
-    x = self.data[idx]  # x est maintenant de forme [B, features]
-    y = self.labels[idx]
-    
-    # x doit avoir la forme [num_bands, features] pour le modèle
-    # Donc on le retourne tel quel, sans reshape supplémentaire
-    return torch.FloatTensor(x), torch.LongTensor([y])[0]
-
+class Transformer(nn.Module):
+    def __init__(self, dim, depth, heads, dim_head, mlp_head, dropout, seq_len, mode):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                Residual(PreNorm(dim, Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout))),
+                Residual(PreNorm(dim, FeedForward(dim, mlp_head, dropout=dropout)))
+            ]))
+        self.mode = mode
+        self.seq_len = seq_len
+        self.skipcat = nn.ModuleList([])
+        for _ in range(depth-2):
+            self.skipcat.append(nn.Conv2d(dim, dim, (1, 2), stride=1, padding=0))
+    def forward(self, x, mask=None):
+        if self.mode == 'ViT':
+            for attn, ff in self.layers:
+                x = attn(x, mask=mask)
+                x = ff(x)
+        elif self.mode == 'CAF':
+            last_output = []
+            nl = 0
+            for attn, ff in self.layers:
+                last_output.append(x)
+                if nl > 1:
+                    x_reshaped = x.permute(0, 2, 1).unsqueeze(-1)
+                    last_reshaped = last_output[nl-2].permute(0, 2, 1).unsqueeze(-1)
+                    concat = torch.cat([x_reshaped, last_reshaped], dim=-1)
+                    x_conv = self.skipcat[nl-2](concat)
+                    x = x_conv.squeeze(-1).permute(0, 2, 1)
+                x = attn(x, mask=mask)
+                x = ff(x)
+                nl += 1
+        return x
 
 class SpectralFormer(nn.Module):
     def __init__(self, num_bands, num_patches, num_classes, dim=64, depth=5, heads=4, 
@@ -782,28 +759,27 @@ class SpectralFormer(nn.Module):
         patch_dim = num_patches * num_bands
         self.num_bands = num_bands
         self.num_patches = num_patches
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_bands + 1, dim))
+        self.dim = dim
+        self.seq_len = 2
         self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout, self.seq_len, mode)
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.seq_len, dim))
         self.dropout = nn.Dropout(emb_dropout)
-        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout, num_bands, mode)
-        self.pool = 'cls'
         self.to_latent = nn.Identity()
         self.mlp_head = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, num_classes)
         )
-        
     def forward(self, x, mask=None):
         batch_size = x.shape[0]
         x = x.reshape(batch_size, self.num_bands, self.num_patches, -1).mean(dim=3)
         x = x.reshape(batch_size, -1)
         x = self.patch_to_embedding(x)
         x = x.unsqueeze(1)
-        b = x.shape[0]
-        cls_tokens = repeat(self.cls_token, '() n d -> b n d', b=b)
+        cls_tokens = repeat(self.cls_token, '() n d -> b n d', b=batch_size)
         x = torch.cat((cls_tokens, x), dim=1)
-        x += self.pos_embedding[:, :2]
+        x = x + self.pos_embedding
         x = self.dropout(x)
         x = self.transformer(x, mask)
         x = self.to_latent(x[:, 0])
