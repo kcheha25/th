@@ -546,3 +546,121 @@ def generate_augmented_cube(
                 plot_count += 1
 
     return augmented_cube
+
+
+
+import matplotlib.pyplot as plt
+from pathlib import Path
+import torch
+import numpy as np
+
+def generate_augmented_cube(
+    cube,
+    class_name,
+    netG,
+    wl_max10,
+    wl_max20,
+    sam_threshold1=0.15,
+    sam_threshold2=0.3,
+    device="cuda",
+    save_plots=False,
+    plot_dir=None
+):
+    stochastic_classes = ["classA", "classB", "classC"]
+
+    B, H, W = cube.shape
+    augmented_cube = np.zeros_like(cube)
+
+    selected_10 = wl_max10.get(class_name, [])
+    selected_20 = wl_max20.get(class_name, [])
+
+    if save_plots:
+        plot_dir = Path(plot_dir)
+        plot_dir.mkdir(parents=True, exist_ok=True)
+
+    plot_count = 0
+
+    # Masque des spectres non nuls (variance > 1e-6)
+    non_zero_mask = np.var(cube, axis=0) > 1e-6
+    non_zero_spectra = cube[:, non_zero_mask]
+
+    # Calcul de l'écart-type global sur tous les spectres non nuls
+    if non_zero_spectra.size == 0:
+        global_std = 0.0
+    else:
+        global_std = np.std(non_zero_spectra) + 1e-8
+
+    for i in range(H):
+        for j in range(W):
+            real_spec = cube[:, i, j].copy()
+
+            real_tensor = torch.tensor(2*real_spec-1, dtype=torch.float32).to(device)
+            real_tensor = real_tensor.unsqueeze(0).unsqueeze(0)
+
+            best_sam = 999
+            best_fake = None
+
+            for _ in range(5):
+                noise = torch.randn_like(real_tensor)
+                fake = netG(noise).detach().cpu().squeeze().numpy()
+                fake_denorm = (fake + 1) / 2
+                sam = compute_sam(real_spec, fake_denorm)
+                if sam < best_sam:
+                    best_sam = sam
+                    best_fake = fake_denorm
+
+            gan_energy = np.linalg.norm(best_fake) + 1e-8
+
+            # Injection stochastique si SAM > threshold2 ou classe stochastique
+            if best_sam > sam_threshold2 or class_name in stochastic_classes:
+                noise = np.random.normal(0, global_std, size=B)
+                new_spec = real_spec + noise
+                augmented_cube[:, i, j] = new_spec
+
+                if save_plots and plot_count < 10:
+                    plt.figure(figsize=(8,5))
+                    plt.plot(real_spec, label="Real Spectrum", linewidth=2)
+                    plt.plot(new_spec, label="Augmented Spectrum (stochastic)", linewidth=2)
+                    plt.title(f"{class_name} - SAM={best_sam:.4f}")
+                    plt.xlabel("Band Index")
+                    plt.ylabel("Reflectance")
+                    plt.legend()
+                    plt.tight_layout()
+                    plt.savefig(plot_dir / f"{class_name}_{plot_count}.png")
+                    plt.close()
+                    plot_count += 1
+                continue
+
+            # Injection pente locale GAN pour bandes sélectionnées
+            if best_sam < sam_threshold1:
+                selected = selected_10
+            else:
+                selected = selected_20
+
+            new_spec = best_fake.copy()
+            for band in selected:
+                if band == 0:
+                    continue
+                delta_real = real_spec[band] - real_spec[band-1]
+                delta_gan = new_spec[band] - new_spec[band-1]
+                scale = abs(delta_gan) / (abs(delta_real) + 1e-8)
+                new_spec[band] = new_spec[band-1] + delta_real * scale
+
+            new_spec = new_spec / (np.linalg.norm(new_spec) + 1e-8) * gan_energy
+            augmented_cube[:, i, j] = new_spec
+
+            if save_plots and plot_count < 10:
+                plt.figure(figsize=(8,5))
+                plt.plot(real_spec, label="Real Spectrum", linewidth=2)
+                plt.plot(best_fake, label="Best GAN Spectrum", linestyle="--")
+                plt.plot(new_spec, label="Final Augmented Spectrum", linewidth=2)
+                plt.title(f"{class_name} - SAM={best_sam:.4f}")
+                plt.xlabel("Band Index")
+                plt.ylabel("Reflectance")
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(plot_dir / f"{class_name}_{plot_count}.png")
+                plt.close()
+                plot_count += 1
+
+    return augmented_cube
