@@ -788,3 +788,128 @@ def generate_augmented_cube(
                 plot_count += 1
 
     return augmented_cube
+
+
+import matplotlib.pyplot as plt
+from pathlib import Path
+import torch
+import numpy as np
+
+
+def inject_signature(real_spec, gan_spec, selected_indices, beta=0.7):
+
+    local_mean = np.convolve(real_spec, np.ones(3)/3, mode='same')
+    local_mean[local_mean == 0] = 1e-8
+
+    ratio = real_spec / local_mean
+
+    M = np.zeros_like(real_spec)
+    M[selected_indices] = 1
+
+    modulation = 1 + beta * M * (ratio - 1)
+
+    S_aug = gan_spec * modulation
+
+    S_aug = S_aug - np.mean(S_aug) + np.mean(gan_spec)
+
+    return S_aug
+
+
+def generate_augmented_cube(
+    cube,
+    class_name,
+    netG,
+    wl_max10,
+    wl_max20,
+    force_real_classes=None,
+    sam_threshold1=0.15,
+    sam_threshold2=0.3,
+    device="cuda",
+    save_plots=False,
+    plot_dir=None
+):
+
+    if force_real_classes is None:
+        force_real_classes = {}
+
+    B, H, W = cube.shape
+    augmented_cube = np.zeros_like(cube)
+
+    selected_10 = wl_max10[class_name]
+    selected_20 = wl_max20[class_name]
+
+    full_range_27 = list(range(27))
+
+    if save_plots:
+        plot_dir = Path(plot_dir)
+        plot_dir.mkdir(parents=True, exist_ok=True)
+
+    plot_count = 0
+
+    for i in range(H):
+        for j in range(W):
+
+            real_spec = cube[:, i, j]
+
+            if np.var(real_spec) < 1e-6:
+                augmented_cube[:, i, j] = real_spec
+                continue
+
+            if class_name in force_real_classes:
+                augmented_cube[:, i, j] = real_spec
+                continue
+
+            real_tensor = torch.tensor(2 * real_spec - 1, dtype=torch.float32).to(device)
+            real_tensor = real_tensor.unsqueeze(0).unsqueeze(0)
+
+            best_sam = 999
+            best_fake = None
+
+            for _ in range(5):
+                noise = torch.randn_like(real_tensor)
+                fake = netG(noise).detach().cpu().squeeze().numpy()
+                fake_denorm = (fake + 1) / 2
+                sam = compute_sam(real_spec, fake_denorm)
+
+                if sam < best_sam:
+                    best_sam = sam
+                    best_fake = fake_denorm
+
+            if best_sam < sam_threshold1:
+
+                if list(selected_10) == full_range_27:
+                    new_spec = best_fake.copy()
+                else:
+                    new_spec = inject_signature(real_spec, best_fake, selected_10)
+
+            elif best_sam < sam_threshold2:
+
+                if list(selected_20) == full_range_27:
+                    new_spec = best_fake.copy()
+                else:
+                    new_spec = inject_signature(real_spec, best_fake, selected_20)
+
+            else:
+                new_spec = real_spec
+
+            augmented_cube[:, i, j] = new_spec
+
+            if save_plots and plot_count < 10:
+
+                plt.figure(figsize=(8, 5))
+                plt.plot(real_spec, label="Real Spectrum", linewidth=2)
+                plt.plot(best_fake, label="Best GAN Spectrum", linestyle="--")
+                plt.plot(new_spec, label="Final Augmented Spectrum", linewidth=2)
+
+                plt.title(f"{class_name} - SAM={best_sam:.4f}")
+                plt.xlabel("Band Index")
+                plt.ylabel("Reflectance")
+                plt.legend()
+                plt.tight_layout()
+
+                plt.savefig(plot_dir / f"{class_name}_{plot_count}.png")
+                plt.close()
+
+                plot_count += 1
+
+    return augmented_cube
