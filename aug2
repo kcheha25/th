@@ -1223,10 +1223,16 @@ generate_multiple_augmented(
     device="cuda"      # ou "cpu"
 )
 
-        plt.figure(figsize=(8,4))
-        plt.plot(noise_vector, label="Bruit injecté", color="red", linestyle=":")
-        plt.xlabel("Indice bande")
-        plt.ylabel("Amplitude bruit")
-        plt.title("Bruit généré pour le spectre")
-        plt.legend()
-        plt.show()
+
+import numpy as np
+
+def augment_with_class_noise(real_spec, spectra_class, alpha=1.0):
+    sigma_per_pixel = np.std(spectra_class, axis=0)
+    mean_class = np.mean(spectra_class, axis=0)
+    mean_class_safe = np.where(mean_class > 0, mean_class, 1.0)
+    relative_noise_profile = sigma_per_pixel / mean_class_safe
+    raw_noise = np.random.randn(len(real_spec))
+    scaled_noise = raw_noise * relative_noise_profile * real_spec * alpha
+    scaled_noise = scaled_noise - np.mean(scaled_noise)
+    S_aug = np.clip(real_spec + scaled_noise, 0, 1)
+    return S_aug
