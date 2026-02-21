@@ -1178,7 +1178,7 @@ def generate_multiple_augmented(
 
         print(f"{n_extrudes} extrusions générées pour le cube {cube_path}")
         cube_counter += 1
-        
+
 from pathlib import Path
 
 # Dossier contenant tous les cubes HDR
@@ -1222,3 +1222,11 @@ generate_multiple_augmented(
     alpha_noise=1.0,  # facteur de bruit
     device="cuda"      # ou "cpu"
 )
+
+        plt.figure(figsize=(8,4))
+        plt.plot(noise_vector, label="Bruit injecté", color="red", linestyle=":")
+        plt.xlabel("Indice bande")
+        plt.ylabel("Amplitude bruit")
+        plt.title("Bruit généré pour le spectre")
+        plt.legend()
+        plt.show()
