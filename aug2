@@ -878,6 +878,7 @@ def generate_augmented_cube(
                     new_spec = best_fake.copy()
                 else:
                     new_spec = inject_local_variation(real_spec, best_fake, selected_10, beta=beta, window_size=window_size)
+                    wl_to_plot = selected_10
 
             elif best_sam < sam_threshold2:
 
@@ -885,9 +886,11 @@ def generate_augmented_cube(
                     new_spec = best_fake.copy()
                 else:
                     new_spec = inject_local_variation(real_spec, best_fake, selected_20, beta=beta, window_size=window_size)
+                    wl_to_plot = selected_20
 
             else:
                 new_spec = real_spec
+                wl_to_plot = []
 
             augmented_cube[:, i, j] = new_spec
 
@@ -897,6 +900,10 @@ def generate_augmented_cube(
                 plt.plot(real_spec, label="Real Spectrum", linewidth=2)
                 plt.plot(best_fake, label="Best GAN Spectrum", linestyle="--")
                 plt.plot(new_spec, label="Final Augmented Spectrum", linewidth=2)
+
+                # Tracer les longueurs d'onde sélectionnées
+                for wl in wl_to_plot:
+                    plt.axvline(x=int(wl), color='red', linestyle=':', linewidth=1)
 
                 plt.title(f"{class_name} - SAM={best_sam:.4f}")
                 plt.xlabel("Band Index")
