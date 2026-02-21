@@ -796,21 +796,16 @@ import torch
 import numpy as np
 
 
-def inject_signature(real_spec, gan_spec, selected_indices, beta=0.7):
-
-    local_mean = np.convolve(real_spec, np.ones(3)/3, mode='same')
-    local_mean[local_mean == 0] = 1e-8
-
-    ratio = real_spec / local_mean
-
-    M = np.zeros_like(real_spec)
-    M[selected_indices] = 1
-
-    modulation = 1 + beta * M * (ratio - 1)
-
-    S_aug = gan_spec * modulation
-
-    S_aug = S_aug - np.mean(S_aug) + np.mean(gan_spec)
+def inject_local_variation(real_spec, gan_spec, selected_indices, beta=1.0, window_size=1):
+    S_aug = gan_spec.copy()
+    B = len(real_spec)
+    
+    for i in selected_indices:
+        start = max(0, i - window_size)
+        end   = min(B, i + window_size + 1)
+        local_mean = np.mean(real_spec[start:end])
+        variation = real_spec[i] - local_mean
+        S_aug[i] += beta * variation
 
     return S_aug
 
@@ -826,7 +821,9 @@ def generate_augmented_cube(
     sam_threshold2=0.3,
     device="cuda",
     save_plots=False,
-    plot_dir=None
+    plot_dir=None,
+    beta=1.0,
+    window_size=1
 ):
 
     if force_real_classes is None:
@@ -880,14 +877,14 @@ def generate_augmented_cube(
                 if list(selected_10) == full_range_27:
                     new_spec = best_fake.copy()
                 else:
-                    new_spec = inject_signature(real_spec, best_fake, selected_10)
+                    new_spec = inject_local_variation(real_spec, best_fake, selected_10, beta=beta, window_size=window_size)
 
             elif best_sam < sam_threshold2:
 
                 if list(selected_20) == full_range_27:
                     new_spec = best_fake.copy()
                 else:
-                    new_spec = inject_signature(real_spec, best_fake, selected_20)
+                    new_spec = inject_local_variation(real_spec, best_fake, selected_20, beta=beta, window_size=window_size)
 
             else:
                 new_spec = real_spec
