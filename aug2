@@ -795,18 +795,26 @@ from pathlib import Path
 import torch
 import numpy as np
 
-
-def inject_local_variation(real_spec, gan_spec, selected_indices, beta=1.0, window_size=1):
+def inject_local_variation(real_spec, gan_spec, selected_indices, window_size=1):
     S_aug = gan_spec.copy()
     B = len(real_spec)
     
-    for i in selected_indices:
+    for idx in selected_indices:
+        i = int(idx)
         start = max(0, i - window_size)
         end   = min(B, i + window_size + 1)
-        local_mean = np.mean(real_spec[start:end])
-        variation = real_spec[i] - local_mean
-        S_aug[i] += beta * variation
-
+        
+        real_win = real_spec[start:end]
+        gan_win  = gan_spec[start:end]
+        
+        delta_real = np.diff(real_win)
+        
+        aug_win = [gan_win[0]]  # première valeur = GAN
+        for d in delta_real:
+            aug_win.append(aug_win[-1] + d)
+        
+        S_aug[start:end] = aug_win
+        
     return S_aug
 
 
