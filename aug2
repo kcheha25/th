@@ -1248,3 +1248,14 @@ def augment_with_class_noise_relative(real_spec, spectra_class, alpha=1.0):
     raw_noise = raw_noise - np.mean(raw_noise)
     S_aug = np.clip(real_spec + raw_noise, 0, 1)
     return S_aug
+
+def augment_with_class_noise_relative(real_spec, spectra_class, alpha=1.0, max_relative_noise=0.05):
+    wl_index = np.random.randint(0, spectra_class.shape[1])
+    sigma_wl = np.std(spectra_class[:, wl_index])
+    mean_wl = np.mean(spectra_class[:, wl_index])
+    relative_noise = sigma_wl / mean_wl if mean_wl > 0 else 0
+    relative_noise = min(relative_noise, max_relative_noise)
+    raw_noise = np.random.randn(len(real_spec)) * relative_noise * real_spec * alpha
+    raw_noise = raw_noise - np.mean(raw_noise)
+    S_aug = np.clip(real_spec + raw_noise, 0, 1)
+    return S_aug
