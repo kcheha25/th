@@ -1,56 +1,6 @@
 import sys
-import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append('../')
 from pycore.tikzeng import *
-from pycore.blocks import *
-import sys
-
-arch = [
-    to_head('..'),
-    to_cor(),
-    to_begin(),
-
-    # Latent vector
-    to_FC("latent", 100, caption="Latent z"),
-
-    # Deconv1
-    to_Conv("deconv1", 4, 32, 512,
-            caption="ConvT1d 512\nReLU"),
-    to_FC("bn1", 20, caption="BatchNorm1d"),
-
-    # Deconv2
-    to_Conv("deconv2", 8, 32, 256,
-            caption="ConvT1d 256\nReLU"),
-    to_FC("bn2", 20, caption="BatchNorm1d"),
-
-    # Deconv3
-    to_Conv("deconv3", 16, 32, 128,
-            caption="ConvT1d 128\nReLU"),
-    to_FC("bn3", 20, caption="BatchNorm1d"),
-
-    # Deconv4
-    to_Conv("deconv4", 32, 32, 64,
-            caption="ConvT1d 64\nReLU"),
-    to_FC("bn4", 20, caption="BatchNorm1d"),
-
-    # Output
-    to_FC("output", 1,
-          caption="ConvT1d 1\nTanh"),
-
-    to_end()
-]
-
-def main():
-    namefile = str(sys.argv[0]).split('.')[0]
-    to_generate(arch, namefile)
-
-if __name__ == '__main__':
-    main()
-
-
-from pycore.tikzeng import *
-from pycore.blocks import *
-import sys
 
 arch = [
     to_head('..'),
@@ -60,35 +10,83 @@ arch = [
     # Input
     to_input("input.jpg"),
 
-    # Conv1
-    to_Conv("conv1", 64, 32, 64,
-            caption="Conv1d 64\nLeakyReLU"),
-    
-    # Conv2
-    to_Conv("conv2", 32, 32, 128,
-            caption="Conv1d 128\nLeakyReLU"),
-    to_FC("bn2", 20, caption="BatchNorm1d"),
+    # Conv1 + LeakyReLU
+    to_Conv("conv1", s_filer=1, n_filer=64, offset="(0,0,0)", to="(0,0,0)", height=40, depth=40, width=2, caption="Conv1d 64\nLeakyReLU"),
 
-    # Conv3
-    to_Conv("conv3", 16, 32, 256,
-            caption="Conv1d 256\nLeakyReLU"),
-    to_FC("bn3", 20, caption="BatchNorm1d"),
+    # Conv2 + BatchNorm + LeakyReLU
+    to_Conv("conv2", s_filer=64, n_filer=128, offset="(2,0,0)", to="(conv1-east)", height=32, depth=32, width=2, caption="Conv1d 128\nBatchNorm\nLeakyReLU"),
+    to_connection("conv1", "conv2"),
 
-    # Conv4
-    to_Conv("conv4", 8, 32, 512,
-            caption="Conv1d 512\nLeakyReLU"),
-    to_FC("bn4", 20, caption="BatchNorm1d"),
+    # Conv3 + BatchNorm + LeakyReLU
+    to_Conv("conv3", s_filer=128, n_filer=256, offset="(2,0,0)", to="(conv2-east)", height=16, depth=16, width=2, caption="Conv1d 256\nBatchNorm\nLeakyReLU"),
+    to_connection("conv2", "conv3"),
+
+    # Conv4 + BatchNorm + LeakyReLU
+    to_Conv("conv4", s_filer=256, n_filer=512, offset="(2,0,0)", to="(conv3-east)", height=8, depth=8, width=2, caption="Conv1d 512\nBatchNorm\nLeakyReLU"),
+    to_connection("conv3", "conv4"),
 
     # Final Conv
-    to_FC("conv_final", 1,
-          caption="Conv1d 1\nKernel=17"),
+    to_Conv("conv5", s_filer=512, n_filer=1, offset="(2,0,0)", to="(conv4-east)", height=4, depth=4, width=2, caption="Conv1d 1\nKernel=17"),
+    to_connection("conv4", "conv5"),
 
     to_end()
 ]
 
 def main():
-    namefile = str(sys.argv[0]).split('.')[0]
-    to_generate(arch, namefile)
+    to_generate(arch, "discriminator.tex")
 
 if __name__ == '__main__':
     main()
+
+
+import sys
+sys.path.append('../')
+from pycore.tikzeng import *
+
+arch = [
+    to_head('..'),
+    to_cor(),
+    to_begin(),
+
+    # Latent vector
+    to_input("latent.jpg"),
+
+    # Deconv1 + BatchNorm + ReLU
+    to_Conv("deconv1", s_filer=100, n_filer=512, offset="(0,0,0)", to="(0,0,0)", height=8, depth=8, width=2, caption="ConvT1d 512\nBatchNorm\nReLU"),
+
+    # Deconv2 + BatchNorm + ReLU
+    to_Conv("deconv2", s_filer=512, n_filer=256, offset="(2,0,0)", to="(deconv1-east)", height=16, depth=16, width=2, caption="ConvT1d 256\nBatchNorm\nReLU"),
+    to_connection("deconv1", "deconv2"),
+
+    # Deconv3 + BatchNorm + ReLU
+    to_Conv("deconv3", s_filer=256, n_filer=128, offset="(2,0,0)", to="(deconv2-east)", height=32, depth=32, width=2, caption="ConvT1d 128\nBatchNorm\nReLU"),
+    to_connection("deconv2", "deconv3"),
+
+    # Deconv4 + BatchNorm + ReLU
+    to_Conv("deconv4", s_filer=128, n_filer=64, offset="(2,0,0)", to="(deconv3-east)", height=64, depth=64, width=2, caption="ConvT1d 64\nBatchNorm\nReLU"),
+    to_connection("deconv3", "deconv4"),
+
+    # Output layer
+    to_Conv("output", s_filer=64, n_filer=1, offset="(2,0,0)", to="(deconv4-east)", height=128, depth=128, width=2, caption="ConvT1d 1\nTanh"),
+    to_connection("deconv4", "output"),
+
+    to_end()
+]
+
+def main():
+    to_generate(arch, "generator.tex")
+
+if __name__ == '__main__':
+    main()
+
+def to_cor():
+    return r"""
+\def\ConvColor{rgb:blue,5;cyan,2.5;white,5}       % couleur principale des conv
+\def\ConvReluColor{rgb:blue,5;cyan,5;white,5}     % couleur des bandes ReLU
+\def\PoolColor{rgb:blue,3;black,0.3}             % couleur des pools
+\def\UnpoolColor{rgb:blue,4;green,1;black,0.3}   % couleur des unpool
+\def\FcColor{rgb:blue,5;cyan,2.5;white,5}       % si tu avais FC
+\def\FcReluColor{rgb:blue,5;cyan,5;white,4}     
+\def\SoftmaxColor{rgb:blue,5;black,7}           % softmax en bleu
+\def\SumColor{rgb:blue,5;green,15}              % somme / addition en bleu
+"""
