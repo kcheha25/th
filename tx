@@ -26,3 +26,15 @@ Faire une expérimentation : entraîner un modèle sur les données augmentées 
 Générer un spectre pour chaque extrude et superposer les spectres moyens des différents extrudes.
 
 Ajouter un peu de contexte au début de la présentation pour toujours replacer le contexte global avant d’aborder les détails techniques.
+
+
+            for s in spectra:
+                if np.var(s) > self.null_threshold:
+                    # Calcul de la dérivée seconde
+                    s_sec_deriv = np.gradient(np.gradient(s))
+
+                    # Normalisation similaire au spectre original
+                    s_sec_deriv_norm = 2 * s_sec_deriv - 1
+
+                    # Ajout au dataset
+                    self.samples.append((torch.tensor(s_sec_deriv_norm, dtype=torch.float32), class_id))
