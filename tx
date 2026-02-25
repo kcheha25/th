@@ -1,0 +1,28 @@
+Pour l’augmentation des données, il faudra veiller à regarder les déséquilibres qu’on peut avoir entre les classes, et générer plus d’exemplaires pour les classes minoritaires que pour les classes majoritaires.
+
+Pour l’augmentation des données, il faudra veiller à regarder les déséquilibres qu’on peut avoir entre les classes, et générer plus d’exemplaires pour les classes minoritaires que pour les classes majoritaires.
+
+Si au milieu des extrudes il n’y a pas un grand écart par rapport aux pixels aux extrémités des extrudes, il n’y a pas de risque avec l’augmentation par les GAN, mais sinon il faudra prendre ça en compte.
+
+Les classes où le modèle n’arrive pas à converger, c’est peut-être dû au fait que l’écart au sein du même label est important, et c’est pour ça que le modèle n’arrive pas à converger.
+
+Il faudra tester l’augmentation spectrale seule et observer son effet sur la classification avant d’appliquer, en plus de ça, l’augmentation spatiale.
+
+Pour les classes sur lesquelles le modèle n’arrive pas à converger, on peut essayer d’augmenter plutôt le spectre de la dérivée seconde.
+
+
+Il faut finaliser l’augmentation des données et commencer à entraîner les modèles de classification sur les données augmentées.
+
+Vérifier si la signature spectrale au centre des extrudes et celle aux extrémités des extrudes sont plutôt proches ou s’il y a un écart entre les deux.
+
+Tracer la moyenne avec l’écart-type pour avoir une idée si le signal pour un extrude a la même signature spectrale ou pas.
+
+Prendre un extrude et dessiner le spectre correspondant au centre de l’extrude et à quelques pixels vers les contours pour voir si l’écart est important ou pas.
+
+Faire une visualisation des données et l’intégrer aux diapos, et toujours mettre l’axe des x en longueur d’onde au lieu de l’indice des bandes lors de l’affichage.
+
+Faire une expérimentation : entraîner un modèle sur les données augmentées uniquement et tester sur les données réelles.
+
+Générer un spectre pour chaque extrude et superposer les spectres moyens des différents extrudes.
+
+Ajouter un peu de contexte au début de la présentation pour toujours replacer le contexte global avant d’aborder les détails techniques.
