@@ -1,40 +1,222 @@
-Pour l’augmentation des données, il faudra veiller à regarder les déséquilibres qu’on peut avoir entre les classes, et générer plus d’exemplaires pour les classes minoritaires que pour les classes majoritaires.
+import numpy as np
+import matplotlib.pyplot as plt
+from spectral import envi
+from pathlib import Path
 
-Pour l’augmentation des données, il faudra veiller à regarder les déséquilibres qu’on peut avoir entre les classes, et générer plus d’exemplaires pour les classes minoritaires que pour les classes majoritaires.
+def plot_mean_std_for_cube(cube_path, null_threshold=1e-6):
+    cube_path = Path(cube_path)
+    class_name = cube_path.stem.split("_")[0]
+    hdr_img = envi.open(str(cube_path))
+    cube = np.array(hdr_img.load(), dtype=np.float32)
+    B, H, W = cube.shape
+    spectra = cube.reshape(B, -1).T
+    valid_spectra = np.array([s for s in spectra if np.var(s) > null_threshold])
+    if len(valid_spectra) == 0:
+        return
+    mean_spec = np.mean(valid_spectra, axis=0)
+    std_spec = np.std(valid_spectra, axis=0)
+    plt.figure(figsize=(10,5))
+    plt.plot(mean_spec, linewidth=2)
+    plt.plot(mean_spec + std_spec, linestyle="--")
+    plt.plot(mean_spec - std_spec, linestyle="--")
+    plt.title(f"{class_name} - {cube_path.stem}")
+    plt.xlabel("Indice bande")
+    plt.ylabel("Reflectance")
+    plt.tight_layout()
+    plt.show()
 
-Si au milieu des extrudes il n’y a pas un grand écart par rapport aux pixels aux extrémités des extrudes, il n’y a pas de risque avec l’augmentation par les GAN, mais sinon il faudra prendre ça en compte.
+def plot_all_extrudes(dataset_root):
+    dataset_root = Path(dataset_root)
+    hdr_files = sorted(dataset_root.rglob("*.hdr"))
+    for cube_path in hdr_files:
+        plot_mean_std_for_cube(cube_path)
 
-Les classes où le modèle n’arrive pas à converger, c’est peut-être dû au fait que l’écart au sein du même label est important, et c’est pour ça que le modèle n’arrive pas à converger.
+import numpy as np
+import matplotlib.pyplot as plt
+from spectral import envi
+from pathlib import Path
+from collections import defaultdict
 
-Il faudra tester l’augmentation spectrale seule et observer son effet sur la classification avant d’appliquer, en plus de ça, l’augmentation spatiale.
+def compute_mean_std_cube(cube_path, null_threshold=1e-6):
+    cube_path = Path(cube_path)
+    class_name = cube_path.stem.split("_")[0]
+    hdr_img = envi.open(str(cube_path))
+    cube = np.array(hdr_img.load(), dtype=np.float32)
+    B, H, W = cube.shape
+    spectra = cube.reshape(B, -1).T
+    valid_spectra = np.array([s for s in spectra if np.var(s) > null_threshold])
+    if len(valid_spectra) == 0:
+        return class_name, None, None
+    mean_spec = np.mean(valid_spectra, axis=0)
+    std_spec = np.std(valid_spectra, axis=0)
+    return class_name, mean_spec, std_spec
 
-Pour les classes sur lesquelles le modèle n’arrive pas à converger, on peut essayer d’augmenter plutôt le spectre de la dérivée seconde.
+def plot_all_extrudes_and_overlay_by_class(dataset_root, null_threshold=1e-6):
+    dataset_root = Path(dataset_root)
+    hdr_files = sorted(dataset_root.rglob("*.hdr"))
+    class_means = defaultdict(list)
+
+    for cube_path in hdr_files:
+        class_name, mean_spec, std_spec = compute_mean_std_cube(cube_path, null_threshold)
+        if mean_spec is None:
+            continue
+
+        plt.figure(figsize=(8,4))
+        plt.plot(mean_spec, linewidth=2)
+        plt.plot(mean_spec + std_spec, linestyle="--")
+        plt.plot(mean_spec - std_spec, linestyle="--")
+        plt.title(f"{class_name} - {cube_path.stem}")
+        plt.xlabel("Indice bande")
+        plt.ylabel("Reflectance")
+        plt.tight_layout()
+        plt.show()
+
+        class_means[class_name].append(mean_spec)
+
+    for class_name, means in class_means.items():
+        plt.figure(figsize=(10,5))
+        for mean_spec in means:
+            plt.plot(mean_spec)
+        plt.title(f"Superposition des spectres moyens - {class_name}")
+        plt.xlabel("Indice bande")
+        plt.ylabel("Reflectance")
+        plt.tight_layout()
+        plt.show()
 
 
-Il faut finaliser l’augmentation des données et commencer à entraîner les modèles de classification sur les données augmentées.
+import numpy as np
+import matplotlib.pyplot as plt
+from spectral import envi
+from pathlib import Path
 
-Vérifier si la signature spectrale au centre des extrudes et celle aux extrémités des extrudes sont plutôt proches ou s’il y a un écart entre les deux.
+def plot_radial_spectra_for_cube(cube_path, null_threshold=1e-6):
+    cube_path = Path(cube_path)
+    class_name = cube_path.stem.split("_")[0]
 
-Tracer la moyenne avec l’écart-type pour avoir une idée si le signal pour un extrude a la même signature spectrale ou pas.
+    hdr_img = envi.open(str(cube_path))
+    cube = np.array(hdr_img.load(), dtype=np.float32)
+    B, H, W = cube.shape
 
-Prendre un extrude et dessiner le spectre correspondant au centre de l’extrude et à quelques pixels vers les contours pour voir si l’écart est important ou pas.
+    mask = np.var(cube, axis=0) > null_threshold
+    coords = np.column_stack(np.where(mask))
 
-Faire une visualisation des données et l’intégrer aux diapos, et toujours mettre l’axe des x en longueur d’onde au lieu de l’indice des bandes lors de l’affichage.
+    if len(coords) == 0:
+        return
 
-Faire une expérimentation : entraîner un modèle sur les données augmentées uniquement et tester sur les données réelles.
+    cy = np.mean(coords[:, 0])
+    cx = np.mean(coords[:, 1])
 
-Générer un spectre pour chaque extrude et superposer les spectres moyens des différents extrudes.
+    distances = np.sqrt((coords[:, 0] - cy) ** 2 + (coords[:, 1] - cx) ** 2)
+    max_d = np.max(distances)
 
-Ajouter un peu de contexte au début de la présentation pour toujours replacer le contexte global avant d’aborder les détails techniques.
+    center_idx = np.argmin(distances)
+    contour_idx = np.argmax(distances)
+
+    mid_target = 0.5 * max_d
+    mid_idx = np.argmin(np.abs(distances - mid_target))
+
+    near_contour_target = 0.85 * max_d
+    near_contour_idx = np.argmin(np.abs(distances - near_contour_target))
+
+    y_center, x_center = coords[center_idx]
+    y_mid, x_mid = coords[mid_idx]
+    y_near, x_near = coords[near_contour_idx]
+    y_contour, x_contour = coords[contour_idx]
+
+    spec_center = cube[:, y_center, x_center]
+    spec_mid = cube[:, y_mid, x_mid]
+    spec_near = cube[:, y_near, x_near]
+    spec_contour = cube[:, y_contour, x_contour]
+
+    plt.figure(figsize=(10,5))
+    plt.plot(spec_center, label="Centre")
+    plt.plot(spec_mid, label="Milieu")
+    plt.plot(spec_near, label="Proche contour")
+    plt.plot(spec_contour, label="Contour")
+    plt.title(f"{class_name} - {cube_path.stem}")
+    plt.xlabel("Indice bande")
+    plt.ylabel("Reflectance")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
 
-            for s in spectra:
-                if np.var(s) > self.null_threshold:
-                    # Calcul de la dérivée seconde
-                    s_sec_deriv = np.gradient(np.gradient(s))
+def plot_radial_spectra_all_extrudes(dataset_root, null_threshold=1e-6):
+    dataset_root = Path(dataset_root)
+    hdr_files = sorted(dataset_root.rglob("*.hdr"))
 
-                    # Normalisation similaire au spectre original
-                    s_sec_deriv_norm = 2 * s_sec_deriv - 1
+    for cube_path in hdr_files:
+        plot_radial_spectra_for_cube(cube_path, null_threshold)
 
-                    # Ajout au dataset
-                    self.samples.append((torch.tensor(s_sec_deriv_norm, dtype=torch.float32), class_id))
+
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from spectral import envi
+from pathlib import Path
+
+def plot_radial_spectra_for_cube(cube_path, null_threshold=1e-6):
+    cube_path = Path(cube_path)
+    class_name = cube_path.stem.split("_")[0]
+
+    hdr_img = envi.open(str(cube_path))
+    cube = np.array(hdr_img.load(), dtype=np.float32)
+    B, H, W = cube.shape
+
+    wavelengths = None
+    if 'wavelength' in hdr_img.metadata:
+        wavelengths = np.array(hdr_img.metadata['wavelength'], dtype=float)
+    else:
+        wavelengths = np.arange(B)
+
+    mask = np.var(cube, axis=0) > null_threshold
+    coords = np.column_stack(np.where(mask))
+
+    if len(coords) == 0:
+        return
+
+    cy = np.mean(coords[:, 0])
+    cx = np.mean(coords[:, 1])
+
+    distances = np.sqrt((coords[:, 0] - cy) ** 2 + (coords[:, 1] - cx) ** 2)
+    max_d = np.max(distances)
+
+    center_idx = np.argmin(distances)
+    contour_idx = np.argmax(distances)
+
+    mid_target = 0.5 * max_d
+    mid_idx = np.argmin(np.abs(distances - mid_target))
+
+    near_target = 0.85 * max_d
+    near_idx = np.argmin(np.abs(distances - near_target))
+
+    y_center, x_center = coords[center_idx]
+    y_mid, x_mid = coords[mid_idx]
+    y_near, x_near = coords[near_idx]
+    y_contour, x_contour = coords[contour_idx]
+
+    spec_center = cube[:, y_center, x_center]
+    spec_mid = cube[:, y_mid, x_mid]
+    spec_near = cube[:, y_near, x_near]
+    spec_contour = cube[:, y_contour, x_contour]
+
+    plt.figure(figsize=(10,5))
+    plt.plot(wavelengths, spec_center, label="Centre")
+    plt.plot(wavelengths, spec_mid, label="Milieu")
+    plt.plot(wavelengths, spec_near, label="Proche contour")
+    plt.plot(wavelengths, spec_contour, label="Contour")
+    plt.title(f"{class_name} - {cube_path.stem}")
+    plt.xlabel("Longueur d'onde")
+    plt.ylabel("Reflectance")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_radial_spectra_all_extrudes(dataset_root, null_threshold=1e-6):
+    dataset_root = Path(dataset_root)
+    hdr_files = sorted(dataset_root.rglob("*.hdr"))
+    for cube_path in hdr_files:
+        plot_radial_spectra_for_cube(cube_path, null_threshold)
