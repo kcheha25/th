@@ -205,6 +205,34 @@ print("Kappa:", Kappa)
 print("Per-class AA:", AA)
 
 
+    dataset = SpectralPixelDataset(dataset_root)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    class_counts = Counter(
+        Path(p).stem.split("_")[0] for p in input_cube_paths
+    )
+
+    class_extra_distribution = {}
+
+    for cls, nb_base in class_counts.items():
+        total_base = nb_base * base_extrudes
+
+        if total_base >= 350:
+            class_extra_distribution[cls] = (0, 0)
+        else:
+            missing = 350 - total_base
+            extra_per_cube = missing // nb_base
+            remainder = missing % nb_base
+            class_extra_distribution[cls] = (extra_per_cube, remainder)
+
+    cube_counter = 0
+    class_cube_index = {cls: 0 for cls in class_counts}
+
+    for cube_path in input_cube_paths:
+        cube_prefix = Path(cube_path).stem.split("_")[0]
+        spectra_class = get_spectra_class(dataset, cube_prefix)
+
         extra_per_cube, remainder = class_extra_distribution[cube_prefix]
         idx = class_cube_index[cube_prefix]
 
