@@ -241,3 +241,13 @@ print("Per-class AA:", AA)
             n_extrudes += 1
 
         class_cube_index[cube_prefix] += 1
+
+
+        # Forcer new_spec à être 1D
+new_spec = np.asarray(new_spec).reshape(-1)
+
+# Vérifier la dimension
+if new_spec.shape[0] != B:
+    raise ValueError(f"Dimension incorrecte de new_spec: {new_spec.shape}, attendu ({B},)")
+
+augmented_cube[:, i, j] = new_spec
