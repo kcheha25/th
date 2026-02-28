@@ -205,23 +205,11 @@ print("Kappa:", Kappa)
 print("Per-class AA:", AA)
 
 
-    class_counts = Counter(
-        Path(p).stem.split("_")[0] for p in input_cube_paths
-    )
+        extra_per_cube, remainder = class_extra_distribution[cube_prefix]
+        idx = class_cube_index[cube_prefix]
 
-    # 🔹 Calcul des surplus à répartir par classe
-    class_extra_distribution = {}
+        n_extrudes = base_extrudes + extra_per_cube
+        if idx < remainder:
+            n_extrudes += 1
 
-    for cls, nb_base in class_counts.items():
-        total_base = nb_base * base_extrudes
-
-        if total_base >= 350:
-            class_extra_distribution[cls] = (0, 0)
-        else:
-            missing = 350 - total_base
-            extra_per_cube = missing // nb_base
-            remainder = missing % nb_base
-            class_extra_distribution[cls] = (extra_per_cube, remainder)
-
-    cube_counter = 0
-    class_cube_index = {cls: 0 for cls in class_counts}
+        class_cube_index[cube_prefix] += 1
