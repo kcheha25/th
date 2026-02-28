@@ -114,7 +114,7 @@ class Transformer(nn.Module):
             x = ff(x)
         return x
 
-class SpectralFormer(nn.Module):
+class ViT(nn.Module):
     def __init__(self, patch_dim, num_patches, num_classes):
         super().__init__()
         dim = 64
@@ -203,3 +203,25 @@ print("OA:", OA)
 print("AA:", AA_mean)
 print("Kappa:", Kappa)
 print("Per-class AA:", AA)
+
+
+    class_counts = Counter(
+        Path(p).stem.split("_")[0] for p in input_cube_paths
+    )
+
+    # 🔹 Calcul des surplus à répartir par classe
+    class_extra_distribution = {}
+
+    for cls, nb_base in class_counts.items():
+        total_base = nb_base * base_extrudes
+
+        if total_base >= 350:
+            class_extra_distribution[cls] = (0, 0)
+        else:
+            missing = 350 - total_base
+            extra_per_cube = missing // nb_base
+            remainder = missing % nb_base
+            class_extra_distribution[cls] = (extra_per_cube, remainder)
+
+    cube_counter = 0
+    class_cube_index = {cls: 0 for cls in class_counts}
