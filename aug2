@@ -1027,11 +1027,11 @@ def inject_local_variation(real_spec, gan_spec, selected_indices, beta=1.0, wind
 # -------------------------------
 # Bruit avec wl aléatoire
 # -------------------------------
-def augment_with_class_noise(real_spec, spectra_class, alpha=1.0):
+def augment_with_class_noise(real_spec, spectra_class, alpha=0.05):
     # choisir un indice aléatoire
     wl_index = np.random.randint(0, spectra_class.shape[1])
     sigma = np.std(spectra_class[:, wl_index])
-    noise = np.random.randn() * sigma * alpha
+    noise = np.random.randn(len(real_spec)) * sigma * alpha
     S_aug = np.clip(real_spec + noise, 0, 1)
     return S_aug
 
@@ -1259,3 +1259,85 @@ def augment_with_class_noise_relative(real_spec, spectra_class, alpha=1.0, max_r
     raw_noise = raw_noise - np.mean(raw_noise)
     S_aug = np.clip(real_spec + raw_noise, 0, 1)
     return S_aug
+
+
+def generate_multiple_augmented(
+    dataset_root,
+    input_cube_paths,
+    wl_max10,
+    wl_max20,
+    output_dir,
+    target_per_class=400,
+    alpha_noise=1.0,
+    device="cuda"
+):
+    dataset = SpectralPixelDataset(dataset_root)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Regrouper les cubes par classe
+    class_to_cubes = {}
+    for cube_path in input_cube_paths:
+        prefix = Path(cube_path).stem.split("_")[0]
+        class_to_cubes.setdefault(prefix, []).append(cube_path)
+
+    for class_name, cube_list in class_to_cubes.items():
+
+        print(f"\nClasse {class_name}")
+        print(f"Cubes réels : {len(cube_list)}")
+
+        n_real = len(cube_list)
+
+        if n_real == 0:
+            continue
+
+        # Calcul automatique du nombre d’augmentations par cube
+        base_per_cube = target_per_class // n_real
+        remainder = target_per_class % n_real
+
+        print(f"Objectif total : {target_per_class}")
+        print(f"Générations par cube : {base_per_cube} (+1 pour {remainder} cubes)")
+
+        spectra_class = get_spectra_class(dataset, class_name)
+
+        netG_path = f"./results/{class_name}/netG_best.pth"
+        netG = torch.load(netG_path)
+        netG.to(device)
+        netG.eval()
+
+        generated_count = 0
+
+        for idx, cube_path in enumerate(cube_list):
+
+            # Répartir le reste
+            n_generate = base_per_cube + (1 if idx < remainder else 0)
+
+            hdr_img = envi.open(cube_path)
+            cube = np.array(hdr_img.load(), dtype=np.float32)
+
+            for n in range(n_generate):
+
+                aug_cube = generate_augmented_cube(
+                    cube,
+                    class_name,
+                    netG,
+                    wl_max10,
+                    wl_max20,
+                    spectra_class=spectra_class,
+                    alpha_noise=alpha_noise,
+                    device=device,
+                    save_plots=False
+                )
+
+                save_path = output_dir / f"{class_name}_aug_{generated_count}.hdr"
+                envi.save_image(
+                    str(save_path),
+                    aug_cube,
+                    dtype=np.float32,
+                    force=True,
+                    interleave="bsq"
+                )
+
+                generated_count += 1
+
+        print(f"Total généré pour {class_name} : {generated_count}")
