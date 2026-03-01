@@ -1352,46 +1352,50 @@ import random
 def transform_cube_spatial(cube):
     B, H, W = cube.shape
     operation = random.choice(["rot90", "rot180", "rot270", "flip_h", "flip_v"])
-    rotated_cube = cube
+    transformed_cube = cube
+    H_new, W_new = H, W
+
     if operation == "rot90":
-        rotated_cube = np.rot90(cube, k=1, axes=(1,2))
-        H, W = W, H
+        transformed_cube = np.rot90(cube, k=1, axes=(1,2))
+        H_new, W_new = W, H
     elif operation == "rot180":
-        rotated_cube = np.rot90(cube, k=2, axes=(1,2))
+        transformed_cube = np.rot90(cube, k=2, axes=(1,2))
     elif operation == "rot270":
-        rotated_cube = np.rot90(cube, k=3, axes=(1,2))
-        H, W = W, H
+        transformed_cube = np.rot90(cube, k=3, axes=(1,2))
+        H_new, W_new = W, H
     elif operation == "flip_h":
-        rotated_cube = np.flip(cube, axis=2)
+        transformed_cube = np.flip(cube, axis=2)
     elif operation == "flip_v":
-        rotated_cube = np.flip(cube, axis=1)
-    return rotated_cube, operation, H, W
+        transformed_cube = np.flip(cube, axis=1)
 
-def show_cartography_before_after(cube_before, cube_after, title=""):
-    map_before = np.mean(cube_before, axis=0)
-    map_after = np.mean(cube_after, axis=0)
-    plt.figure(figsize=(10,4))
-    plt.subplot(1,2,1)
-    plt.imshow(map_before, cmap="gray")
-    plt.title("Avant")
-    plt.colorbar()
-    plt.subplot(1,2,2)
-    plt.imshow(map_after, cmap="gray")
-    plt.title("Après")
-    plt.colorbar()
-    plt.suptitle(title)
-    plt.tight_layout()
-    plt.show()
+    return transformed_cube, operation, H_new, W_new
 
-def augment_existing_cubes_inplace(cube_paths, visualize=True):
+def augment_existing_cubes(cube_paths, output_dir, visualize=True):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     for cube_path in cube_paths:
         cube_path = Path(cube_path)
         hdr_img = envi.open(str(cube_path))
         cube = np.array(hdr_img.load(), dtype=np.float32)
         transformed_cube, operation, H_new, W_new = transform_cube_spatial(cube)
+
         if visualize:
-            show_cartography_before_after(cube, transformed_cube, title=f"{cube_path.stem} - {operation}")
+            plt.figure(figsize=(8,4))
+            plt.subplot(1,2,1)
+            plt.imshow(np.mean(cube, axis=0), cmap="gray")
+            plt.title("Avant")
+            plt.subplot(1,2,2)
+            plt.imshow(np.mean(transformed_cube, axis=0), cmap="gray")
+            plt.title(f"Après {operation}")
+            plt.show()
+
         meta = hdr_img.metadata.copy()
-        meta['lines'] = H_new
-        meta['samples'] = W_new
-        envi.save_image(str(cube_path), transformed_cube, dtype=np.float32, force=True, interleave="bil", metadata=meta)
+        meta['lines'] = int(H_new)
+        meta['samples'] = int(W_new)
+        meta['bands'] = int(cube.shape[0])
+
+        save_path = output_dir / cube_path.name
+        envi.save_image(str(save_path), transformed_cube.astype(np.float32),
+                        force=True, interleave="bil", metadata=meta)
+        print(f"✔ {cube_path.name} transformé ({operation}) et sauvegardé dans {output_dir}")
