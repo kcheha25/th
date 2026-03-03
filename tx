@@ -220,3 +220,208 @@ def plot_radial_spectra_all_extrudes(dataset_root, null_threshold=1e-6):
     hdr_files = sorted(dataset_root.rglob("*.hdr"))
     for cube_path in hdr_files:
         plot_radial_spectra_for_cube(cube_path, null_threshold)
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from spectral import envi
+from pathlib import Path
+
+
+def compute_mean_std_for_class(cube_paths, null_threshold=1e-6):
+
+    all_spectra = []
+
+    for cube_path in cube_paths:
+        hdr_img = envi.open(str(cube_path))
+        cube = np.array(hdr_img.load(), dtype=np.float32)
+
+        B, H, W = cube.shape
+        spectra = cube.reshape(B, -1).T
+
+        valid_spectra = np.array(
+            [s for s in spectra if np.var(s) > null_threshold]
+        )
+
+        if len(valid_spectra) > 0:
+            all_spectra.append(valid_spectra)
+
+    if len(all_spectra) == 0:
+        return None, None
+
+    all_spectra = np.vstack(all_spectra)
+
+    mean_spec = np.mean(all_spectra, axis=0)
+    std_spec = np.std(all_spectra, axis=0)
+
+    return mean_spec, std_spec
+
+
+def plot_real_vs_augmented(dataset_root):
+
+    dataset_root = Path(dataset_root)
+    hdr_files = sorted(dataset_root.rglob("*.hdr"))
+
+    class_to_real = {}
+    class_to_aug = {}
+
+    for cube_path in hdr_files:
+        name = cube_path.stem
+        class_name = name.split("_")[0]
+
+        if "_aug_" in name:
+            class_to_aug.setdefault(class_name, []).append(cube_path)
+        else:
+            class_to_real.setdefault(class_name, []).append(cube_path)
+
+    all_classes = sorted(set(list(class_to_real.keys()) + list(class_to_aug.keys())))
+
+    for class_name in all_classes:
+
+        real_cubes = class_to_real.get(class_name, [])
+        aug_cubes = class_to_aug.get(class_name, [])
+
+        mean_real, std_real = compute_mean_std_for_class(real_cubes)
+        mean_aug, std_aug = compute_mean_std_for_class(aug_cubes)
+
+        if mean_real is None and mean_aug is None:
+            continue
+
+        plt.figure(figsize=(10, 5))
+
+        if mean_real is not None:
+            plt.plot(mean_real, color="blue", linewidth=2, label="Réel - Moyenne")
+            plt.fill_between(
+                range(len(mean_real)),
+                mean_real - std_real,
+                mean_real + std_real,
+                color="blue",
+                alpha=0.2,
+                label="Réel ± std"
+            )
+
+        if mean_aug is not None:
+            plt.plot(mean_aug, color="red", linewidth=2, label="Augmenté - Moyenne")
+            plt.fill_between(
+                range(len(mean_aug)),
+                mean_aug - std_aug,
+                mean_aug + std_aug,
+                color="red",
+                alpha=0.2,
+                label="Augmenté ± std"
+            )
+
+        plt.title(f"Classe {class_name} - Spectres moyens")
+        plt.xlabel("Indice bande")
+        plt.ylabel("Reflectance")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+
+
+
+plot_real_vs_augmented("extrudes_eroded")
+
+import numpy as np
+import matplotlib.pyplot as plt
+from spectral import envi
+from pathlib import Path
+
+
+def compute_mean_std_for_class(cube_paths, null_threshold=1e-6):
+
+    all_spectra = []
+
+    for cube_path in cube_paths:
+        hdr_img = envi.open(str(cube_path))
+        cube = np.array(hdr_img.load(), dtype=np.float32)
+
+        B, H, W = cube.shape
+        spectra = cube.reshape(B, -1).T
+
+        valid_spectra = spectra[np.var(spectra, axis=1) > null_threshold]
+
+        if len(valid_spectra) > 0:
+            all_spectra.append(valid_spectra)
+
+    if len(all_spectra) == 0:
+        return None, None
+
+    all_spectra = np.vstack(all_spectra)
+
+    mean_spec = np.mean(all_spectra, axis=0)
+    std_spec = np.std(all_spectra, axis=0)
+
+    return mean_spec, std_spec
+
+
+def plot_real_vs_augmented(real_root, aug_root):
+
+    real_root = Path(real_root)
+    aug_root = Path(aug_root)
+
+    real_files = sorted(real_root.rglob("*.hdr"))
+    aug_files = sorted(aug_root.rglob("*.hdr"))
+
+    class_to_real = {}
+    class_to_aug = {}
+
+    for f in real_files:
+        class_name = f.stem.split("_")[0]
+        class_to_real.setdefault(class_name, []).append(f)
+
+    for f in aug_files:
+        class_name = f.stem.split("_")[0]
+        class_to_aug.setdefault(class_name, []).append(f)
+
+    all_classes = sorted(set(list(class_to_real.keys()) + list(class_to_aug.keys())))
+
+    for class_name in all_classes:
+
+        real_cubes = class_to_real.get(class_name, [])
+        aug_cubes = class_to_aug.get(class_name, [])
+
+        mean_real, std_real = compute_mean_std_for_class(real_cubes)
+        mean_aug, std_aug = compute_mean_std_for_class(aug_cubes)
+
+        if mean_real is None and mean_aug is None:
+            continue
+
+        plt.figure(figsize=(10, 5))
+
+        if mean_real is not None:
+            plt.plot(mean_real, color="blue", linewidth=2, label="Réel - Moyenne")
+            plt.fill_between(
+                range(len(mean_real)),
+                mean_real - std_real,
+                mean_real + std_real,
+                color="blue",
+                alpha=0.2
+            )
+
+        if mean_aug is not None:
+            plt.plot(mean_aug, color="red", linewidth=2, label="Augmenté - Moyenne")
+            plt.fill_between(
+                range(len(mean_aug)),
+                mean_aug - std_aug,
+                mean_aug + std_aug,
+                color="red",
+                alpha=0.2
+            )
+
+        plt.title(f"Classe {class_name}")
+        plt.xlabel("Indice bande")
+        plt.ylabel("Reflectance")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+
+
+
+plot_real_vs_augmented(
+    real_root="extrudes_reels",
+    aug_root="extrudes_augmented"
+)
