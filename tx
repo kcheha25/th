@@ -425,3 +425,71 @@ plot_real_vs_augmented(
     real_root="extrudes_reels",
     aug_root="extrudes_augmented"
 )
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from spectral import envi
+from pathlib import Path
+
+def plot_real_vs_augmented_class(cube_path, augmented_class_dir, null_threshold=1e-6):
+    """
+    Affiche sur le même plot :
+    - Le spectre moyen et écart-type du cube réel
+    - Le spectre moyen et écart-type de tous les cubes augmentés pour la même classe
+    
+    cube_path : chemin vers le cube original
+    augmented_class_dir : dossier contenant tous les cubes augmentés de la classe
+    """
+    # --- Cube réel ---
+    cube_path = Path(cube_path)
+    class_name = cube_path.stem.split("_")[0]
+    hdr_img = envi.open(str(cube_path))
+    cube = np.array(hdr_img.load(), dtype=np.float32)
+    B, H, W = cube.shape
+    spectra = cube.reshape(B, -1).T
+    valid_spectra = np.array([s for s in spectra if np.var(s) > null_threshold])
+    if len(valid_spectra) == 0:
+        print(f"Aucun spectre valide pour {cube_path}")
+        return
+    real_mean = np.mean(valid_spectra, axis=0)
+    real_std = np.std(valid_spectra, axis=0)
+
+    # --- Cubes augmentés pour la même classe ---
+    aug_dir = Path(augmented_class_dir) / class_name
+    aug_files = sorted(aug_dir.rglob(f"{class_name}_cube*_aug_*.hdr"))
+    all_aug_spectra = []
+    for f in aug_files:
+        hdr_aug = envi.open(str(f))
+        cube_aug = np.array(hdr_aug.load(), dtype=np.float32)
+        B_aug, H_aug, W_aug = cube_aug.shape
+        spectra_aug = cube_aug.reshape(B_aug, -1).T
+        valid_aug = np.array([s for s in spectra_aug if np.var(s) > null_threshold])
+        if len(valid_aug) > 0:
+            all_aug_spectra.append(valid_aug)
+    if len(all_aug_spectra) == 0:
+        print(f"Aucun cube augmenté valide pour la classe {class_name}")
+        return
+    all_aug_spectra = np.vstack(all_aug_spectra)
+    aug_mean = np.mean(all_aug_spectra, axis=0)
+    aug_std = np.std(all_aug_spectra, axis=0)
+
+    # --- Plot ---
+    plt.figure(figsize=(10,5))
+    plt.plot(real_mean, color='blue', linewidth=2, label='Real Mean')
+    plt.fill_between(range(len(real_mean)), real_mean - real_std, real_mean + real_std, 
+                     color='blue', alpha=0.2, label='Real ± STD')
+
+    plt.plot(aug_mean, color='orange', linewidth=2, label='Augmented Mean')
+    plt.fill_between(range(len(aug_mean)), aug_mean - aug_std, aug_mean + aug_std, 
+                     color='orange', alpha=0.2, label='Augmented ± STD')
+
+    plt.title(f"{class_name} - {cube_path.stem}")
+    plt.xlabel("Indice bande")
+    plt.ylabel("Reflectance")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+# Exemple d'utilisation :
+# plot_real_vs_augmented_class("data/A1_cube0.hdr", "augmented")
