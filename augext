@@ -200,3 +200,93 @@ def process_all(hsi_root, ann_root, out_dir, window_size=3):
             continue
         process_cube(cube_folder, json_path, out_dir, window_size=window_size)
 
+import numpy as np
+from pathlib import Path
+import json
+import matplotlib.pyplot as plt
+from specarray import SpecArray
+import spectral.io.envi as envi
+from scipy.ndimage import median_filter
+import cv2
+
+def load_labelme(json_path):
+    with open(json_path) as f:
+        data = json.load(f)
+    plots = []
+    polygons_to_remove = []
+    for shape in data["shapes"]:
+        label = shape["label"]
+        pts = np.array(shape["points"], dtype=np.int32)
+        if label == "plot":
+            x1 = int(np.min(pts[:,0]))
+            x2 = int(np.max(pts[:,0]))
+            y1 = int(np.min(pts[:,1]))
+            y2 = int(np.max(pts[:,1]))
+            plots.append((x1, y1, x2, y2))
+        elif label != "trou":
+            polygons_to_remove.append(pts)
+    return plots, polygons_to_remove
+
+def build_mask(H, W, polygons):
+    mask = np.zeros((H, W), dtype=np.uint8)
+    for poly in polygons:
+        cv2.fillPoly(mask, [poly], 1)
+    return mask.astype(bool)
+
+def fill_zero_by_local_median(cube, mask, size=5):
+    B, H, W = cube.shape
+    cube_filled = cube.copy()
+    for b in range(B):
+        band = cube[b]
+        med = median_filter(band, size=size)
+        band[mask] = med[mask]
+        cube_filled[b] = band
+    return cube_filled
+
+def process_cube(cube_folder, json_path, out_dir, median_size=5):
+    spec = SpecArray.from_folder(cube_folder)
+    cube = np.array(spec.spectral_albedo).transpose(1,0,2)
+    B, H, W = cube.shape
+    wavelengths = np.array(spec.wavelengths)
+    plots, polygons_to_remove = load_labelme(json_path)
+    remove_mask = build_mask(H, W, polygons_to_remove)
+    cube[:, remove_mask] = 0
+    cube_filled = fill_zero_by_local_median(cube, remove_mask, size=median_size)
+    i1 = np.argmin(np.abs(wavelengths - 996))
+    i2 = np.argmin(np.abs(wavelengths - 1197))
+    ratio = cube_filled[i1] / (cube_filled[i2] + 1e-8)
+    for i, (x1, y1, x2, y2) in enumerate(plots):
+        plot_cube = cube_filled[:, y1:y2, x1:x2]
+        meta = spec.metadata.copy()
+        meta["lines"] = plot_cube.shape[1]
+        meta["samples"] = plot_cube.shape[2]
+        meta["bands"] = plot_cube.shape[0]
+        hdr_path = out_dir / f"{cube_folder.name}_plot_{i}.hdr"
+        envi.save_image(str(hdr_path), plot_cube, dtype=np.float32, interleave="bil", force=True, metadata=meta)
+        ratio_plot = ratio[y1:y2, x1:x2]
+        plt.figure(figsize=(5,5))
+        plt.imshow(ratio_plot, cmap="inferno")
+        plt.axis("off")
+        plt.title(f"{cube_folder.name} plot {i}")
+        plt.savefig(out_dir / f"{cube_folder.name}_plot_{i}_ratio.png")
+        plt.close()
+        print("Plot sauvegardé :", hdr_path.name)
+
+def process_all(hsi_root, ann_root, out_dir, median_size=5):
+    hsi_root = Path(hsi_root)
+    ann_root = Path(ann_root)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for cube_folder in hsi_root.iterdir():
+        if not cube_folder.is_dir():
+            continue
+        json_path = ann_root / f"{cube_folder.name}.json"
+        if not json_path.exists():
+            print("JSON manquant :", cube_folder.name)
+            continue
+        process_cube(cube_folder, json_path, out_dir, median_size=median_size)
+
+hsi_root = "ann/hsi_cube"
+ann_root = "ann"
+out_dir = "plots_output"
+process_all(hsi_root, ann_root, out_dir, median_size=5)
