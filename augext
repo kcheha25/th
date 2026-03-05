@@ -340,3 +340,21 @@ def process_all(hsi_root, ann_root, out_dir, dilate_radius=3):
             print("json manquant :", cube_folder.name)
             continue
         process_cube(cube_folder, json_path, out_dir, dilate_radius=dilate_radius)
+
+from scipy.ndimage import distance_transform_edt
+
+def fill_black_pixels_nn(cube, mask):
+    """
+    cube  : (B, H, W) float32
+    mask  : (H, W) bool — True = pixels à remplir (valeur 0)
+    retourne le cube avec les pixels interpolés
+    """
+    filled = cube.copy()
+    # Pour chaque pixel masqué, trouver le pixel valide le plus proche
+    # distance_transform_edt retourne aussi l'indice du voisin le plus proche
+    _, nearest_idx = distance_transform_edt(mask, return_indices=True)
+    for b in range(cube.shape[0]):
+        band = filled[b]
+        band[mask] = band[nearest_idx[0][mask], nearest_idx[1][mask]]
+        filled[b] = band
+    return filled
