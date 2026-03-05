@@ -120,24 +120,27 @@ def build_mask(H, W, polygons):
         cv2.fillPoly(mask, [poly], 1)
     return mask.astype(bool)
 
-def replace_zeros_with_neighbor_median(cube, mask_to_fill, window_size=3):
-    bands, H, W = cube.shape
+def fill_mask_iterative(cube, mask_to_fill, window_size=3):
     filled_cube = cube.copy()
-    ys, xs = np.where(mask_to_fill)
-    
-    for y, x in zip(ys, xs):
-        y0 = max(0, y-window_size)
-        y1 = min(H, y+window_size+1)
-        x0 = max(0, x-window_size)
-        x1 = min(W, x+window_size+1)
-        
-        neighborhood = filled_cube[:, y0:y1, x0:x1]
-        neighbor_mask = ~mask_to_fill[y0:y1, x0:x1]
-        valid_pixels = np.where(neighbor_mask)
-        
-        if len(valid_pixels[0]) > 0:
-            median_spectrum = np.median(neighborhood[:, valid_pixels[0], valid_pixels[1]], axis=1)
-            filled_cube[:, y, x] = median_spectrum
+    mask = mask_to_fill.copy()
+
+    iteration = 0
+    while np.any(filled_cube[:, mask] == 0):
+        iteration += 1
+        ys, xs = np.where(mask)
+        for y, x in zip(ys, xs):
+            for b in range(filled_cube.shape[0]):
+                if filled_cube[b, y, x] != 0:
+                    continue
+                y0 = max(0, y-window_size)
+                y1 = min(filled_cube.shape[1], y+window_size+1)
+                x0 = max(0, x-window_size)
+                x1 = min(filled_cube.shape[2], x+window_size+1)
+
+                neighborhood = filled_cube[b, y0:y1, x0:x1]
+                neighbor_mask = neighborhood != 0
+                if np.any(neighbor_mask):
+                    filled_cube[b, y, x] = np.median(neighborhood[neighbor_mask])
     return filled_cube
 
 def process_cube(cube_folder, json_path, out_dir, window_size=3):
@@ -150,7 +153,7 @@ def process_cube(cube_folder, json_path, out_dir, window_size=3):
     remove_mask = build_mask(H, W, polygons)
 
     cube[:, remove_mask] = 0
-    cube = replace_zeros_with_neighbor_median(cube, remove_mask, window_size=window_size)
+    cube = fill_mask_iterative(cube, remove_mask, window_size=window_size)
 
     i1 = np.argmin(np.abs(wavelengths - 996))
     i2 = np.argmin(np.abs(wavelengths - 1197))
@@ -197,10 +200,3 @@ def process_all(hsi_root, ann_root, out_dir, window_size=3):
             continue
         process_cube(cube_folder, json_path, out_dir, window_size=window_size)
 
-# Exemple d'utilisation
-process_all(
-    "ann/hsi_cube",
-    "ann",
-    "plots_output",
-    window_size=3
-)
