@@ -127,12 +127,11 @@ for hdr_file in plot_files:
 
 import numpy as np
 from pathlib import Path
-from specarray import SpecArray
 import json
 import cv2
-from skimage.morphology import dilation, disk
-import spectral.io.envi as envi
 import matplotlib.pyplot as plt
+from specarray import SpecArray
+import spectral.io.envi as envi
 
 
 def load_labelme(json_path):
@@ -141,103 +140,69 @@ def load_labelme(json_path):
         data = json.load(f)
 
     plots = []
-    polygons = []
+    polygons_to_remove = []
 
-    for s in data["shapes"]:
+    for shape in data["shapes"]:
 
-        if s["label"] == "plot":
+        label = shape["label"]
+        pts = np.array(shape["points"], dtype=np.int32)
 
-            pts = np.array(s["points"])
+        if label == "plot":
 
-            x1 = int(min(p[0] for p in pts))
-            x2 = int(max(p[0] for p in pts))
-            y1 = int(min(p[1] for p in pts))
-            y2 = int(max(p[1] for p in pts))
+            x1 = int(np.min(pts[:,0]))
+            x2 = int(np.max(pts[:,0]))
+            y1 = int(np.min(pts[:,1]))
+            y2 = int(np.max(pts[:,1]))
 
             plots.append((x1,y1,x2,y2))
 
-        else:
+        elif label != "trou":
 
-            poly = np.array(s["points"],dtype=np.int32)
-            polygons.append(poly)
+            polygons_to_remove.append(pts)
 
-    return plots, polygons
+    return plots, polygons_to_remove
 
 
-def build_mask(H,W,polygons,dilate_radius=6):
+def build_mask(H,W,polygons):
 
     mask = np.zeros((H,W),dtype=np.uint8)
 
     for poly in polygons:
         cv2.fillPoly(mask,[poly],1)
 
-    if dilate_radius>0:
-        mask = dilation(mask,disk(dilate_radius))
-
     return mask.astype(bool)
-
-
-def fill_pixels(cube,mask_remove,window=9):
-
-    B,H,W = cube.shape
-
-    cube_out = cube.copy()
-
-    ys,xs = np.where(mask_remove)
-
-    for y,x in zip(ys,xs):
-
-        y0=max(0,y-window)
-        y1=min(H,y+window+1)
-
-        x0=max(0,x-window)
-        x1=min(W,x+window+1)
-
-        local_mask = mask_remove[y0:y1,x0:x1]
-
-        valid = np.where(~local_mask)
-
-        if len(valid[0])==0:
-            continue
-
-        spectra = cube[:,y0:y1,x0:x1][:,valid[0],valid[1]]
-
-        spec = np.median(spectra,axis=1)
-
-        cube_out[:,y,x]=spec
-
-    return cube_out
 
 
 def process_cube(cube_folder,json_path,out_dir):
 
     spec = SpecArray.from_folder(cube_folder)
 
-    cube = np.array(spec.spectral_albedo).transpose(1,0,2)
+    cube = np.array(spec.spectral_albedo)
+    cube = cube.transpose(1,0,2)
 
     B,H,W = cube.shape
 
+    wavelengths = np.array(spec.wavelengths)
+
     plots,polygons = load_labelme(json_path)
 
-    mask_remove = build_mask(H,W,polygons,6)
+    remove_mask = build_mask(H,W,polygons)
 
-    cube_clean = fill_pixels(cube,mask_remove,9)
-
-    wavelengths = np.array(spec.wavelengths)
+    cube[:,remove_mask] = 0
 
     i1 = np.argmin(np.abs(wavelengths-996))
     i2 = np.argmin(np.abs(wavelengths-1197))
 
-    ratio = cube_clean[i1]/(cube_clean[i2]+1e-8)
+    ratio = cube[i1] / (cube[i2] + 1e-8)
 
     for i,(x1,y1,x2,y2) in enumerate(plots):
 
-        plot_cube = cube_clean[:,y1:y2,x1:x2]
+        plot_cube = cube[:,y1:y2,x1:x2]
 
         meta = spec.metadata.copy()
-        meta["lines"]=plot_cube.shape[1]
-        meta["samples"]=plot_cube.shape[2]
-        meta["bands"]=plot_cube.shape[0]
+        meta["lines"] = plot_cube.shape[1]
+        meta["samples"] = plot_cube.shape[2]
+        meta["bands"] = plot_cube.shape[0]
 
         hdr_path = out_dir / f"{cube_folder.name}_plot_{i}.hdr"
 
@@ -264,11 +229,11 @@ def process_cube(cube_folder,json_path,out_dir):
 
 def process_all(hsi_root,ann_root,out_dir):
 
-    hsi_root=Path(hsi_root)
-    ann_root=Path(ann_root)
-    out_dir=Path(out_dir)
+    hsi_root = Path(hsi_root)
+    ann_root = Path(ann_root)
+    out_dir = Path(out_dir)
 
-    out_dir.mkdir(exist_ok=True,parents=True)
+    out_dir.mkdir(parents=True,exist_ok=True)
 
     for cube_folder in hsi_root.iterdir():
 
@@ -287,5 +252,5 @@ def process_all(hsi_root,ann_root,out_dir):
 process_all(
     "ann/hsi_cube",
     "ann",
-    "plots_clean"
+    "plots_output"
 )
