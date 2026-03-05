@@ -2323,3 +2323,90 @@ for group in groups:
     sel = select_mrmr_bands_skfeature(class_spectra, group, n_selected=10)
     selected_bands_per_group.append(sel)
 plot_groups_and_selected(class_spectra, groups, selected_bands_per_group)
+
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from pathlib import Path
+from spectral import envi
+
+class SpectralPixelDataset(Dataset):
+    def __init__(self, root_dir, deriv_threshold=1e-4, min_len=3, null_threshold=1e-6):
+        """
+        Dataset hyperspectral : charge les spectres, normalise, et supprime les spectres saturés.
+        
+        Args:
+            root_dir (str / Path) : dossier contenant les fichiers .hdr
+            deriv_threshold (float) : seuil pour considérer une dérivée comme "plate"
+            min_len (int) : nombre minimal de bandes consécutives plates pour considérer une saturation
+            null_threshold (float) : variance minimale pour considérer un spectre comme valide
+        """
+        self.root_dir = Path(root_dir)
+        self.deriv_threshold = deriv_threshold
+        self.min_len = min_len
+        self.null_threshold = null_threshold
+
+        self.samples = []
+        self.class_map = {}
+        self.class_names = []
+
+        class_counter = 0
+        hdr_files = list(self.root_dir.rglob("*.hdr"))
+
+        for hdr_file in sorted(hdr_files):
+            name = hdr_file.stem
+            prefix = name.split("_")[0]
+
+            if prefix not in self.class_map:
+                self.class_map[prefix] = class_counter
+                self.class_names.append(prefix)
+                class_counter += 1
+
+            class_id = self.class_map[prefix]
+
+            img = envi.open(str(hdr_file))
+            cube = np.array(img.load(), dtype=np.float32)
+            B, H, W = cube.shape
+
+            # Mise en vecteur des spectres
+            spectra = cube.reshape(B, -1).T
+
+            for s in spectra:
+                # Vérifie variance > seuil pour ignorer spectres nuls
+                if np.var(s) <= self.null_threshold:
+                    continue
+
+                # Vérifie saturation
+                if not self.has_short_saturation(s):
+                    # Normalisation [-1, 1]
+                    s_norm = 2 * s - 1
+                    self.samples.append((torch.tensor(s_norm, dtype=torch.float32), class_id))
+
+        print(f"Dataset chargé : {len(self.samples)} spectres valides")
+        print(f"Classes : {self.class_names}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+    def has_short_saturation(self, s):
+        """
+        Détecte si un spectre contient un plateau (saturation) court.
+        Renvoie True si saturé, False sinon.
+        """
+        d = np.diff(s)
+        flat = np.abs(d) < self.deriv_threshold
+
+        count = 0
+        for f in flat:
+            if f:
+                count += 1
+                if count >= self.min_len:
+                    return True
+            else:
+                count = 0
+
+        return False
