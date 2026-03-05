@@ -496,7 +496,4 @@ def plot_all_real_and_augmented(data_dir, augmented_dir, null_threshold=1e-6):
         plot_real_with_its_augmented(cube_path, augmented_dir, null_threshold=null_threshold)
 
 
-# --- Exemple d'utilisation ---
-# data_dir contient les cubes réels : data/A1_0.hdr, data/A1_1.hdr ...
-# augmented_dir contient les sous-dossiers A1, B1,... avec les cubes augmentés
 plot_all_real_and_augmented("data", "augmented")
