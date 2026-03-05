@@ -1253,34 +1253,61 @@ import matplotlib.pyplot as plt
 # -------------------------------
 # Dataset
 # -------------------------------
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from pathlib import Path
+from spectral import envi
+
 class SpectralPixelDataset(Dataset):
-    def __init__(self, root_dir, null_threshold=1e-6):
+    def __init__(self, root_dir, null_threshold=1e-6, deriv_threshold=1e-4, flat_ratio=0.3):
         self.root_dir = Path(root_dir)
         self.null_threshold = null_threshold
+        self.deriv_threshold = deriv_threshold
+        self.flat_ratio = flat_ratio
         self.samples = []
         self.class_map = {}
         self.class_names = []
         class_counter = 0
+
         hdr_files = list(self.root_dir.rglob("*.hdr"))
 
         for hdr_file in sorted(hdr_files):
             name = hdr_file.stem
             prefix = name.split("_")[0]
+
             if prefix not in self.class_map:
                 self.class_map[prefix] = class_counter
                 self.class_names.append(prefix)
                 class_counter += 1
+
             class_id = self.class_map[prefix]
+
             img = envi.open(str(hdr_file))
             cube = np.array(img.load(), dtype=np.float32)
+
             B, H, W = cube.shape
             spectra = cube.reshape(B, -1).T
-            for s in spectra:
-                if np.var(s) > self.null_threshold:
-                    s_norm = 2 * s - 1
-                    self.samples.append((torch.tensor(s_norm, dtype=torch.float32), class_id))
 
-        print(f"Dataset chargé : {len(self.samples)} spectres non nuls")
+            for s in spectra:
+
+                if np.var(s) <= self.null_threshold:
+                    continue
+
+                d = np.diff(s)
+
+                flat = np.mean(np.abs(d) < self.deriv_threshold)
+
+                if flat > self.flat_ratio:
+                    continue
+
+                s_norm = 2 * s - 1
+
+                self.samples.append(
+                    (torch.tensor(s_norm, dtype=torch.float32), class_id)
+                )
+
+        print(f"Dataset chargé : {len(self.samples)} spectres")
         print(f"Classes : {self.class_names}")
 
     def __len__(self):
