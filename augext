@@ -343,48 +343,30 @@ def process_all(hsi_root, ann_root, out_dir, dilate_radius=3):
 
 from scipy.ndimage import distance_transform_edt
 
-from scipy.ndimage import distance_transform_edt
-
-def fill_nearest_iterative(cube, mask, max_iter=100):
+def refine_bilateral_on_mask(cube, mask, d=5, sigma_color=0.1, sigma_space=3):
     """
-    Remplace itérativement chaque pixel masqué par le spectre du pixel valide
-    le plus proche. Zéro mélange → zéro artefact.
+    Filtre bilatéral appliqué uniquement sur les pixels interpolés.
+    Les pixels valides originaux sont préservés à l'identique.
 
-    cube     : (B, H, W) float32
-    mask     : (H, W) bool — True = pixels à remplir
-    max_iter : sécurité boucle infinie
+    cube        : (B, H, W) float32 — valeurs déjà normalisées [0, 1]
+    mask        : (H, W) bool — True = pixels interpolés
+    d           : diamètre du voisinage (5=local, 9=large)
+    sigma_color : sensibilité aux différences de valeur [0,1]
+    sigma_space : sensibilité à la distance spatiale
     """
-    filled = cube.copy()
-    remaining_mask = mask.copy()
+    refined = cube.copy()
 
-    for iteration in range(max_iter):
-        n_remaining = np.sum(remaining_mask)
-        if n_remaining == 0:
-            print(f"✓ Terminé en {iteration} itération(s)")
-            break
+    for b in range(cube.shape[0]):
+        band = cube[b].astype(np.float32)
 
-        print(f"  iter {iteration+1} — pixels restants : {n_remaining}")
+        smoothed = cv2.bilateralFilter(
+            band,
+            d=d,
+            sigmaColor=sigma_color,
+            sigmaSpace=sigma_space
+        )
 
-        # Indice du pixel valide le plus proche pour chaque pixel masqué
-        _, nearest_idx = distance_transform_edt(remaining_mask, return_indices=True)
+        # Remplacer UNIQUEMENT les pixels interpolés
+        refined[b][mask] = smoothed[mask]
 
-        # Pixels masqués dont le voisin le plus proche est VALIDE (pas masqué lui-même)
-        nr = nearest_idx[0]
-        nc = nearest_idx[1]
-        neighbor_is_valid = ~remaining_mask[nr, nc]
-        fillable = remaining_mask & neighbor_is_valid
-
-        if not np.any(fillable):
-            print(f"⚠ Aucun pixel remplissable à l'itération {iteration+1}")
-            break
-
-        # Copie vectorisée sur toutes les bandes
-        rows, cols = np.where(fillable)
-        filled[:, rows, cols] = filled[:, nr[rows, cols], nc[rows, cols]]
-
-        remaining_mask[fillable] = False
-
-    else:
-        print(f"⚠ max_iter={max_iter} atteint, pixels restants : {np.sum(remaining_mask)}")
-
-    return filled
+    return refined
