@@ -137,44 +137,41 @@ import cv2
 
 
 def load_annotations_labelme(json_path):
-    with open(json_path, 'r') as f:
+
+    with open(json_path) as f:
         data = json.load(f)
 
     plots = []
     holes = []
     extrudes = []
 
-    for shape in data["shapes"]:
+    for s in data["shapes"]:
 
-        label = shape["label"]
-        points = np.array(shape["points"], dtype=np.int32)
+        label = s["label"]
+        pts = np.array(s["points"],dtype=np.int32)
 
         if label == "plot":
 
-            x = points[:,0]
-            y = points[:,1]
+            x = pts[:,0]
+            y = pts[:,1]
 
-            bbox = [
-                int(np.min(x)),
-                int(np.min(y)),
-                int(np.max(x)),
-                int(np.max(y))
-            ]
+            bbox = [int(x.min()),int(y.min()),int(x.max()),int(y.max())]
 
-            plots.append({"bbox":bbox})
+            plots.append(bbox)
 
         elif label == "trou":
 
-            holes.append(points)
+            holes.append(pts)
 
         else:
 
-            extrudes.append(points)
+            extrudes.append(pts)
 
-    return plots, holes, extrudes
+    return plots,holes,extrudes
 
 
-def create_mask_from_polygons(H,W,polygons,dilate_radius=3):
+
+def polygon_mask(H,W,polygons,dilate_r=5):
 
     mask = np.zeros((H,W),dtype=np.uint8)
 
@@ -182,61 +179,68 @@ def create_mask_from_polygons(H,W,polygons,dilate_radius=3):
 
         cv2.fillPoly(mask,[poly],1)
 
-    if dilate_radius>0:
-
-        mask = dilation(mask,disk(dilate_radius))
+    if dilate_r>0:
+        mask = dilation(mask,disk(dilate_r))
 
     return mask.astype(bool)
 
 
-def fill_mask_with_neighbors(cube,mask_to_fill,holes_mask,window_size=3):
 
-    bands,H,W = cube.shape
+def fill_mask(cube,remove_mask,holes_mask,window=7):
 
-    cube_filled = cube.copy()
+    B,H,W = cube.shape
 
-    mask = mask_to_fill.copy()
+    cube_out = cube.copy()
 
-    while np.any(mask):
+    mask = remove_mask.copy()
 
-        ys,xs = np.where(mask)
+    ys,xs = np.where(mask)
 
-        for y,x in zip(ys,xs):
+    for y,x in zip(ys,xs):
 
-            y0 = max(0,y-window_size)
-            y1 = min(H,y+window_size+1)
+        found=False
 
-            x0 = max(0,x-window_size)
-            x1 = min(W,x+window_size+1)
+        for r in range(1,window):
 
-            local_mask = mask[y0:y1,x0:x1]
+            y0=max(0,y-r)
+            y1=min(H,y+r+1)
+
+            x0=max(0,x-r)
+            x1=min(W,x+r+1)
+
+            local_remove = remove_mask[y0:y1,x0:x1]
             local_holes = holes_mask[y0:y1,x0:x1]
 
-            neighborhood_mask = (~local_mask) & (~local_holes)
+            valid = (~local_remove) & (~local_holes)
 
-            if np.any(neighborhood_mask):
+            if np.any(valid):
 
-                yy,xx = np.where(neighborhood_mask)
+                yy,xx = np.where(valid)
 
-                r = random.randint(0,len(yy)-1)
+                k = random.randint(0,len(yy)-1)
 
-                sy = yy[r] + y0
-                sx = xx[r] + x0
+                sy = yy[k] + y0
+                sx = xx[k] + x0
 
-                cube_filled[:,y,x] = cube[:,sy,sx]
+                cube_out[:,y,x] = cube[:,sy,sx]
 
-                mask[y,x] = False
+                found=True
+                break
 
-    return cube_filled
+        if not found:
+            cube_out[:,y,x] = cube[:,y,x]
+
+    return cube_out
 
 
-def process_cubes(hsi_root,ann_root,output_root):
+
+def process_all(hsi_root,ann_root,out_root):
 
     hsi_root = Path(hsi_root)
     ann_root = Path(ann_root)
-    output_root = Path(output_root)
+    out_root = Path(out_root)
 
-    output_root.mkdir(parents=True,exist_ok=True)
+    out_root.mkdir(exist_ok=True,parents=True)
 
     for cube_folder in hsi_root.iterdir():
 
@@ -251,46 +255,46 @@ def process_cubes(hsi_root,ann_root,output_root):
 
         plots,holes,extrudes = load_annotations_labelme(json_path)
 
-        for cube_hdr in cube_folder.glob("*.hdr"):
+        for hdr in cube_folder.glob("*.hdr"):
 
-            spec = SpecArray.from_folder(cube_hdr.parent)
+            spec = SpecArray.from_folder(hdr.parent)
 
             cube = np.array(spec.spectral_albedo).transpose(1,0,2)
 
-            bands,H,W = cube.shape
+            B,H,W = cube.shape
 
-            if len(holes)>0:
 
-                holes_mask = create_mask_from_polygons(H,W,holes,0)
+            holes_mask = polygon_mask(H,W,holes,0) if holes else np.zeros((H,W),bool)
 
-            else:
+            extrude_mask = polygon_mask(H,W,extrudes,7)
 
-                holes_mask = np.zeros((H,W),dtype=bool)
+            remove_mask = extrude_mask & (~holes_mask)
 
-            extrude_mask = create_mask_from_polygons(H,W,extrudes,3)
 
-            mask_to_fill = extrude_mask & (~holes_mask)
+            cube_clean = fill_mask(cube,remove_mask,holes_mask)
 
-            cube_filled = fill_mask_with_neighbors(cube,mask_to_fill,holes_mask)
 
             i996 = np.argmin(np.abs(spec.wavelengths-996))
             i1197 = np.argmin(np.abs(spec.wavelengths-1197))
 
-            for i,plot in enumerate(plots):
 
-                x1,y1,x2,y2 = plot["bbox"]
+            for i,b in enumerate(plots):
 
-                plot_cube = cube_filled[:,y1:y2,x1:x2]
+                x1,y1,x2,y2 = b
 
-                ratio = plot_cube[i996,:,:] / (plot_cube[i1197,:,:] + 1e-8)
+                plot_cube = cube_clean[:,y1:y2,x1:x2]
+
+                ratio = plot_cube[i996] / (plot_cube[i1197] + 1e-8)
+
 
                 meta = spec.metadata.copy()
 
-                meta["lines"] = plot_cube.shape[1]
-                meta["samples"] = plot_cube.shape[2]
-                meta["bands"] = plot_cube.shape[0]
+                meta["lines"]=plot_cube.shape[1]
+                meta["samples"]=plot_cube.shape[2]
+                meta["bands"]=plot_cube.shape[0]
 
-                out_hdr = output_root / f"{cube_hdr.stem}_plot{i}.hdr"
+
+                out_hdr = out_root / f"{hdr.stem}_plot{i}.hdr"
 
                 envi.save_image(
                     str(out_hdr),
@@ -301,24 +305,23 @@ def process_cubes(hsi_root,ann_root,output_root):
                     metadata=meta
                 )
 
+
                 plt.figure(figsize=(6,6))
 
                 plt.imshow(ratio,cmap="inferno")
 
-                plt.title(f"ratio plot {i}")
-
                 plt.axis("off")
 
-                plt.savefig(output_root / f"{cube_hdr.stem}_plot{i}_ratio.png")
+                plt.savefig(out_root / f"{hdr.stem}_plot{i}_ratio.png")
 
                 plt.close()
 
-            print("cube traité",cube_hdr.name)
+            print("cube traité",hdr.name)
 
 
 
-hsi_root = "ann/hsi_cube"
-ann_root = "ann"
-output_root = "output_plots"
-
-process_cubes(hsi_root,ann_root,output_root)
+process_all(
+    "ann/hsi_cube",
+    "ann",
+    "plots_clean"
+)
