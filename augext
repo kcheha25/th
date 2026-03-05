@@ -258,11 +258,11 @@ process_all(
 import numpy as np
 from pathlib import Path
 import json
+import cv2
 import matplotlib.pyplot as plt
 from specarray import SpecArray
 import spectral.io.envi as envi
-import cv2
-import random
+from skimage.morphology import dilation, disk
 
 def load_labelme(json_path):
     with open(json_path) as f:
@@ -282,50 +282,25 @@ def load_labelme(json_path):
             polygons_to_remove.append(pts)
     return plots, polygons_to_remove
 
-def build_mask(H, W, polygons):
+def build_mask(H, W, polygons, dilate_radius=3):
     mask = np.zeros((H, W), dtype=np.uint8)
     for poly in polygons:
         cv2.fillPoly(mask, [poly], 1)
+    mask = dilation(mask, disk(dilate_radius))
     return mask.astype(bool)
 
-def replace_zeros_with_neighbor_median(cube, mask_to_fill, window_size=3, max_passes=10):
-    bands, H, W = cube.shape
-    filled_cube = cube.copy()
-    mask_current = mask_to_fill.copy()
-    for _ in range(max_passes):
-        ys, xs = np.where(mask_current)
-        if len(ys) == 0:
-            break
-        updated = 0
-        for y, x in zip(ys, xs):
-            y0 = max(0, y-window_size)
-            y1 = min(H, y+window_size+1)
-            x0 = max(0, x-window_size)
-            x1 = min(W, x+window_size+1)
-            neighborhood = filled_cube[:, y0:y1, x0:x1]
-            neighbor_mask = ~mask_current[y0:y1, x0:x1]
-            valid_pixels = np.where(neighbor_mask)
-            if len(valid_pixels[0]) > 0:
-                median_spectrum = np.median(neighborhood[:, valid_pixels[0], valid_pixels[1]], axis=1)
-                filled_cube[:, y, x] = median_spectrum
-                updated += 1
-        mask_current = (filled_cube == 0).any(axis=0) & mask_to_fill
-        if updated == 0:
-            break
-    return filled_cube
-
-def process_cube(cube_folder, json_path, out_dir, window_size=3):
+def process_cube(cube_folder, json_path, out_dir, dilate_radius=3):
     spec = SpecArray.from_folder(cube_folder)
-    cube = np.array(spec.spectral_albedo).transpose(1,0,2)  # (B,H,W)
+    cube = np.array(spec.spectral_albedo).transpose(1,0,2)
     B, H, W = cube.shape
     wavelengths = np.array(spec.wavelengths)
-    plots, polygons = load_labelme(json_path)
-    remove_mask = build_mask(H, W, polygons)
-    cube[:, remove_mask] = 0
-    cube = replace_zeros_with_neighbor_median(cube, remove_mask, window_size=window_size)
 
-    i1 = np.argmin(np.abs(wavelengths - 996))
-    i2 = np.argmin(np.abs(wavelengths - 1197))
+    plots, polygons = load_labelme(json_path)
+    remove_mask = build_mask(H, W, polygons, dilate_radius=dilate_radius)
+    cube[:, remove_mask] = 0
+
+    i1 = np.argmin(np.abs(wavelengths-996))
+    i2 = np.argmin(np.abs(wavelengths-1197))
     ratio = cube[i1] / (cube[i2] + 1e-8)
 
     for i, (x1, y1, x2, y2) in enumerate(plots):
@@ -343,7 +318,6 @@ def process_cube(cube_folder, json_path, out_dir, window_size=3):
             force=True,
             metadata=meta
         )
-
         ratio_plot = ratio[y1:y2, x1:x2]
         plt.figure(figsize=(5,5))
         plt.imshow(ratio_plot, cmap="inferno")
@@ -353,7 +327,7 @@ def process_cube(cube_folder, json_path, out_dir, window_size=3):
         plt.close()
         print("plot sauvegardé :", hdr_path.name)
 
-def process_all(hsi_root, ann_root, out_dir, window_size=3):
+def process_all(hsi_root, ann_root, out_dir, dilate_radius=3):
     hsi_root = Path(hsi_root)
     ann_root = Path(ann_root)
     out_dir = Path(out_dir)
@@ -365,11 +339,4 @@ def process_all(hsi_root, ann_root, out_dir, window_size=3):
         if not json_path.exists():
             print("json manquant :", cube_folder.name)
             continue
-        process_cube(cube_folder, json_path, out_dir, window_size=window_size)
-
-process_all(
-    "ann/hsi_cube",
-    "ann",
-    "plots_output",
-    window_size=3
-)
+        process_cube(cube_folder, json_path, out_dir, dilate_radius=dilate_radius)
