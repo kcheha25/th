@@ -123,3 +123,75 @@ for hdr_file in plot_files:
     plt.title(f"Ratio {WL1}nm/{WL2}nm - {hdr_file.stem}")
     plt.axis('off')
     plt.show()
+
+
+import numpy as np
+import cv2
+from pathlib import Path
+from specarray import SpecArray
+import json
+import spectral.io.envi as envi
+from skimage.morphology import dilation, disk
+import matplotlib.pyplot as plt
+
+def load_annotations(json_path):
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+    plots, trous, autres = [], [], []
+    for obj in data['objects']:
+        if obj['class'] == 'plot':
+            plots.append(obj)
+        elif obj['class'] == 'trou':
+            trous.append(obj)
+        else:
+            autres.append(obj)
+    return plots, trous, autres
+
+def create_mask_from_polygons(cube_shape, polygons, dilate_radius=3):
+    _, H, W = cube_shape
+    mask = np.zeros((H, W), dtype=np.uint8)
+    for poly in polygons:
+        pts = np.array(poly, dtype=np.int32)
+        cv2.fillPoly(mask, [pts], 1)
+    mask = dilation(mask, disk(dilate_radius))
+    return mask.astype(bool)
+
+def remove_objects_and_interpolate(cube, polygons_to_remove, keep_mask):
+    bands, H, W = cube.shape
+    remove_mask = create_mask_from_polygons(cube.shape, polygons_to_remove)
+    mask_to_clear = remove_mask & (~keep_mask)
+    cube_clean = cube.copy()
+    for b in range(bands):
+        band = cube[b]
+        inpainted = cv2.inpaint((band*255).astype(np.uint8),
+                                mask_to_clear.astype(np.uint8), 3, cv2.INPAINT_TELEA)
+        cube_clean[b] = inpainted.astype(np.float32)/255
+    return cube_clean
+
+def process_plot_cube(cube_path, json_path, output_path, dilate_radius=3):
+    spec = SpecArray.from_folder(cube_path.parent)
+    cube = np.array(spec.spectral_albedo).transpose(1,0,2)
+    plots, trous, autres = load_annotations(json_path)
+    trous_mask = create_mask_from_polygons(cube.shape, [t['polygon'] for t in trous], dilate_radius=0)
+    polygons_to_remove = [obj['polygon'] for obj in autres]
+    cube_clean = remove_objects_and_interpolate(cube, polygons_to_remove, keep_mask=trous_mask)
+    meta = spec.metadata.copy()
+    meta['lines'] = cube_clean.shape[1]
+    meta['samples'] = cube_clean.shape[2]
+    meta['bands'] = cube_clean.shape[0]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    envi.save_image(str(output_path), cube_clean, dtype=np.float32, force=True, interleave='bil', metadata=meta)
+
+    plots_mask = np.zeros((cube_clean.shape[1], cube_clean.shape[2]), dtype=np.uint8)
+    for plot in plots:
+        x1, y1, x2, y2 = plot['bbox']
+        plots_mask[y1:y2, x1:x2] = 1
+
+    plt.figure(figsize=(8,8))
+    plt.imshow(plots_mask, cmap='jet')
+    plt.title(f"Plots cartographie - {cube_path.stem}")
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(output_path.parent / f"{cube_path.stem}_plots_map.png")
+    plt.close()
+    return plots, cube_clean
