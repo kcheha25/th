@@ -206,8 +206,8 @@ import json
 import matplotlib.pyplot as plt
 from specarray import SpecArray
 import spectral.io.envi as envi
-from scipy.ndimage import median_filter
 import cv2
+from scipy.ndimage import generic_filter
 
 def load_labelme(json_path):
     with open(json_path) as f:
@@ -233,17 +233,26 @@ def build_mask(H, W, polygons):
         cv2.fillPoly(mask, [poly], 1)
     return mask.astype(bool)
 
-def fill_zero_by_local_median(cube, mask, size=5):
+def fill_zeros_iterative(cube, mask, window_size=3):
     B, H, W = cube.shape
     cube_filled = cube.copy()
+    kernel_size = window_size*2+1
+
     for b in range(B):
-        band = cube[b]
-        med = median_filter(band, size=size)
-        band[mask] = med[mask]
+        band = cube_filled[b]
+        mask_band = mask.copy()
+        while np.any(band[mask_band] == 0):
+            def median_nonzero(vals):
+                vals = vals[vals>0]
+                if len(vals) == 0:
+                    return 0
+                return np.median(vals)
+            band_filled = generic_filter(band, median_nonzero, size=kernel_size, mode='mirror')
+            band[mask_band & (band==0)] = band_filled[mask_band & (band==0)]
         cube_filled[b] = band
     return cube_filled
 
-def process_cube(cube_folder, json_path, out_dir, median_size=5):
+def process_cube(cube_folder, json_path, out_dir, window_size=3):
     spec = SpecArray.from_folder(cube_folder)
     cube = np.array(spec.spectral_albedo).transpose(1,0,2)
     B, H, W = cube.shape
@@ -251,10 +260,11 @@ def process_cube(cube_folder, json_path, out_dir, median_size=5):
     plots, polygons_to_remove = load_labelme(json_path)
     remove_mask = build_mask(H, W, polygons_to_remove)
     cube[:, remove_mask] = 0
-    cube_filled = fill_zero_by_local_median(cube, remove_mask, size=median_size)
+    cube_filled = fill_zeros_iterative(cube, remove_mask, window_size=window_size)
     i1 = np.argmin(np.abs(wavelengths - 996))
     i2 = np.argmin(np.abs(wavelengths - 1197))
     ratio = cube_filled[i1] / (cube_filled[i2] + 1e-8)
+
     for i, (x1, y1, x2, y2) in enumerate(plots):
         plot_cube = cube_filled[:, y1:y2, x1:x2]
         meta = spec.metadata.copy()
@@ -272,7 +282,7 @@ def process_cube(cube_folder, json_path, out_dir, median_size=5):
         plt.close()
         print("Plot sauvegardé :", hdr_path.name)
 
-def process_all(hsi_root, ann_root, out_dir, median_size=5):
+def process_all(hsi_root, ann_root, out_dir, window_size=3):
     hsi_root = Path(hsi_root)
     ann_root = Path(ann_root)
     out_dir = Path(out_dir)
@@ -284,9 +294,9 @@ def process_all(hsi_root, ann_root, out_dir, median_size=5):
         if not json_path.exists():
             print("JSON manquant :", cube_folder.name)
             continue
-        process_cube(cube_folder, json_path, out_dir, median_size=median_size)
+        process_cube(cube_folder, json_path, out_dir, window_size=window_size)
 
 hsi_root = "ann/hsi_cube"
 ann_root = "ann"
 out_dir = "plots_output"
-process_all(hsi_root, ann_root, out_dir, median_size=5)
+process_all(hsi_root, ann_root, out_dir, window_size=3)
