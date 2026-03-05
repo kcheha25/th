@@ -345,35 +345,57 @@ from scipy.ndimage import distance_transform_edt
 
 from scipy.ndimage import uniform_filter
 
-def fill_with_mean_spectrum(cube, mask, radius=5):
+def fill_with_mean_spectrum(cube, mask, radius=5, max_iter=100):
     """
-    Remplace chaque pixel masqué par le spectre moyen de son voisinage.
-    
-    cube   : (B, H, W) float32
-    mask   : (H, W) bool — True = pixels à remplir (valeur 0)
-    radius : demi-taille de la fenêtre de voisinage (fenêtre = 2*radius+1)
+    Remplace itérativement chaque pixel masqué par le spectre moyen de son voisinage,
+    jusqu'à ce que tous les pixels soient remplis.
+
+    cube     : (B, H, W) float32
+    mask     : (H, W) bool — True = pixels à remplir
+    radius   : demi-taille de la fenêtre de voisinage (fenêtre = 2*radius+1)
+    max_iter : sécurité pour éviter une boucle infinie
     """
     filled = cube.copy()
     size = 2 * radius + 1
 
-    # Masque des pixels valides (non masqués)
-    valid = (~mask).astype(np.float32)  # 1 = valide, 0 = masqué
+    # Masque courant — se réduit à chaque itération
+    remaining_mask = mask.copy()
 
-    # Somme des pixels valides dans la fenêtre
-    valid_count = uniform_filter(valid, size=size, mode='reflect') * (size * size)
-    valid_count = np.maximum(valid_count, 1)  # éviter division par zéro
+    for iteration in range(max_iter):
+        n_remaining = np.sum(remaining_mask)
+        if n_remaining == 0:
+            print(f"✓ Terminé en {iteration} itérations")
+            break
 
-    for b in range(cube.shape[0]):
-        band = filled[b].copy()
-        band[mask] = 0  # s'assurer que les pixels masqués ne contribuent pas
+        print(f"  iter {iteration+1} — pixels restants : {n_remaining}")
 
-        # Somme locale des valeurs valides
-        band_sum = uniform_filter(band, size=size, mode='reflect') * (size * size)
+        # Pixels valides = non masqués dans l'état courant
+        valid = (~remaining_mask).astype(np.float32)
+        valid_count = uniform_filter(valid, size=size, mode='reflect') * (size * size)
 
-        # Moyenne locale sur les pixels valides uniquement
-        mean_neighborhood = band_sum / valid_count
+        # Pixels masqués qui ont AU MOINS un voisin valide
+        has_valid_neighbor = valid_count > 0
+        fillable = remaining_mask & has_valid_neighbor
 
-        # Remplacement uniquement sur les pixels masqués
-        filled[b][mask] = mean_neighborhood[mask]
+        if not np.any(fillable):
+            print(f"⚠ Plus de voisins valides accessibles après {iteration} itérations — augmentez radius")
+            break
+
+        valid_count_safe = np.maximum(valid_count, 1)
+
+        for b in range(filled.shape[0]):
+            band = filled[b].copy()
+            band[remaining_mask] = 0  # les pixels pas encore remplis ne contribuent pas
+
+            band_sum = uniform_filter(band, size=size, mode='reflect') * (size * size)
+            mean_neighborhood = band_sum / valid_count_safe
+
+            filled[b][fillable] = mean_neighborhood[fillable]
+
+        # Mettre à jour le masque : retirer les pixels qu'on vient de remplir
+        remaining_mask[fillable] = False
+
+    else:
+        print(f"⚠ max_iter={max_iter} atteint, pixels restants : {np.sum(remaining_mask)}")
 
     return filled
