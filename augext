@@ -134,30 +134,36 @@ import spectral.io.envi as envi
 from skimage.morphology import dilation, disk
 import matplotlib.pyplot as plt
 
-def load_annotations(json_path):
+def load_labelme_annotations(json_path):
     with open(json_path, 'r') as f:
         data = json.load(f)
     plots = []
     holes = []
-    for obj in data['objects']:
-        if obj['class'] == 'plot':
-            plots.append(obj)
-        elif obj['class'] == 'trou':
-            holes.append(obj)
-    return plots, holes
+    other_shapes = []
+    for obj in data['shapes']:
+        label = obj['label']
+        points = obj['points']
+        if label == 'plot':
+            plots.append({'label': label, 'points': points})
+        elif label == 'trou':
+            holes.append({'label': label, 'points': points})
+        else:
+            other_shapes.append({'label': label, 'points': points})
+    return plots, holes, other_shapes
 
-def create_mask_from_polygons(cube_shape, polygons, dilate_radius=3):
+def create_mask_from_shapes(cube_shape, shapes, dilate_radius=3):
     _, H, W = cube_shape
     mask = np.zeros((H, W), dtype=np.uint8)
-    for poly in polygons:
-        pts = np.array(poly, dtype=np.int32)
-        cv2.fillPoly(mask, [pts], 1)
+    for s in shapes:
+        pts = np.array(s['points'], dtype=np.int32)
+        if pts.ndim == 2:
+            cv2.fillPoly(mask, [pts], 1)
     mask = dilation(mask, disk(dilate_radius))
     return mask.astype(bool)
 
-def remove_extrudes_and_interpolate(cube, polygons_to_remove):
+def remove_shapes_and_interpolate(cube, shapes_to_remove):
     bands, H, W = cube.shape
-    remove_mask = create_mask_from_polygons(cube.shape, polygons_to_remove)
+    remove_mask = create_mask_from_shapes(cube.shape, shapes_to_remove)
     cube_clean = cube.copy()
     for b in range(bands):
         band = cube[b]
@@ -166,13 +172,12 @@ def remove_extrudes_and_interpolate(cube, polygons_to_remove):
         cube_clean[b] = inpainted.astype(np.float32)/255
     return cube_clean
 
-def process_all_cubes(hsi_root, ann_root, output_root, dilate_radius=3):
+def process_all_cubes_labelme(hsi_root, ann_root, output_root, dilate_radius=3):
     hsi_root = Path(hsi_root)
     ann_root = Path(ann_root)
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    # Parcourir tous les dossiers contenant les cubes
     for cube_folder in hsi_root.iterdir():
         if not cube_folder.is_dir():
             continue
@@ -181,8 +186,9 @@ def process_all_cubes(hsi_root, ann_root, output_root, dilate_radius=3):
             print(f"⚠ JSON manquant pour {cube_folder.name}, skipping")
             continue
 
-        plots, holes = load_annotations(json_file)
-        extrudes_to_remove = [obj['polygon'] for obj in plots]
+        plots, holes, other_shapes = load_labelme_annotations(json_file)
+        # Supprimer toutes les classes sauf 'trou'
+        shapes_to_remove = other_shapes
 
         cube_paths = list(cube_folder.glob("*.hdr")) + list(cube_folder.glob("*.raw"))
 
@@ -190,7 +196,7 @@ def process_all_cubes(hsi_root, ann_root, output_root, dilate_radius=3):
             spec = SpecArray.from_folder(cube_path.parent)
             cube = np.array(spec.spectral_albedo).transpose(1,0,2)  # (B,H,W)
 
-            cube_clean = remove_extrudes_and_interpolate(cube, extrudes_to_remove)
+            cube_clean = remove_shapes_and_interpolate(cube, shapes_to_remove)
 
             meta = spec.metadata.copy()
             meta['lines'] = cube_clean.shape[1]
@@ -200,14 +206,14 @@ def process_all_cubes(hsi_root, ann_root, output_root, dilate_radius=3):
             out_cube_path = output_root / f"{cube_path.stem}_clean.hdr"
             envi.save_image(str(out_cube_path), cube_clean, dtype=np.float32, force=True, interleave='bil', metadata=meta)
 
-            # Cartographie des plots
+            # Visualisation des plots (rectangles)
             plots_map = np.zeros((cube_clean.shape[1], cube_clean.shape[2]), dtype=np.uint8)
             for plot in plots:
-                x1, y1, x2, y2 = plot['bbox']
-                plots_map[y1:y2, x1:x2] = 1
+                pts = np.array(plot['points'], dtype=np.int32)
+                cv2.fillPoly(plots_map, [pts], 1)
 
             plt.figure(figsize=(6,6))
-            plt.imshow(plots_map, cmap='gray')
+            plt.imshow(plots_map, cmap='Reds')
             plt.title(f"Plots map - {cube_path.stem}")
             plt.axis('off')
             plt.savefig(output_root / f"{cube_path.stem}_plots_map.png")
@@ -215,9 +221,9 @@ def process_all_cubes(hsi_root, ann_root, output_root, dilate_radius=3):
 
             print(f"✔ Cube traité : {cube_path.name}, sauvegardé : {out_cube_path.name}")
 
-# Utilisation automatique
+# Utilisation
 hsi_root = "ann/hsi_cube"
 ann_root = "ann"
 output_root = "output/plots_clean"
 
-process_all_cubes(hsi_root, ann_root, output_root)
+process_all_cubes_labelme(hsi_root, ann_root, output_root)
