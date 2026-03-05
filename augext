@@ -134,36 +134,38 @@ import spectral.io.envi as envi
 from skimage.morphology import dilation, disk
 import matplotlib.pyplot as plt
 
-def load_labelme_annotations(json_path):
+WL1 = 996
+WL2 = 1197
+
+def load_annotations_labelme(json_path):
     with open(json_path, 'r') as f:
         data = json.load(f)
     plots = []
     holes = []
-    other_shapes = []
-    for obj in data['shapes']:
-        label = obj['label']
-        points = obj['points']
+    extrudes = []
+    for shape in data['shapes']:
+        label = shape['label']
+        points = shape['points']
         if label == 'plot':
-            plots.append({'label': label, 'points': points})
+            plots.append({'bbox': points})
         elif label == 'trou':
-            holes.append({'label': label, 'points': points})
+            holes.append({'polygon': points})
         else:
-            other_shapes.append({'label': label, 'points': points})
-    return plots, holes, other_shapes
+            extrudes.append({'polygon': points})
+    return plots, holes, extrudes
 
-def create_mask_from_shapes(cube_shape, shapes, dilate_radius=3):
+def create_mask_from_polygons(cube_shape, polygons, dilate_radius=3):
     _, H, W = cube_shape
     mask = np.zeros((H, W), dtype=np.uint8)
-    for s in shapes:
-        pts = np.array(s['points'], dtype=np.int32)
-        if pts.ndim == 2:
-            cv2.fillPoly(mask, [pts], 1)
+    for poly in polygons:
+        pts = np.array(poly, dtype=np.int32)
+        cv2.fillPoly(mask, [pts], 1)
     mask = dilation(mask, disk(dilate_radius))
     return mask.astype(bool)
 
-def remove_shapes_and_interpolate(cube, shapes_to_remove):
+def remove_polygons_and_interpolate(cube, polygons_to_remove):
     bands, H, W = cube.shape
-    remove_mask = create_mask_from_shapes(cube.shape, shapes_to_remove)
+    remove_mask = create_mask_from_polygons(cube.shape, polygons_to_remove)
     cube_clean = cube.copy()
     for b in range(bands):
         band = cube[b]
@@ -172,7 +174,13 @@ def remove_shapes_and_interpolate(cube, shapes_to_remove):
         cube_clean[b] = inpainted.astype(np.float32)/255
     return cube_clean
 
-def process_all_cubes_labelme(hsi_root, ann_root, output_root, dilate_radius=3):
+def compute_ratio(cube, wl1_idx, wl2_idx):
+    b1 = cube[wl1_idx]
+    b2 = cube[wl2_idx]
+    r = b1 / (b2 + 1e-8)
+    return r
+
+def process_all_cubes(hsi_root, ann_root, output_root, dilate_radius=3):
     hsi_root = Path(hsi_root)
     ann_root = Path(ann_root)
     output_root = Path(output_root)
@@ -183,47 +191,63 @@ def process_all_cubes_labelme(hsi_root, ann_root, output_root, dilate_radius=3):
             continue
         json_file = ann_root / f"{cube_folder.name}.json"
         if not json_file.exists():
-            print(f"⚠ JSON manquant pour {cube_folder.name}, skipping")
+            print(f"⚠ JSON manquant pour {cube_folder.name}")
             continue
 
-        plots, holes, other_shapes = load_labelme_annotations(json_file)
-        # Supprimer toutes les classes sauf 'trou'
-        shapes_to_remove = other_shapes
+        plots, holes, extrudes = load_annotations_labelme(json_file)
+        extrudes_to_remove = [e['polygon'] for e in extrudes]
 
-        cube_paths = list(cube_folder.glob("*.hdr")) + list(cube_folder.glob("*.raw"))
+        cube_paths = list(cube_folder.glob("*.hdr"))
 
         for cube_path in cube_paths:
-            spec = SpecArray.from_folder(cube_path.parent)
+            spec = SpecArray.from_file(cube_path)
             cube = np.array(spec.spectral_albedo).transpose(1,0,2)  # (B,H,W)
 
-            cube_clean = remove_shapes_and_interpolate(cube, shapes_to_remove)
+            # Supprimer extrudes
+            cube_clean = remove_polygons_and_interpolate(cube, extrudes_to_remove)
 
-            meta = spec.metadata.copy()
-            meta['lines'] = cube_clean.shape[1]
-            meta['samples'] = cube_clean.shape[2]
-            meta['bands'] = cube_clean.shape[0]
-
-            out_cube_path = output_root / f"{cube_path.stem}_clean.hdr"
-            envi.save_image(str(out_cube_path), cube_clean, dtype=np.float32, force=True, interleave='bil', metadata=meta)
-
-            # Visualisation des plots (rectangles)
-            plots_map = np.zeros((cube_clean.shape[1], cube_clean.shape[2]), dtype=np.uint8)
-            for plot in plots:
-                pts = np.array(plot['points'], dtype=np.int32)
-                cv2.fillPoly(plots_map, [pts], 1)
+            # Carte de ratio globale (résine)
+            wl_idx1 = int(np.argmin(np.abs(np.array(spec.wavelengths) - WL1)))
+            wl_idx2 = int(np.argmin(np.abs(np.array(spec.wavelengths) - WL2)))
+            ratio_map = compute_ratio(cube_clean, wl_idx1, wl_idx2)
 
             plt.figure(figsize=(6,6))
-            plt.imshow(plots_map, cmap='Reds')
-            plt.title(f"Plots map - {cube_path.stem}")
+            plt.imshow(ratio_map, cmap='gray')
+            plt.title(f"Ratio Resine - {cube_path.stem}")
             plt.axis('off')
-            plt.savefig(output_root / f"{cube_path.stem}_plots_map.png")
+            plt.savefig(output_root / f"{cube_path.stem}_resine_ratio.png")
             plt.close()
 
-            print(f"✔ Cube traité : {cube_path.name}, sauvegardé : {out_cube_path.name}")
+            # Croper et sauvegarder chaque plot
+            for i, plot in enumerate(plots):
+                pts = np.array(plot['bbox'], dtype=np.int32)
+                x_min, y_min = pts.min(axis=0)
+                x_max, y_max = pts.max(axis=0)
+                x_min, y_min = int(x_min), int(y_min)
+                x_max, y_max = int(x_max), int(y_max)
+
+                cube_plot = cube_clean[:, y_min:y_max, x_min:x_max]
+                meta = spec.metadata.copy()
+                meta['lines'] = cube_plot.shape[1]
+                meta['samples'] = cube_plot.shape[2]
+                meta['bands'] = cube_plot.shape[0]
+
+                out_path = output_root / f"{cube_path.stem}_plot_{i}.hdr"
+                envi.save_image(str(out_path), cube_plot, dtype=np.float32, force=True, interleave='bil', metadata=meta)
+
+                # Carte ratio pour le plot
+                ratio_plot = compute_ratio(cube_plot, wl_idx1, wl_idx2)
+                plt.figure(figsize=(4,4))
+                plt.imshow(ratio_plot, cmap='gray')
+                plt.title(f"Plot {i} - {cube_path.stem}")
+                plt.axis('off')
+                plt.savefig(output_root / f"{cube_path.stem}_plot_{i}_ratio.png")
+                plt.close()
+
+            print(f"✔ Cube traité : {cube_path.name}, {len(plots)} plots sauvegardés")
 
 # Utilisation
 hsi_root = "ann/hsi_cube"
 ann_root = "ann"
-output_root = "output/plots_clean"
-
-process_all_cubes_labelme(hsi_root, ann_root, output_root)
+output_root = "output/plots_augmented"
+process_all_cubes(hsi_root, ann_root, output_root)
