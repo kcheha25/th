@@ -84,48 +84,6 @@ for cube_dir in DATA_ROOT.iterdir():
 
 
 import numpy as np
-import matplotlib.pyplot as plt
-from pathlib import Path
-
-PLOTS_DIR = Path("output_plots")
-WL1 = 900
-WL2 = 1100
-MAX_PLOTS = 10
-
-def find_nearest_idx(target, arr):
-    return np.argmin(np.abs(arr - target))
-
-def compute_ratio(cube, wavelengths):
-    i1 = find_nearest_idx(WL1, wavelengths)
-    i2 = find_nearest_idx(WL2, wavelengths)
-    band1 = cube[:, i1, :]
-    band2 = cube[:, i2, :]
-    ratio = band1 / (band2 + 1e-8)
-    ratio_norm = (ratio - ratio.min()) / (ratio.max() - ratio.min())
-    return ratio_norm
-
-plot_files = list(PLOTS_DIR.glob("*/*.hdr"))[:MAX_PLOTS]
-
-for hdr_file in plot_files:
-    img = envi.open(str(hdr_file))
-    cube = np.array(img.load())  # shape (bands, rows, cols)
-    cube = np.transpose(cube, (1,0,2))  # (rows, bands, cols)
-    
-    if 'wavelength' in img.metadata:
-        wavelengths = np.array([float(w) for w in img.metadata['wavelength']])
-    else:
-        bands = cube.shape[1]
-        wavelengths = np.linspace(400, 1100, bands)
-    
-    ratio_map = compute_ratio(cube, wavelengths)
-    plt.figure(figsize=(6,4))
-    plt.imshow(ratio_map, cmap='gray', aspect='auto')
-    plt.title(f"Ratio {WL1}nm/{WL2}nm - {hdr_file.stem}")
-    plt.axis('off')
-    plt.show()
-
-
-import numpy as np
 from pathlib import Path
 import json
 import cv2
@@ -133,124 +91,99 @@ import matplotlib.pyplot as plt
 from specarray import SpecArray
 import spectral.io.envi as envi
 
-
 def load_labelme(json_path):
-
     with open(json_path) as f:
         data = json.load(f)
-
     plots = []
     polygons_to_remove = []
-
+    holes = []
     for shape in data["shapes"]:
-
         label = shape["label"]
         pts = np.array(shape["points"], dtype=np.int32)
-
         if label == "plot":
-
             x1 = int(np.min(pts[:,0]))
             x2 = int(np.max(pts[:,0]))
             y1 = int(np.min(pts[:,1]))
             y2 = int(np.max(pts[:,1]))
-
             plots.append((x1,y1,x2,y2))
-
-        elif label != "trou":
-
+        elif label == "trou":
+            holes.append(pts)
+        else:
             polygons_to_remove.append(pts)
-
-    return plots, polygons_to_remove
-
+    return plots, polygons_to_remove, holes
 
 def build_mask(H,W,polygons):
-
-    mask = np.zeros((H,W),dtype=np.uint8)
-
+    mask = np.zeros((H,W),dtype=bool)
     for poly in polygons:
         cv2.fillPoly(mask,[poly],1)
+    return mask
 
-    return mask.astype(bool)
+def fill_with_median(cube, mask_to_fill, holes_mask, window_size=3):
+    bands, H, W = cube.shape
+    cube_filled = cube.copy()
+    ys, xs = np.where(mask_to_fill)
+    for y, x in zip(ys, xs):
+        y0 = max(0, y-window_size)
+        y1 = min(H, y+window_size+1)
+        x0 = max(0, x-window_size)
+        x1 = min(W, x+window_size+1)
+        neighborhood_mask = ~mask_to_fill[y0:y1, x0:x1] & ~holes_mask[y0:y1, x0:x1]
+        if np.any(neighborhood_mask):
+            # prendre le spectre médian parmi les voisins valides
+            neighbor_spectra = cube[:, y0:y1, x0:x1][:, neighborhood_mask]
+            median_spectrum = np.median(neighbor_spectra, axis=1)
+            cube_filled[:, y, x] = median_spectrum
+    return cube_filled
 
-
-def process_cube(cube_folder,json_path,out_dir):
-
+def process_cube(cube_folder,json_path,out_dir,window_size=3):
     spec = SpecArray.from_folder(cube_folder)
-
-    cube = np.array(spec.spectral_albedo)
-    cube = cube.transpose(1,0,2)
-
+    cube = np.array(spec.spectral_albedo).transpose(1,0,2)
     B,H,W = cube.shape
-
     wavelengths = np.array(spec.wavelengths)
 
-    plots,polygons = load_labelme(json_path)
+    plots, polygons_to_remove, holes = load_labelme(json_path)
 
-    remove_mask = build_mask(H,W,polygons)
+    remove_mask = build_mask(H,W,polygons_to_remove)
+    holes_mask = build_mask(H,W,holes)
+    mask_to_fill = remove_mask.copy()  # zone à remplacer
+    mask_to_fill[holes_mask] = False  # ne pas toucher aux trous
 
-    cube[:,remove_mask] = 0
+    cube_filled = fill_with_median(cube, mask_to_fill, holes_mask, window_size=window_size)
 
     i1 = np.argmin(np.abs(wavelengths-996))
     i2 = np.argmin(np.abs(wavelengths-1197))
-
-    ratio = cube[i1] / (cube[i2] + 1e-8)
+    ratio = cube_filled[i1] / (cube_filled[i2]+1e-8)
 
     for i,(x1,y1,x2,y2) in enumerate(plots):
-
-        plot_cube = cube[:,y1:y2,x1:x2]
-
+        plot_cube = cube_filled[:,y1:y2,x1:x2]
         meta = spec.metadata.copy()
         meta["lines"] = plot_cube.shape[1]
         meta["samples"] = plot_cube.shape[2]
         meta["bands"] = plot_cube.shape[0]
 
         hdr_path = out_dir / f"{cube_folder.name}_plot_{i}.hdr"
-
-        envi.save_image(
-            str(hdr_path),
-            plot_cube,
-            dtype=np.float32,
-            interleave="bil",
-            force=True,
-            metadata=meta
-        )
+        envi.save_image(str(hdr_path), plot_cube, dtype=np.float32, interleave="bil", force=True, metadata=meta)
 
         ratio_plot = ratio[y1:y2,x1:x2]
-
         plt.figure(figsize=(5,5))
         plt.imshow(ratio_plot,cmap="inferno")
         plt.axis("off")
         plt.title(f"{cube_folder.name} plot {i}")
         plt.savefig(out_dir/f"{cube_folder.name}_plot_{i}_ratio.png")
         plt.close()
-
         print("plot sauvegardé :",hdr_path.name)
 
-
-def process_all(hsi_root,ann_root,out_dir):
-
+def process_all(hsi_root,ann_root,out_dir,window_size=3):
     hsi_root = Path(hsi_root)
     ann_root = Path(ann_root)
     out_dir = Path(out_dir)
-
     out_dir.mkdir(parents=True,exist_ok=True)
-
     for cube_folder in hsi_root.iterdir():
-
-        if not cube_folder.is_dir():
-            continue
-
+        if not cube_folder.is_dir(): continue
         json_path = ann_root / f"{cube_folder.name}.json"
-
         if not json_path.exists():
             print("json manquant :",cube_folder.name)
             continue
+        process_cube(cube_folder,json_path,out_dir,window_size=window_size)
 
-        process_cube(cube_folder,json_path,out_dir)
-
-
-process_all(
-    "ann/hsi_cube",
-    "ann",
-    "plots_output"
-)
+process_all("ann/hsi_cube","ann","plots_output",window_size=3)
