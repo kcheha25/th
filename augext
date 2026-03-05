@@ -343,18 +343,37 @@ def process_all(hsi_root, ann_root, out_dir, dilate_radius=3):
 
 from scipy.ndimage import distance_transform_edt
 
-def fill_black_pixels_nn(cube, mask):
+from scipy.ndimage import uniform_filter
+
+def fill_with_mean_spectrum(cube, mask, radius=5):
     """
-    cube  : (B, H, W) float32
-    mask  : (H, W) bool — True = pixels à remplir (valeur 0)
-    retourne le cube avec les pixels interpolés
+    Remplace chaque pixel masqué par le spectre moyen de son voisinage.
+    
+    cube   : (B, H, W) float32
+    mask   : (H, W) bool — True = pixels à remplir (valeur 0)
+    radius : demi-taille de la fenêtre de voisinage (fenêtre = 2*radius+1)
     """
     filled = cube.copy()
-    # Pour chaque pixel masqué, trouver le pixel valide le plus proche
-    # distance_transform_edt retourne aussi l'indice du voisin le plus proche
-    _, nearest_idx = distance_transform_edt(mask, return_indices=True)
+    size = 2 * radius + 1
+
+    # Masque des pixels valides (non masqués)
+    valid = (~mask).astype(np.float32)  # 1 = valide, 0 = masqué
+
+    # Somme des pixels valides dans la fenêtre
+    valid_count = uniform_filter(valid, size=size, mode='reflect') * (size * size)
+    valid_count = np.maximum(valid_count, 1)  # éviter division par zéro
+
     for b in range(cube.shape[0]):
-        band = filled[b]
-        band[mask] = band[nearest_idx[0][mask], nearest_idx[1][mask]]
-        filled[b] = band
+        band = filled[b].copy()
+        band[mask] = 0  # s'assurer que les pixels masqués ne contribuent pas
+
+        # Somme locale des valeurs valides
+        band_sum = uniform_filter(band, size=size, mode='reflect') * (size * size)
+
+        # Moyenne locale sur les pixels valides uniquement
+        mean_neighborhood = band_sum / valid_count
+
+        # Remplacement uniquement sur les pixels masqués
+        filled[b][mask] = mean_neighborhood[mask]
+
     return filled
