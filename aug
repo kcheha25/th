@@ -30,6 +30,19 @@ def spectral_ratio_map(cube, metadata):
     plt.title("Ratio 996 / 1197 nm")
     plt.show()
 
+def load_labelme_rectangles(json_path):
+    with open(json_path) as f:
+        data = json.load(f)
+    rects = []
+    for shape in data["shapes"]:
+        if shape["shape_type"] != "rectangle":
+            continue
+        p1, p2 = shape["points"]
+        x1, y1 = int(p1[0]), int(p1[1])
+        x2, y2 = int(p2[0]), int(p2[1])
+        rects.append((x1, y1, x2, y2))
+    return rects
+
 def load_labelme_polygons(json_path):
     with open(json_path) as f:
         data = json.load(f)
@@ -37,9 +50,20 @@ def load_labelme_polygons(json_path):
     for shape in data["shapes"]:
         if shape["shape_type"] != "polygon":
             continue
-        points = shape["points"]
-        polygons.append(points)
+        polygons.append(shape["points"])
     return polygons
+
+def crop_plots_from_cube(cube, rectangles):
+    plots = []
+    for rect in rectangles:
+        x1, y1, x2, y2 = rect
+        xmin = min(x1, x2)
+        xmax = max(x1, x2)
+        ymin = min(y1, y2)
+        ymax = max(y1, y2)
+        plot_cube = cube[ymin:ymax, :, xmin:xmax]  # toutes les bandes
+        plots.append(plot_cube)
+    return plots
 
 def polygon_bbox(poly):
     xs = [p[0] for p in poly]
@@ -64,6 +88,21 @@ def contour_pixels(mask):
                     contour.append([float(x), float(y)])
                     break
     return contour
+
+def load_base_plots(annotation_folder):
+    base_plots = []
+    hsi_folder = os.path.join(annotation_folder, "hsi_cube")
+    metadata = None
+    for cube_name in os.listdir(hsi_folder):
+        cube_folder = os.path.join(hsi_folder, cube_name)
+        json_path = os.path.join(annotation_folder, cube_name + ".json")
+        if not os.path.exists(json_path):
+            continue
+        cube, metadata = load_cube(cube_folder)
+        rects = load_labelme_rectangles(json_path)
+        plots = crop_plots_from_cube(cube, rects)
+        base_plots.extend(plots)
+    return base_plots, metadata
 
 def load_augmented_extrudes(aug_folder):
     extrudes = []
@@ -126,17 +165,18 @@ def save_envi_cube(file_path, cube, metadata):
         force=True
     )
 
-def generate_augmented_dataset(base_folder, aug_folder, output_folder, metadata):
-    os.makedirs(output_folder, exist_ok=True)
-    base_cubes = [f for f in os.listdir(base_folder) if f.endswith(".hdr")]
+def generate_augmented_dataset(annotation_folder, aug_folder, output_folder):
+    base_plots, metadata = load_base_plots(annotation_folder)
     extrudes = load_augmented_extrudes(aug_folder)
+    hsi_folder = os.path.join(annotation_folder, "hsi_cube")
+    os.makedirs(output_folder, exist_ok=True)
     cube_id = 0
 
-    for base_file in base_cubes:
-        base_path = os.path.join(base_folder, base_file)
-        cube_envi = envi.open(base_path)
+    for cube_name in os.listdir(hsi_folder):
+        cube_path = os.path.join(hsi_folder, cube_name)
+        cube_envi = envi.open(cube_path)
         cube = cube_envi.load().astype(np.float32)
-        json_path = os.path.join(base_folder, Path(base_file).stem + ".json")
+        json_path = os.path.join(annotation_folder, cube_name + ".json")
         polygons = load_labelme_polygons(json_path)
         H, B, W = cube.shape
         shapes = []
@@ -144,16 +184,21 @@ def generate_augmented_dataset(base_folder, aug_folder, output_folder, metadata)
         for poly in polygons:
             x0, y0, x1, y1 = polygon_bbox(poly)
             poly_area = (x1 - x0) * (y1 - y0)
-            # sélection aléatoire d'extrude de la même classe
-            candidates = [e for e in extrudes if e["class"] == Path(base_file).stem.split("_")[0]]
+            candidates = [e for e in extrudes if e["class"] == "class_name_ici"]  # ajuster selon classe
             if not candidates:
+                shapes.append({
+                    "label": "original",
+                    "points": poly,
+                    "group_id": None,
+                    "shape_type": "polygon",
+                    "flags": {}
+                })
                 continue
             ext = random.choice(candidates)
             ext_H, ext_W = ext["H"], ext["W"]
             ext_area = ext_H * ext_W
-            # remplacer uniquement si extrude couvrant polygon
             if ext_area >= poly_area:
-                patch = extract_patch(ext["cube"], y1-y0, x1-x0)
+                patch = extract_patch(ext["cube"], y1 - y0, x1 - x0)
                 cube[y0:y1, :, x0:x1] = patch
                 mask = np.any(patch != 0, axis=1)
                 new_poly = contour_pixels(mask)
@@ -174,8 +219,8 @@ def generate_augmented_dataset(base_folder, aug_folder, output_folder, metadata)
                     "flags": {}
                 })
 
-        cube_path = os.path.join(output_folder, f"cube_{cube_id}")
-        save_envi_cube(cube_path, cube, metadata)
+        cube_out_path = os.path.join(output_folder, f"cube_{cube_id}")
+        save_envi_cube(cube_out_path, cube, metadata)
         save_labelme(os.path.join(output_folder, f"cube_{cube_id}.json"), shapes, cube.shape)
         spectral_ratio_map(cube, metadata)
         cube_id += 1
