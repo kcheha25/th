@@ -214,3 +214,30 @@ def generate_augmented_dataset(annotation_folder, aug_folder, output_folder):
         save_labelme(os.path.join(output_folder, f"cube_{cube_id}.json"), shapes, cube.shape)
         spectral_ratio_map(cube, metadata)
         cube_id += 1
+
+x0, y0, x1, y1 = polygon_bbox(poly)
+real_H, real_W = y1 - y0, x1 - x0
+
+candidates = [e for e in extrudes if e["cube"].shape[0] >= real_H and e["cube"].shape[2] >= real_W]
+if candidates:
+    ext = random.choice(candidates)
+    patch = extract_patch(ext["cube"], real_H, real_W)
+    cube[y0:y1, :, x0:x1] = patch
+    mask = np.any(patch != 0, axis=1)
+    new_poly = contour_pixels(mask)
+    new_poly_offset = offset_polygon(new_poly, x0, y0)
+    shapes.append({
+        "label": "augmented",
+        "points": new_poly_offset,
+        "group_id": None,
+        "shape_type": "polygon",
+        "flags": {}
+    })
+else:
+    shapes.append({
+        "label": "original",
+        "points": poly,
+        "group_id": None,
+        "shape_type": "polygon",
+        "flags": {}
+    })
