@@ -121,11 +121,11 @@ def load_augmented_extrudes(aug_folder):
             H, B, W = cube.shape
             extrudes.append({
                 "cube": cube,
-                "class": class_name,
                 "polygon": polygon,
                 "H": H,
                 "W": W
             })
+    random.shuffle(extrudes)
     return extrudes
 
 def extract_patch(source_cube, h, w):
@@ -183,28 +183,18 @@ def generate_augmented_dataset(annotation_folder, aug_folder, output_folder):
 
         for poly in polygons:
             x0, y0, x1, y1 = polygon_bbox(poly)
-            poly_area = (x1 - x0) * (y1 - y0)
-            candidates = [e for e in extrudes if e["class"] == "class_name_ici"]  # ajuster selon classe
-            if not candidates:
-                shapes.append({
-                    "label": "original",
-                    "points": poly,
-                    "group_id": None,
-                    "shape_type": "polygon",
-                    "flags": {}
-                })
-                continue
-            ext = random.choice(candidates)
-            ext_H, ext_W = ext["H"], ext["W"]
-            ext_area = ext_H * ext_W
-            if ext_area >= poly_area:
-                patch = extract_patch(ext["cube"], y1 - y0, x1 - x0)
+            real_H, real_W = y1 - y0, x1 - x0
+
+            candidates = [e for e in extrudes if e["H"] >= real_H and e["W"] >= real_W]
+            if candidates:
+                ext = random.choice(candidates)
+                patch = extract_patch(ext["cube"], real_H, real_W)
                 cube[y0:y1, :, x0:x1] = patch
                 mask = np.any(patch != 0, axis=1)
                 new_poly = contour_pixels(mask)
                 new_poly_offset = offset_polygon(new_poly, x0, y0)
                 shapes.append({
-                    "label": ext["class"],
+                    "label": "augmented",
                     "points": new_poly_offset,
                     "group_id": None,
                     "shape_type": "polygon",
@@ -224,34 +214,3 @@ def generate_augmented_dataset(annotation_folder, aug_folder, output_folder):
         save_labelme(os.path.join(output_folder, f"cube_{cube_id}.json"), shapes, cube.shape)
         spectral_ratio_map(cube, metadata)
         cube_id += 1
-
-
-for poly_data in polygons:
-    poly_points = poly_data["points"]
-    label = poly_data.get("label", "original")
-    x0, y0, x1, y1 = polygon_bbox(poly_points)
-    poly_h, poly_w = y1 - y0, x1 - x0
-
-    candidates = [e for e in extrudes if e["class"] == label and e["H"] >= poly_h and e["W"] >= poly_w]
-    if candidates:
-        ext = random.choice(candidates)
-        patch = extract_patch(ext["cube"], poly_h, poly_w)
-        cube[y0:y1, :, x0:x1] = patch
-        mask = np.any(patch != 0, axis=1)
-        new_poly = contour_pixels(mask)
-        new_poly_offset = offset_polygon(new_poly, x0, y0)
-        shapes.append({
-            "label": ext["class"],
-            "points": new_poly_offset,
-            "group_id": None,
-            "shape_type": "polygon",
-            "flags": {}
-        })
-    else:
-        shapes.append({
-            "label": label,
-            "points": poly_points,
-            "group_id": None,
-            "shape_type": "polygon",
-            "flags": {}
-        })
