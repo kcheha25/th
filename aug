@@ -96,21 +96,29 @@ def contour_pixels(mask):
                     break
     return contour
 
-def load_augmented_extrudes(folder):
+import spectral.io.envi as envi
+import numpy as np
+import random
+
+def load_augmented_extrudes(aug_folder):
     extrudes = []
-    for file in os.listdir(folder):
-        if not file.endswith(".npy"):
+    for class_name in os.listdir(aug_folder):
+        class_folder = os.path.join(aug_folder, class_name)
+        if not os.path.isdir(class_folder):
             continue
-        cube = np.load(os.path.join(folder, file))
-        cube = trim_null_borders(cube)
-        mask = np.any(cube != 0, axis=2)
-        polygon = contour_pixels(mask)
-        class_name = file.split("_")[0]
-        extrudes.append({
-            "cube": cube,
-            "class": class_name,
-            "polygon": polygon
-        })
+        for file in os.listdir(class_folder):
+            if not file.endswith(".hdr"):
+                continue
+            hdr_path = os.path.join(class_folder, file)
+            cube_envi = envi.open(hdr_path)
+            cube = cube_envi.load().astype(np.float32)  # cube shape (lines, bands, samples)
+            mask = np.any(cube != 0, axis=1)  # bandes = axis 1
+            polygon = contour_pixels(mask)
+            extrudes.append({
+                "cube": cube,
+                "class": class_name,
+                "polygon": polygon
+            })
     random.shuffle(extrudes)
     return extrudes
 
