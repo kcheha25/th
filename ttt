@@ -1,0 +1,756 @@
+"""
+Spectral WGAN-GP Application
+- Visualisation des cubes hyperspectraux avec cartographie de ratio
+- Dessin de rectangles ROI sur les images
+- Extraction des spectres depuis les ROI
+- Entraînement d'un WGAN-GP par classe
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import threading
+import queue
+import os
+from pathlib import Path
+from collections import defaultdict
+
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.patches import Rectangle
+from matplotlib.widgets import RectangleSelector
+import matplotlib.colors as mcolors
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.autograd as autograd
+from torch.utils.data import Dataset, DataLoader, Subset
+
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+WL1 = 900
+WL2 = 1197
+
+# WGAN-GP hyper-params
+NZ         = 100
+LR         = 1e-4
+N_CRITIC   = 5
+P_COEFF    = 10
+EPOCH_NUM  = 200
+BATCH_SIZE = 64
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ─────────────────────────────────────────────
+# SPECARRAY STUB  (remplacer par votre import réel)
+# ─────────────────────────────────────────────
+try:
+    from specarray import SpecArray          # votre bibliothèque
+except ImportError:
+    class SpecArray:                          # stub minimal pour tests sans données
+        @staticmethod
+        def from_folder(folder):
+            raise RuntimeError(
+                "La bibliothèque 'specarray' n'est pas installée. "
+                "Remplacez ce stub par votre import réel."
+            )
+
+# ─────────────────────────────────────────────
+# UTILITIES
+# ─────────────────────────────────────────────
+def find_nearest_idx(target, arr):
+    return int(np.argmin(np.abs(arr - target)))
+
+def compute_ratio(cube_HBW, wavelengths):
+    """cube shape: (H, B, W)"""
+    i1 = find_nearest_idx(WL1, wavelengths)
+    i2 = find_nearest_idx(WL2, wavelengths)
+    b1 = cube_HBW[:, i1, :]
+    b2 = cube_HBW[:, i2, :]
+    r  = b1 / (b2 + 1e-8)
+    rmin, rmax = r.min(), r.max()
+    if rmax > rmin:
+        r = (r - rmin) / (rmax - rmin)
+    return r  # (H, W)
+
+# ─────────────────────────────────────────────
+# DATASET  (extraction depuis rectangles ROI)
+# ─────────────────────────────────────────────
+class ROISpectralDataset(Dataset):
+    """
+    Construit un dataset de spectres extraits depuis des ROI (rectangles)
+    définis sur des cubes hyperspectraux.
+
+    rois : liste de dict  {
+        'cube'  : np.ndarray (H, B, W),
+        'rect'  : (row0, col0, row1, col1),  # en pixels image
+        'label' : int
+    }
+    null_threshold  : variance minimale d'un spectre pour être gardé
+    deriv_threshold : seuil sur les dérivées (filtre spectres plats)
+    flat_ratio      : proportion max de bandes "plates" tolérée
+    """
+    def __init__(self, rois, null_threshold=1e-6,
+                 deriv_threshold=1e-4, flat_ratio=0.3):
+        self.samples    = []
+        self.class_names= {}
+
+        for roi in rois:
+            cube  = roi['cube']           # (H, B, W)
+            r0, c0, r1, c1 = roi['rect']
+            label = roi['label']
+            cname = roi.get('class_name', f"class_{label}")
+            self.class_names[label] = cname
+
+            # Extraction des pixels dans le rectangle
+            patch = cube[r0:r1, :, c0:c1]   # (dH, B, dW)
+            dH, B, dW = patch.shape
+            spectra = patch.reshape(dH * dW, B)
+
+            for s in spectra:
+                if np.var(s) <= null_threshold:
+                    continue
+                d    = np.diff(s)
+                flat = np.mean(np.abs(d) < deriv_threshold)
+                if flat > flat_ratio:
+                    continue
+                s_norm = 2.0 * s - 1.0
+                self.samples.append(
+                    (torch.tensor(s_norm, dtype=torch.float32), label)
+                )
+
+        print(f"[ROISpectralDataset] {len(self.samples)} spectres extraits")
+        for lid, lname in self.class_names.items():
+            n = sum(1 for _, l in self.samples if l == lid)
+            print(f"  classe {lid} ({lname}): {n} spectres")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+    @property
+    def n_bands(self):
+        if self.samples:
+            return self.samples[0][0].shape[0]
+        return 0
+
+
+def create_class_dataloaders(dataset, batch_size=64):
+    class_indices = defaultdict(list)
+    for i, (_, label) in enumerate(dataset):
+        class_indices[label].append(i)
+    loaders = {}
+    for label, indices in class_indices.items():
+        subset  = Subset(dataset, indices)
+        loaders[label] = DataLoader(
+            subset, batch_size=batch_size, shuffle=True, drop_last=True
+        )
+    return loaders
+
+# ─────────────────────────────────────────────
+# WGAN-GP ARCHITECTURES
+# ─────────────────────────────────────────────
+def weights_init(m):
+    if isinstance(m, (nn.Conv1d, nn.ConvTranspose1d)):
+        nn.init.normal_(m.weight, 0.0, 0.02)
+    elif isinstance(m, nn.BatchNorm1d):
+        nn.init.normal_(m.weight, 1.0, 0.02)
+        nn.init.constant_(m.bias, 0)
+
+class Generator(nn.Module):
+    def __init__(self, nz, n_bands):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.ConvTranspose1d(nz, 512, 4, 1, 0, bias=False),
+            nn.BatchNorm1d(512), nn.ReLU(True),
+            nn.ConvTranspose1d(512, 256, 4, 2, 1, bias=False),
+            nn.BatchNorm1d(256), nn.ReLU(True),
+            nn.ConvTranspose1d(256, 128, 4, 2, 1, bias=False),
+            nn.BatchNorm1d(128), nn.ReLU(True),
+            nn.ConvTranspose1d(128,  64, 4, 2, 1, bias=False),
+            nn.BatchNorm1d(64),  nn.ReLU(True),
+            nn.ConvTranspose1d( 64,   1, 4, 2, 1, bias=False),
+            nn.Tanh()
+        )
+        self._n_bands = n_bands
+
+    def forward(self, z):
+        x = self.net(z)                        # (B, 1, L)
+        return x[:, :, :self._n_bands]
+
+class Discriminator(nn.Module):
+    def __init__(self, n_bands):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(  1,  64, 4, 2, 1, bias=False), nn.LeakyReLU(0.2, True),
+            nn.Conv1d( 64, 128, 4, 2, 1, bias=False), nn.LeakyReLU(0.2, True),
+            nn.Conv1d(128, 256, 4, 2, 1, bias=False), nn.LeakyReLU(0.2, True),
+            nn.Conv1d(256, 512, 4, 2, 1, bias=False), nn.LeakyReLU(0.2, True),
+            nn.Conv1d(512,   1, 4, 1, 0, bias=False)
+        )
+
+    def forward(self, x):
+        return self.net(x).mean(dim=[1, 2])
+
+def compute_metrics(real, fake):
+    real_np = real.detach().cpu().numpy().reshape(real.size(0), -1)
+    fake_np = fake.detach().cpu().numpy().reshape(fake.size(0), -1)
+    mse = float(np.mean((real_np - fake_np) ** 2))
+    # Pearson on means
+    r_m = real_np.mean(axis=0); f_m = fake_np.mean(0)
+    num = np.sum((real_np - r_m) * (fake_np - f_m))
+    den = np.sqrt(np.sum((real_np - r_m)**2) * np.sum((fake_np - f_m)**2)) + 1e-8
+    pearson = float(num / den)
+    # SAM
+    dot  = np.sum(real_np * fake_np, axis=1)
+    nr   = np.linalg.norm(real_np, axis=1) + 1e-8
+    nf   = np.linalg.norm(fake_np, axis=1) + 1e-8
+    sam  = float(np.mean(np.arccos(np.clip(dot / (nr * nf), -1, 1))))
+    return {'MSE': mse, 'Pearson': pearson, 'SAM': sam}
+
+# ─────────────────────────────────────────────
+# TRAINING FUNCTION  (runs in a thread)
+# ─────────────────────────────────────────────
+def train_single_class(loader, n_bands, class_name, out_dir,
+                       log_queue, stop_event):
+    """Entraîne un WGAN-GP sur une classe. Envoie les logs dans log_queue."""
+    netD = Discriminator(n_bands).to(DEVICE)
+    netG = Generator(NZ, n_bands).to(DEVICE)
+    netD.apply(weights_init)
+    netG.apply(weights_init)
+
+    optD = optim.Adam(netD.parameters(), lr=LR, betas=(0, 0.9))
+    optG = optim.Adam(netG.parameters(), lr=LR, betas=(0, 0.9))
+
+    fixed_noise = torch.randn(16, NZ, 1, device=DEVICE)
+    best_sam, best_G, best_D = float('inf'), None, None
+
+    out = Path(out_dir) / class_name
+    out.mkdir(parents=True, exist_ok=True)
+
+    for epoch in range(EPOCH_NUM):
+        if stop_event.is_set():
+            log_queue.put(f"[{class_name}] Entraînement interrompu à l'epoch {epoch}.")
+            break
+        epoch_metrics = {'MSE': [], 'Pearson': [], 'SAM': []}
+
+        for data in loader:
+            real = data[0].to(DEVICE)
+            if real.dim() == 2:
+                real = real.unsqueeze(1)
+            b = real.size(0)
+
+            for _ in range(N_CRITIC):
+                netD.zero_grad()
+                noise = torch.randn(b, NZ, 1, device=DEVICE)
+                fake  = netG(noise)
+                eps   = torch.rand(b, 1, 1, device=DEVICE)
+                xp    = eps * real + (1 - eps) * fake
+                xp.requires_grad_(True)
+                grad  = autograd.grad(netD(xp).sum(), xp,
+                                      create_graph=True, retain_graph=True)[0]
+                gp    = P_COEFF * ((grad.view(b,-1).norm(2,dim=1)-1)**2).mean()
+                lD    = torch.mean(netD(fake)) - torch.mean(netD(real)) + gp
+                lD.backward()
+                optD.step()
+
+            netG.zero_grad()
+            noise = torch.randn(b, NZ, 1, device=DEVICE)
+            fake  = netG(noise)
+            lG    = -torch.mean(netD(fake))
+            lG.backward()
+            optG.step()
+
+            m = compute_metrics(real, fake)
+            for k in epoch_metrics:
+                epoch_metrics[k].append(m[k])
+
+        avg = {k: float(np.mean(v)) for k, v in epoch_metrics.items()}
+        msg = (f"[{class_name}] Epoch {epoch:03d} | "
+               f"D:{lD.item():.4f} G:{lG.item():.4f} | "
+               f"MSE:{avg['MSE']:.4f} Pearson:{avg['Pearson']:.4f} SAM:{avg['SAM']:.4f}")
+        log_queue.put(msg)
+
+        if avg['SAM'] < best_sam:
+            best_sam = avg['SAM']
+            best_G = {k: v.cpu().clone() for k, v in netG.state_dict().items()}
+            best_D = {k: v.cpu().clone() for k, v in netD.state_dict().items()}
+
+        if (epoch + 1) % 50 == 0:
+            torch.save(netG.state_dict(), out / f"netG_epoch_{epoch:03d}.pth")
+            torch.save(netD.state_dict(), out / f"netD_epoch_{epoch:03d}.pth")
+
+    torch.save(best_G, out / "netG_best.pth")
+    torch.save(best_D, out / "netD_best.pth")
+    log_queue.put(f"[{class_name}] ✓ Terminé. Best SAM={best_sam:.4f}. Modèles sauvegardés dans {out}")
+
+# ─────────────────────────────────────────────
+# MAIN APPLICATION
+# ─────────────────────────────────────────────
+class SpectralApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Spectral WGAN-GP — Cartographie & Entraînement")
+        self.geometry("1400x900")
+        self.configure(bg="#1e1e2e")
+        self._style()
+
+        # State
+        self.cubes       = []      # list of {name, cube(H,B,W), wavelengths, ratio(H,W)}
+        self.current_idx = 0
+        self.rois        = []      # list of {cube_idx, rect(r0,c0,r1,c1), label, class_name, color}
+        self.roi_patches = []      # matplotlib patches
+        self._drawing    = False
+        self._rect_start = None
+        self._temp_rect  = None
+        self.pending_class_name = tk.StringVar(value="class_0")
+
+        self.log_queue   = queue.Queue()
+        self.stop_event  = threading.Event()
+        self.train_threads = []
+
+        self._build_ui()
+        self._poll_log()
+
+    # ── Style ──────────────────────────────────────────────────────────────
+    def _style(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        bg, fg, acc = "#1e1e2e", "#cdd6f4", "#89b4fa"
+        s.configure(".",        background=bg, foreground=fg, font=("Segoe UI", 10))
+        s.configure("TFrame",   background=bg)
+        s.configure("TLabel",   background=bg, foreground=fg)
+        s.configure("TButton",  background="#313244", foreground=fg, padding=6)
+        s.configure("TEntry",   fieldbackground="#313244", foreground=fg)
+        s.configure("TCombobox",fieldbackground="#313244", foreground=fg)
+        s.configure("TNotebook",background=bg, tabmargins=0)
+        s.configure("TNotebook.Tab", background="#313244", foreground=fg, padding=[12,4])
+        s.map("TNotebook.Tab", background=[("selected", acc)], foreground=[("selected","#1e1e2e")])
+        s.configure("TLabelframe", background=bg, foreground=acc)
+        s.configure("TLabelframe.Label", background=bg, foreground=acc)
+        s.configure("Treeview", background="#313244", foreground=fg,
+                    fieldbackground="#313244", rowheight=22)
+        s.map("Treeview", background=[("selected", acc)])
+
+    # ── UI Construction ───────────────────────────────────────────────────
+    def _build_ui(self):
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self.tab_view  = ttk.Frame(nb)
+        self.tab_train = ttk.Frame(nb)
+        nb.add(self.tab_view,  text="  📊  Visualisation  ")
+        nb.add(self.tab_train, text="  🤖  Entraînement  ")
+
+        self._build_view_tab()
+        self._build_train_tab()
+
+    # ── Visualisation Tab ─────────────────────────────────────────────────
+    def _build_view_tab(self):
+        p = self.tab_view
+
+        # Left panel
+        left = ttk.Frame(p, width=240)
+        left.pack(side="left", fill="y", padx=(6,0), pady=6)
+        left.pack_propagate(False)
+
+        ttk.Label(left, text="Cubes chargés", font=("Segoe UI",10,"bold")).pack(pady=(0,4))
+        self.cube_list = tk.Listbox(left, bg="#313244", fg="#cdd6f4", selectmode="single",
+                                    font=("Consolas",9), relief="flat", bd=0)
+        self.cube_list.pack(fill="both", expand=True)
+        self.cube_list.bind("<<ListboxSelect>>", self._on_cube_select)
+
+        ttk.Button(left, text="📂 Ouvrir dossier de cubes",
+                   command=self._load_cubes).pack(fill="x", pady=(6,2))
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=8)
+
+        ttk.Label(left, text="ROI — Nom de classe :").pack(anchor="w")
+        ttk.Entry(left, textvariable=self.pending_class_name).pack(fill="x")
+        ttk.Button(left, text="✏️  Mode dessin ROI",
+                   command=self._toggle_draw_mode).pack(fill="x", pady=(4,2))
+        ttk.Button(left, text="🗑  Effacer dernier ROI",
+                   command=self._delete_last_roi).pack(fill="x", pady=2)
+        ttk.Button(left, text="🗑  Effacer tous les ROI",
+                   command=self._clear_rois).pack(fill="x", pady=2)
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=8)
+
+        ttk.Label(left, text="ROI définis :").pack(anchor="w")
+        self.roi_tree = ttk.Treeview(left, columns=("cube","class","rect"),
+                                     show="headings", height=8)
+        self.roi_tree.heading("cube",  text="Cube")
+        self.roi_tree.heading("class", text="Classe")
+        self.roi_tree.heading("rect",  text="Rect")
+        self.roi_tree.column("cube",  width=60)
+        self.roi_tree.column("class", width=60)
+        self.roi_tree.column("rect",  width=90)
+        self.roi_tree.pack(fill="both", expand=True)
+
+        # Draw mode indicator
+        self.draw_mode_var = tk.StringVar(value="Mode: Navigation")
+        ttk.Label(left, textvariable=self.draw_mode_var,
+                  font=("Segoe UI",9,"italic"), foreground="#a6e3a1").pack(pady=(4,0))
+
+        # Right: matplotlib canvas
+        right = ttk.Frame(p)
+        right.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+
+        self.fig, self.ax = plt.subplots(figsize=(9, 7),
+                                         facecolor="#1e1e2e")
+        self.ax.set_facecolor("#181825")
+        self.ax.set_title("Aucun cube chargé", color="#cdd6f4")
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, right)
+        self.toolbar.update()
+
+        self.canvas.mpl_connect("button_press_event",   self._on_press)
+        self.canvas.mpl_connect("motion_notify_event",  self._on_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_release)
+
+    # ── Training Tab ──────────────────────────────────────────────────────
+    def _build_train_tab(self):
+        p = self.tab_train
+
+        top = ttk.Frame(p)
+        top.pack(fill="x", padx=10, pady=8)
+
+        ttk.Label(top, text="Dossier de sortie :").grid(row=0, column=0, sticky="w")
+        self.out_dir_var = tk.StringVar(value="./results")
+        ttk.Entry(top, textvariable=self.out_dir_var, width=40).grid(row=0, column=1, padx=6)
+        ttk.Button(top, text="📁", command=self._pick_outdir).grid(row=0, column=2)
+
+        # Hyper-params
+        params = ttk.LabelFrame(p, text="Hyper-paramètres")
+        params.pack(fill="x", padx=10, pady=4)
+        labels = ["Epochs","Batch size","nz","lr","n_critic","lambda_gp"]
+        defaults = [str(EPOCH_NUM), str(BATCH_SIZE), str(NZ),
+                    str(LR), str(N_CRITIC), str(P_COEFF)]
+        self.hp_vars = {}
+        for i,(l,d) in enumerate(zip(labels,defaults)):
+            ttk.Label(params, text=l+":").grid(row=i//3, column=(i%3)*2,
+                                                padx=6, pady=3, sticky="e")
+            v = tk.StringVar(value=d)
+            ttk.Entry(params, textvariable=v, width=10).grid(
+                row=i//3, column=(i%3)*2+1, padx=4, pady=3)
+            self.hp_vars[l] = v
+
+        # Classes summary
+        cls_frame = ttk.LabelFrame(p, text="Classes / ROI")
+        cls_frame.pack(fill="x", padx=10, pady=4)
+        self.cls_info = tk.Text(cls_frame, height=4, bg="#313244", fg="#cdd6f4",
+                                font=("Consolas",9), state="disabled", relief="flat")
+        self.cls_info.pack(fill="x", padx=4, pady=4)
+
+        btn_row = ttk.Frame(p)
+        btn_row.pack(padx=10, pady=6, fill="x")
+        ttk.Button(btn_row, text="🔄 Mettre à jour le résumé ROI",
+                   command=self._update_cls_info).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="🚀 Lancer l'entraînement",
+                   command=self._start_training).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="⏹  Arrêter",
+                   command=self._stop_training).pack(side="left", padx=4)
+
+        # Log
+        log_frame = ttk.LabelFrame(p, text="Logs d'entraînement")
+        log_frame.pack(fill="both", expand=True, padx=10, pady=6)
+        self.log_text = tk.Text(log_frame, bg="#181825", fg="#a6e3a1",
+                                font=("Consolas",9), state="disabled", relief="flat")
+        sb = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.log_text.pack(fill="both", expand=True)
+
+    # ── Cube loading ──────────────────────────────────────────────────────
+    def _load_cubes(self):
+        folder = filedialog.askdirectory(title="Sélectionner le dossier racine des cubes")
+        if not folder:
+            return
+        root = Path(folder)
+        loaded = 0
+        errors = []
+        for sub in sorted(root.iterdir()):
+            if not sub.is_dir():
+                continue
+            try:
+                spec       = SpecArray.from_folder(str(sub))
+                cube       = np.array(spec.spectral_albedo)   # (H, B, W)
+                wavelengths= np.array(spec.wavelengths)
+                ratio      = compute_ratio(cube, wavelengths)
+                self.cubes.append({
+                    "name"       : sub.name,
+                    "cube"       : cube,
+                    "wavelengths": wavelengths,
+                    "ratio"      : ratio,
+                    "path"       : str(sub)
+                })
+                self.cube_list.insert("end", sub.name)
+                loaded += 1
+            except Exception as e:
+                errors.append(f"{sub.name}: {e}")
+
+        if errors:
+            messagebox.showwarning("Erreurs de chargement",
+                                   "\n".join(errors[:10]))
+        if loaded:
+            self.current_idx = 0
+            self._show_cube(0)
+            messagebox.showinfo("Cubes chargés", f"{loaded} cube(s) chargé(s).")
+
+    def _on_cube_select(self, event):
+        sel = self.cube_list.curselection()
+        if sel:
+            self._show_cube(sel[0])
+
+    def _show_cube(self, idx):
+        if idx >= len(self.cubes):
+            return
+        self.current_idx = idx
+        c = self.cubes[idx]
+        self.ax.clear()
+        self.ax.set_facecolor("#181825")
+        self.ax.imshow(c["ratio"], cmap="RdYlGn", aspect="auto",
+                       vmin=0, vmax=1)
+        self.ax.set_title(
+            f"{c['name']}  —  Ratio {WL1}nm / {WL2}nm",
+            color="#cdd6f4", fontsize=11
+        )
+        self.ax.tick_params(colors="#585b70")
+        for spine in self.ax.spines.values():
+            spine.set_edgecolor("#585b70")
+        # Redraw existing ROIs for this cube
+        for roi in self.rois:
+            if roi["cube_idx"] == idx:
+                self._draw_roi_patch(roi)
+        self.canvas.draw()
+
+    # ── ROI drawing ───────────────────────────────────────────────────────
+    COLORS = list(mcolors.TABLEAU_COLORS.values())
+
+    def _toggle_draw_mode(self):
+        self._drawing = not self._drawing
+        if self._drawing:
+            self.draw_mode_var.set("Mode: ✏️  Dessin ROI")
+            self.toolbar.mode = ""          # disable pan/zoom while drawing
+        else:
+            self.draw_mode_var.set("Mode: Navigation")
+
+    def _on_press(self, event):
+        if not self._drawing or event.inaxes != self.ax:
+            return
+        self._rect_start = (event.xdata, event.ydata)
+
+    def _on_motion(self, event):
+        if not self._drawing or not self._rect_start or event.inaxes != self.ax:
+            return
+        x0, y0 = self._rect_start
+        x1, y1 = event.xdata, event.ydata
+        if self._temp_rect:
+            self._temp_rect.remove()
+        self._temp_rect = Rectangle(
+            (min(x0,x1), min(y0,y1)),
+            abs(x1-x0), abs(y1-y0),
+            linewidth=1.5, edgecolor="#f38ba8",
+            facecolor="none", linestyle="--"
+        )
+        self.ax.add_patch(self._temp_rect)
+        self.canvas.draw_idle()
+
+    def _on_release(self, event):
+        if not self._drawing or not self._rect_start or event.inaxes != self.ax:
+            self._rect_start = None
+            return
+        if self._temp_rect:
+            self._temp_rect.remove()
+            self._temp_rect = None
+
+        x0, y0 = self._rect_start
+        x1, y1 = event.xdata, event.ydata
+        self._rect_start = None
+
+        if abs(x1-x0) < 2 or abs(y1-y0) < 2:
+            self.canvas.draw_idle()
+            return
+
+        # Convert display coords (x=col, y=row) to array indices
+        c_idx = self.current_idx
+        c = self.cubes[c_idx]
+        H, _, W = c["cube"].shape
+
+        col0 = max(0, int(round(min(x0, x1))))
+        col1 = min(W, int(round(max(x0, x1))))
+        row0 = max(0, int(round(min(y0, y1))))
+        row1 = min(H, int(round(max(y0, y1))))
+
+        cname = self.pending_class_name.get().strip() or f"class_{len(self.rois)}"
+        color = self.COLORS[len(self.rois) % len(self.COLORS)]
+
+        roi = {
+            "cube_idx"  : c_idx,
+            "rect"      : (row0, col0, row1, col1),
+            "label"     : self._label_for_class(cname),
+            "class_name": cname,
+            "color"     : color
+        }
+        self.rois.append(roi)
+        self._draw_roi_patch(roi)
+        self._add_roi_tree_row(roi)
+        self.canvas.draw()
+
+    def _label_for_class(self, name):
+        existing = {r["class_name"]: r["label"] for r in self.rois}
+        if name in existing:
+            return existing[name]
+        return max((r["label"] for r in self.rois), default=-1) + 1
+
+    def _draw_roi_patch(self, roi):
+        r0, c0, r1, c1 = roi["rect"]
+        patch = Rectangle(
+            (c0, r0), c1-c0, r1-r0,
+            linewidth=2, edgecolor=roi["color"],
+            facecolor=roi["color"], alpha=0.15, label=roi["class_name"]
+        )
+        self.ax.add_patch(patch)
+        self.ax.text(
+            c0+2, r0+2, roi["class_name"],
+            color=roi["color"], fontsize=7,
+            va="top", ha="left",
+            bbox=dict(boxstyle="round,pad=0.2", fc="#1e1e2e", alpha=0.7)
+        )
+        self.roi_patches.append(patch)
+
+    def _add_roi_tree_row(self, roi):
+        r0, c0, r1, c1 = roi["rect"]
+        cname = self.cubes[roi["cube_idx"]]["name"]
+        self.roi_tree.insert("", "end",
+                             values=(cname, roi["class_name"],
+                                     f"({r0},{c0})-({r1},{c1})"))
+
+    def _delete_last_roi(self):
+        if not self.rois:
+            return
+        self.rois.pop()
+        rows = self.roi_tree.get_children()
+        if rows:
+            self.roi_tree.delete(rows[-1])
+        self._show_cube(self.current_idx)
+
+    def _clear_rois(self):
+        self.rois.clear()
+        self.roi_patches.clear()
+        for row in self.roi_tree.get_children():
+            self.roi_tree.delete(row)
+        self._show_cube(self.current_idx)
+
+    # ── Training ──────────────────────────────────────────────────────────
+    def _pick_outdir(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.out_dir_var.set(d)
+
+    def _update_cls_info(self):
+        if not self.rois:
+            text = "Aucun ROI défini."
+        else:
+            counts = defaultdict(int)
+            for roi in self.rois:
+                counts[roi["class_name"]] += 1
+            lines = ["ROI définis :"]
+            for cname, n in counts.items():
+                lines.append(f"  • {cname} : {n} rectangle(s)")
+            text = "\n".join(lines)
+        self.cls_info.configure(state="normal")
+        self.cls_info.delete("1.0","end")
+        self.cls_info.insert("end", text)
+        self.cls_info.configure(state="disabled")
+
+    def _log(self, msg):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", msg + "\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _poll_log(self):
+        try:
+            while True:
+                msg = self.log_queue.get_nowait()
+                self._log(msg)
+        except queue.Empty:
+            pass
+        self.after(200, self._poll_log)
+
+    def _start_training(self):
+        if not self.rois:
+            messagebox.showwarning("Pas de ROI", "Dessinez d'abord des rectangles ROI.")
+            return
+
+        # Parse hyper-params
+        try:
+            ep  = int(self.hp_vars["Epochs"].get())
+            bs  = int(self.hp_vars["Batch size"].get())
+            nz  = int(self.hp_vars["nz"].get())
+            lr_ = float(self.hp_vars["lr"].get())
+            nc  = int(self.hp_vars["n_critic"].get())
+            lam = float(self.hp_vars["lambda_gp"].get())
+        except ValueError:
+            messagebox.showerror("Paramètre invalide",
+                                 "Vérifiez les valeurs des hyper-paramètres.")
+            return
+
+        # Patch globals used inside train_single_class
+        global EPOCH_NUM, BATCH_SIZE, NZ, LR, N_CRITIC, P_COEFF
+        EPOCH_NUM, BATCH_SIZE, NZ, LR, N_CRITIC, P_COEFF = ep, bs, nz, lr_, nc, lam
+
+        # Build ROI dataset
+        roi_dicts = []
+        for roi in self.rois:
+            roi_dicts.append({
+                "cube"      : self.cubes[roi["cube_idx"]]["cube"],
+                "rect"      : roi["rect"],
+                "label"     : roi["label"],
+                "class_name": roi["class_name"]
+            })
+
+        dataset = ROISpectralDataset(roi_dicts)
+        if len(dataset) == 0:
+            messagebox.showerror("Dataset vide",
+                                 "Aucun spectre valide extrait des ROI.")
+            return
+
+        n_bands = dataset.n_bands
+        loaders = create_class_dataloaders(dataset, batch_size=bs)
+        out_dir = self.out_dir_var.get()
+
+        self.stop_event.clear()
+        self._log(f"=== Démarrage de l'entraînement | {len(loaders)} classe(s) | "
+                  f"{len(dataset)} spectres | {n_bands} bandes | device={DEVICE} ===")
+
+        for label, loader in loaders.items():
+            cname = dataset.class_names.get(label, f"class_{label}")
+            t = threading.Thread(
+                target=train_single_class,
+                args=(loader, n_bands, cname, out_dir,
+                      self.log_queue, self.stop_event),
+                daemon=True
+            )
+            t.start()
+            self.train_threads.append(t)
+
+    def _stop_training(self):
+        self.stop_event.set()
+        self._log("⏹  Signal d'arrêt envoyé. L'entraînement s'arrêtera à la fin de l'epoch en cours.")
+
+
+# ─────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    app = SpectralApp()
+    app.mainloop()
