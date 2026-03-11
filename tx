@@ -1,499 +1,575 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from spectral import envi
 from pathlib import Path
-
-def plot_mean_std_for_cube(cube_path, null_threshold=1e-6):
-    cube_path = Path(cube_path)
-    class_name = cube_path.stem.split("_")[0]
-    hdr_img = envi.open(str(cube_path))
-    cube = np.array(hdr_img.load(), dtype=np.float32)
-    B, H, W = cube.shape
-    spectra = cube.reshape(B, -1).T
-    valid_spectra = np.array([s for s in spectra if np.var(s) > null_threshold])
-    if len(valid_spectra) == 0:
-        return
-    mean_spec = np.mean(valid_spectra, axis=0)
-    std_spec = np.std(valid_spectra, axis=0)
-    plt.figure(figsize=(10,5))
-    plt.plot(mean_spec, linewidth=2)
-    plt.plot(mean_spec + std_spec, linestyle="--")
-    plt.plot(mean_spec - std_spec, linestyle="--")
-    plt.title(f"{class_name} - {cube_path.stem}")
-    plt.xlabel("Indice bande")
-    plt.ylabel("Reflectance")
-    plt.tight_layout()
-    plt.show()
-
-def plot_all_extrudes(dataset_root):
-    dataset_root = Path(dataset_root)
-    hdr_files = sorted(dataset_root.rglob("*.hdr"))
-    for cube_path in hdr_files:
-        plot_mean_std_for_cube(cube_path)
-
-import numpy as np
+import json
+import cv2
+import torch
 import matplotlib.pyplot as plt
-from spectral import envi
-from pathlib import Path
-from collections import defaultdict
+from specarray import SpecArray
+import spectral.io.envi as envi
+from skimage.morphology import dilation, disk
 
-def compute_mean_std_cube(cube_path, null_threshold=1e-6):
-    cube_path = Path(cube_path)
-    class_name = cube_path.stem.split("_")[0]
-    hdr_img = envi.open(str(cube_path))
-    cube = np.array(hdr_img.load(), dtype=np.float32)
+
+# ─────────────────────────────────────────────
+# UTILS MASK
+# ─────────────────────────────────────────────
+def load_labelme(json_path):
+    with open(json_path) as f:
+        data = json.load(f)
+    plots, polygons_to_remove = [], []
+    for shape in data["shapes"]:
+        label = shape["label"]
+        pts   = np.array(shape["points"], dtype=np.int32)
+        if label == "plot":
+            x1 = int(np.min(pts[:,0])); x2 = int(np.max(pts[:,0]))
+            y1 = int(np.min(pts[:,1])); y2 = int(np.max(pts[:,1]))
+            plots.append((x1, y1, x2, y2))
+        elif label != "trou":
+            polygons_to_remove.append(pts)
+    return plots, polygons_to_remove
+
+def build_mask(H, W, polygons, dilate_radius=3):
+    mask = np.zeros((H, W), dtype=np.uint8)
+    for poly in polygons:
+        cv2.fillPoly(mask, [poly], 1)
+    mask = dilation(mask, disk(dilate_radius))
+    return mask.astype(bool)
+
+
+# ─────────────────────────────────────────────
+# VOISINS REELS autour d un pixel masqué
+# ─────────────────────────────────────────────
+def get_real_neighbors(cube, remove_mask, row, col,
+                       n_neighbors=5, search_radius=10):
+    """
+    Retourne jusqu'à n_neighbors spectres réels (non masqués)
+    dans un carré de search_radius autour de (row, col).
+    cube : (B, H, W)
+    """
     B, H, W = cube.shape
-    spectra = cube.reshape(B, -1).T
-    valid_spectra = np.array([s for s in spectra if np.var(s) > null_threshold])
-    if len(valid_spectra) == 0:
-        return class_name, None, None
-    mean_spec = np.mean(valid_spectra, axis=0)
-    std_spec = np.std(valid_spectra, axis=0)
-    return class_name, mean_spec, std_spec
+    r0 = max(0, row - search_radius)
+    r1 = min(H, row + search_radius + 1)
+    c0 = max(0, col - search_radius)
+    c1 = min(W, col + search_radius + 1)
 
-def plot_all_extrudes_and_overlay_by_class(dataset_root, null_threshold=1e-6):
-    dataset_root = Path(dataset_root)
-    hdr_files = sorted(dataset_root.rglob("*.hdr"))
-    class_means = defaultdict(list)
+    neighbors = []
+    for r in range(r0, r1):
+        for c in range(c0, c1):
+            if not remove_mask[r, c] and np.var(cube[:, r, c]) > 1e-6:
+                neighbors.append(cube[:, r, c])
 
-    for cube_path in hdr_files:
-        class_name, mean_spec, std_spec = compute_mean_std_cube(cube_path, null_threshold)
-        if mean_spec is None:
-            continue
+    if not neighbors:
+        return None
 
-        plt.figure(figsize=(8,4))
-        plt.plot(mean_spec, linewidth=2)
-        plt.plot(mean_spec + std_spec, linestyle="--")
-        plt.plot(mean_spec - std_spec, linestyle="--")
-        plt.title(f"{class_name} - {cube_path.stem}")
-        plt.xlabel("Indice bande")
-        plt.ylabel("Reflectance")
-        plt.tight_layout()
-        plt.show()
-
-        class_means[class_name].append(mean_spec)
-
-    for class_name, means in class_means.items():
-        plt.figure(figsize=(10,5))
-        for mean_spec in means:
-            plt.plot(mean_spec)
-        plt.title(f"Superposition des spectres moyens - {class_name}")
-        plt.xlabel("Indice bande")
-        plt.ylabel("Reflectance")
-        plt.tight_layout()
-        plt.show()
+    neighbors = np.array(neighbors)          # (N, B)
+    # tirage aléatoire de n_neighbors parmi les voisins disponibles
+    idx = np.random.choice(len(neighbors),
+                           size=min(n_neighbors, len(neighbors)),
+                           replace=False)
+    return neighbors[idx]                    # (k, B)
 
 
-import numpy as np
-import matplotlib.pyplot as plt
-from spectral import envi
-from pathlib import Path
-
-def plot_radial_spectra_for_cube(cube_path, null_threshold=1e-6):
-    cube_path = Path(cube_path)
-    class_name = cube_path.stem.split("_")[0]
-
-    hdr_img = envi.open(str(cube_path))
-    cube = np.array(hdr_img.load(), dtype=np.float32)
-    B, H, W = cube.shape
-
-    mask = np.var(cube, axis=0) > null_threshold
-    coords = np.column_stack(np.where(mask))
-
-    if len(coords) == 0:
-        return
-
-    cy = np.mean(coords[:, 0])
-    cx = np.mean(coords[:, 1])
-
-    distances = np.sqrt((coords[:, 0] - cy) ** 2 + (coords[:, 1] - cx) ** 2)
-    max_d = np.max(distances)
-
-    center_idx = np.argmin(distances)
-    contour_idx = np.argmax(distances)
-
-    mid_target = 0.5 * max_d
-    mid_idx = np.argmin(np.abs(distances - mid_target))
-
-    near_contour_target = 0.85 * max_d
-    near_contour_idx = np.argmin(np.abs(distances - near_contour_target))
-
-    y_center, x_center = coords[center_idx]
-    y_mid, x_mid = coords[mid_idx]
-    y_near, x_near = coords[near_contour_idx]
-    y_contour, x_contour = coords[contour_idx]
-
-    spec_center = cube[:, y_center, x_center]
-    spec_mid = cube[:, y_mid, x_mid]
-    spec_near = cube[:, y_near, x_near]
-    spec_contour = cube[:, y_contour, x_contour]
-
-    plt.figure(figsize=(10,5))
-    plt.plot(spec_center, label="Centre")
-    plt.plot(spec_mid, label="Milieu")
-    plt.plot(spec_near, label="Proche contour")
-    plt.plot(spec_contour, label="Contour")
-    plt.title(f"{class_name} - {cube_path.stem}")
-    plt.xlabel("Indice bande")
-    plt.ylabel("Reflectance")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
+# ─────────────────────────────────────────────
+# SAM
+# ─────────────────────────────────────────────
+def compute_sam(s1, s2):
+    num   = np.dot(s1, s2)
+    denom = np.linalg.norm(s1) * np.linalg.norm(s2) + 1e-8
+    return float(np.arccos(np.clip(num / denom, -1, 1)))
 
 
-def plot_radial_spectra_all_extrudes(dataset_root, null_threshold=1e-6):
-    dataset_root = Path(dataset_root)
-    hdr_files = sorted(dataset_root.rglob("*.hdr"))
+# ─────────────────────────────────────────────
+# GENERATION D UN SPECTRE pour un pixel masqué
+# ─────────────────────────────────────────────
+def generate_pixel_spectrum(netG, real_neighbors, device,
+                             n_candidates=5, sam_threshold=0.10):
+    """
+    - Tire n_candidates spectres GAN
+    - Choisit celui le plus proche (SAM minimal) d'un voisin réel tiré aléatoirement
+    - Applique inject_local_variation inspiré du premier code
+    """
+    # spectre réel de référence : moyenne des voisins
+    ref_spec = real_neighbors.mean(axis=0)          # (B,)
 
-    for cube_path in hdr_files:
-        plot_radial_spectra_for_cube(cube_path, null_threshold)
+    best_sam  = float("inf")
+    best_fake = None
 
+    for _ in range(n_candidates):
+        noise = torch.randn(1, 1, 1, device=device)  # (1,1,1) — adapté à votre G
+        with torch.no_grad():
+            fake = netG(noise).cpu().squeeze().numpy()   # (B,)
+        sam = compute_sam(ref_spec, fake)
+        if sam < best_sam:
+            best_sam  = sam
+            best_fake = fake
 
-
-
-
-import numpy as np
-import matplotlib.pyplot as plt
-from spectral import envi
-from pathlib import Path
-
-def plot_radial_spectra_for_cube(cube_path, null_threshold=1e-6):
-    cube_path = Path(cube_path)
-    class_name = cube_path.stem.split("_")[0]
-
-    hdr_img = envi.open(str(cube_path))
-    cube = np.array(hdr_img.load(), dtype=np.float32)
-    B, H, W = cube.shape
-
-    wavelengths = None
-    if 'wavelength' in hdr_img.metadata:
-        wavelengths = np.array(hdr_img.metadata['wavelength'], dtype=float)
+    if best_sam < sam_threshold:
+        # injection des variations locales du voisin réel dans le fake
+        new_spec = inject_local_variation(ref_spec, best_fake,
+                                          selected_indices=range(len(ref_spec)),
+                                          beta=1.0, window_size=1)
     else:
-        wavelengths = np.arange(B)
+        # GAN trop éloigné → on ajoute du bruit sur le voisin réel
+        sigma    = real_neighbors.std(axis=0)         # variabilité inter-voisins
+        noise_np = np.random.randn(len(ref_spec)) * sigma * 0.05
+        new_spec = np.clip(ref_spec + noise_np, 0, 1)
 
-    mask = np.var(cube, axis=0) > null_threshold
-    coords = np.column_stack(np.where(mask))
-
-    if len(coords) == 0:
-        return
-
-    cy = np.mean(coords[:, 0])
-    cx = np.mean(coords[:, 1])
-
-    distances = np.sqrt((coords[:, 0] - cy) ** 2 + (coords[:, 1] - cx) ** 2)
-    max_d = np.max(distances)
-
-    center_idx = np.argmin(distances)
-    contour_idx = np.argmax(distances)
-
-    mid_target = 0.5 * max_d
-    mid_idx = np.argmin(np.abs(distances - mid_target))
-
-    near_target = 0.85 * max_d
-    near_idx = np.argmin(np.abs(distances - near_target))
-
-    y_center, x_center = coords[center_idx]
-    y_mid, x_mid = coords[mid_idx]
-    y_near, x_near = coords[near_idx]
-    y_contour, x_contour = coords[contour_idx]
-
-    spec_center = cube[:, y_center, x_center]
-    spec_mid = cube[:, y_mid, x_mid]
-    spec_near = cube[:, y_near, x_near]
-    spec_contour = cube[:, y_contour, x_contour]
-
-    plt.figure(figsize=(10,5))
-    plt.plot(wavelengths, spec_center, label="Centre")
-    plt.plot(wavelengths, spec_mid, label="Milieu")
-    plt.plot(wavelengths, spec_near, label="Proche contour")
-    plt.plot(wavelengths, spec_contour, label="Contour")
-    plt.title(f"{class_name} - {cube_path.stem}")
-    plt.xlabel("Longueur d'onde")
-    plt.ylabel("Reflectance")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
+    return new_spec, best_sam
 
 
-def plot_radial_spectra_all_extrudes(dataset_root, null_threshold=1e-6):
-    dataset_root = Path(dataset_root)
-    hdr_files = sorted(dataset_root.rglob("*.hdr"))
-    for cube_path in hdr_files:
-        plot_radial_spectra_for_cube(cube_path, null_threshold)
+def inject_local_variation(real_spec, gan_spec, selected_indices,
+                            beta=1.0, window_size=1):
+    S_aug = gan_spec.copy()
+    B     = len(real_spec)
+    for idx in selected_indices:
+        i     = int(idx)
+        start = max(0, i - window_size)
+        end   = min(B, i + window_size + 1)
+        real_win = real_spec[start:end]
+        gan_win  = gan_spec[start:end]
+        delta    = np.diff(real_win)
+        aug_win  = [gan_win[0]]
+        for d in delta:
+            aug_win.append(aug_win[-1] + d)
+        S_aug[start:end] = aug_win
+    return S_aug
 
 
+# ─────────────────────────────────────────────
+# INPAINTING D UN CUBE
+# ─────────────────────────────────────────────
+def inpaint_cube(cube, remove_mask, netG, device,
+                 n_neighbors=5, search_radius=10,
+                 n_candidates=5, sam_threshold=0.10,
+                 save_plots=False, plot_dir=None, plot_max=10):
+    """
+    cube        : (B, H, W)  — pixels masqués déjà mis à 0
+    remove_mask : (H, W) bool — True = pixel à inpainter
+    Retourne le cube inpainté (B, H, W)
+    """
+    B, H, W     = cube.shape
+    result_cube = cube.copy()
+    masked_pixels = list(zip(*np.where(remove_mask)))   # [(r,c), ...]
+    print(f"  {len(masked_pixels)} pixels à inpainter...")
 
-import numpy as np
-import matplotlib.pyplot as plt
-from spectral import envi
-from pathlib import Path
+    plot_count = 0
+    if save_plots and plot_dir:
+        Path(plot_dir).mkdir(parents=True, exist_ok=True)
 
+    for k, (row, col) in enumerate(masked_pixels):
+        neighbors = get_real_neighbors(cube, remove_mask, row, col,
+                                       n_neighbors=n_neighbors,
+                                       search_radius=search_radius)
+        if neighbors is None:
+            # aucun voisin trouvé → laisser à zéro
+            continue
 
-def compute_mean_std_for_class(cube_paths, null_threshold=1e-6):
-
-    all_spectra = []
-
-    for cube_path in cube_paths:
-        hdr_img = envi.open(str(cube_path))
-        cube = np.array(hdr_img.load(), dtype=np.float32)
-
-        B, H, W = cube.shape
-        spectra = cube.reshape(B, -1).T
-
-        valid_spectra = np.array(
-            [s for s in spectra if np.var(s) > null_threshold]
+        new_spec, sam = generate_pixel_spectrum(
+            netG, neighbors, device,
+            n_candidates=n_candidates,
+            sam_threshold=sam_threshold
         )
+        result_cube[:, row, col] = new_spec
 
-        if len(valid_spectra) > 0:
-            all_spectra.append(valid_spectra)
+        if save_plots and plot_dir and plot_count < plot_max:
+            ref = neighbors.mean(axis=0)
+            plt.figure(figsize=(8, 4))
+            for nb in neighbors:
+                plt.plot(nb, color="gray", alpha=0.3, linewidth=0.8)
+            plt.plot(ref,      color="blue",  linewidth=1.5, label="Voisins (moy)")
+            plt.plot(new_spec, color="red",   linewidth=1.5, label=f"Généré SAM={sam:.3f}")
+            plt.title(f"Pixel ({row},{col})")
+            plt.xlabel("Bande"); plt.ylabel("Réflectance")
+            plt.legend(); plt.tight_layout()
+            plt.savefig(Path(plot_dir) / f"pixel_{k}.png")
+            plt.close()
+            plot_count += 1
 
-    if len(all_spectra) == 0:
-        return None, None
+        if k % 500 == 0:
+            print(f"    {k}/{len(masked_pixels)} pixels traités")
 
-    all_spectra = np.vstack(all_spectra)
-
-    mean_spec = np.mean(all_spectra, axis=0)
-    std_spec = np.std(all_spectra, axis=0)
-
-    return mean_spec, std_spec
+    return result_cube
 
 
-def plot_real_vs_augmented(dataset_root):
+# ─────────────────────────────────────────────
+# PIPELINE PRINCIPAL
+# ─────────────────────────────────────────────
+def process_cube_inpaint(cube_folder, json_path, netG_path, out_dir,
+                         dilate_radius=3, n_neighbors=5, search_radius=10,
+                         n_candidates=5, sam_threshold=0.10,
+                         device="cpu", save_plots=True):
 
-    dataset_root = Path(dataset_root)
-    hdr_files = sorted(dataset_root.rglob("*.hdr"))
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
 
-    class_to_real = {}
-    class_to_aug = {}
+    # Chargement modèle
+    from your_model_file import Generator   # ← remplacer par votre import
+    # netG = Generator(nz, n_bands).to(device)
+    # netG.load_state_dict(torch.load(netG_path, weights_only=False))
+    netG = torch.load(netG_path, weights_only=False)
+    netG.to(device)
+    netG.eval()
 
-    for cube_path in hdr_files:
-        name = cube_path.stem
-        class_name = name.split("_")[0]
+    # Chargement cube
+    spec        = SpecArray.from_folder(str(cube_folder))
+    cube_HBW    = np.array(spec.spectral_albedo).transpose(1, 0, 2)  # (B,H,W)
+    B, H, W     = cube_HBW.shape
+    wavelengths = np.array(spec.wavelengths)
+    meta        = spec.metadata.copy()
 
-        if "_aug_" in name:
-            class_to_aug.setdefault(class_name, []).append(cube_path)
-        else:
-            class_to_real.setdefault(class_name, []).append(cube_path)
+    # Masque
+    plots, polygons = load_labelme(json_path)
+    remove_mask     = build_mask(H, W, polygons, dilate_radius=dilate_radius)
+    cube_HBW[:, remove_mask] = 0   # mise à zéro
 
-    all_classes = sorted(set(list(class_to_real.keys()) + list(class_to_aug.keys())))
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    for class_name in all_classes:
+    # Inpainting
+    print(f"Inpainting : {cube_folder.name}")
+    inpainted = inpaint_cube(
+        cube_HBW, remove_mask, netG, device,
+        n_neighbors=n_neighbors,
+        search_radius=search_radius,
+        n_candidates=n_candidates,
+        sam_threshold=sam_threshold,
+        save_plots=save_plots,
+        plot_dir=out_dir / f"{cube_folder.name}_plots"
+    )
 
-        real_cubes = class_to_real.get(class_name, [])
-        aug_cubes = class_to_aug.get(class_name, [])
+    # Sauvegarde par plot
+    i1 = np.argmin(np.abs(wavelengths - 996))
+    i2 = np.argmin(np.abs(wavelengths - 1197))
 
-        mean_real, std_real = compute_mean_std_for_class(real_cubes)
-        mean_aug, std_aug = compute_mean_std_for_class(aug_cubes)
+    for i, (x1, y1, x2, y2) in enumerate(plots):
+        plot_cube = inpainted[:, y1:y2, x1:x2]
+        m = meta.copy()
+        m["lines"]   = plot_cube.shape[1]
+        m["samples"] = plot_cube.shape[2]
+        m["bands"]   = plot_cube.shape[0]
+        hdr_path = out_dir / f"{cube_folder.name}_plot_{i}_inpainted.hdr"
+        envi.save_image(str(hdr_path), plot_cube, dtype=np.float32,
+                        interleave="bil", force=True, metadata=m)
 
-        if mean_real is None and mean_aug is None:
+        ratio = inpainted[i1, y1:y2, x1:x2] / (inpainted[i2, y1:y2, x1:x2] + 1e-8)
+        plt.figure(figsize=(5, 5))
+        plt.imshow(ratio, cmap="inferno"); plt.axis("off")
+        plt.title(f"{cube_folder.name} plot {i} inpainted")
+        plt.savefig(out_dir / f"{cube_folder.name}_plot_{i}_inpainted_ratio.png")
+        plt.close()
+        print(f"  Sauvegardé : {hdr_path.name}")
+
+
+def process_all_inpaint(hsi_root, ann_root, netG_path, out_dir, **kwargs):
+    for cube_folder in Path(hsi_root).iterdir():
+        if not cube_folder.is_dir():
             continue
-
-        plt.figure(figsize=(10, 5))
-
-        if mean_real is not None:
-            plt.plot(mean_real, color="blue", linewidth=2, label="Réel - Moyenne")
-            plt.fill_between(
-                range(len(mean_real)),
-                mean_real - std_real,
-                mean_real + std_real,
-                color="blue",
-                alpha=0.2,
-                label="Réel ± std"
-            )
-
-        if mean_aug is not None:
-            plt.plot(mean_aug, color="red", linewidth=2, label="Augmenté - Moyenne")
-            plt.fill_between(
-                range(len(mean_aug)),
-                mean_aug - std_aug,
-                mean_aug + std_aug,
-                color="red",
-                alpha=0.2,
-                label="Augmenté ± std"
-            )
-
-        plt.title(f"Classe {class_name} - Spectres moyens")
-        plt.xlabel("Indice bande")
-        plt.ylabel("Reflectance")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-
-
-
-plot_real_vs_augmented("extrudes_eroded")
-
-import numpy as np
-import matplotlib.pyplot as plt
-from spectral import envi
-from pathlib import Path
-
-
-def compute_mean_std_for_class(cube_paths, null_threshold=1e-6):
-
-    all_spectra = []
-
-    for cube_path in cube_paths:
-        hdr_img = envi.open(str(cube_path))
-        cube = np.array(hdr_img.load(), dtype=np.float32)
-
-        B, H, W = cube.shape
-        spectra = cube.reshape(B, -1).T
-
-        valid_spectra = spectra[np.var(spectra, axis=1) > null_threshold]
-
-        if len(valid_spectra) > 0:
-            all_spectra.append(valid_spectra)
-
-    if len(all_spectra) == 0:
-        return None, None
-
-    all_spectra = np.vstack(all_spectra)
-
-    mean_spec = np.mean(all_spectra, axis=0)
-    std_spec = np.std(all_spectra, axis=0)
-
-    return mean_spec, std_spec
-
-
-def plot_real_vs_augmented(real_root, aug_root):
-
-    real_root = Path(real_root)
-    aug_root = Path(aug_root)
-
-    real_files = sorted(real_root.rglob("*.hdr"))
-    aug_files = sorted(aug_root.rglob("*.hdr"))
-
-    class_to_real = {}
-    class_to_aug = {}
-
-    for f in real_files:
-        class_name = f.stem.split("_")[0]
-        class_to_real.setdefault(class_name, []).append(f)
-
-    for f in aug_files:
-        class_name = f.stem.split("_")[0]
-        class_to_aug.setdefault(class_name, []).append(f)
-
-    all_classes = sorted(set(list(class_to_real.keys()) + list(class_to_aug.keys())))
-
-    for class_name in all_classes:
-
-        real_cubes = class_to_real.get(class_name, [])
-        aug_cubes = class_to_aug.get(class_name, [])
-
-        mean_real, std_real = compute_mean_std_for_class(real_cubes)
-        mean_aug, std_aug = compute_mean_std_for_class(aug_cubes)
-
-        if mean_real is None and mean_aug is None:
+        json_path = Path(ann_root) / f"{cube_folder.name}.json"
+        if not json_path.exists():
+            print("JSON manquant :", cube_folder.name)
             continue
-
-        plt.figure(figsize=(10, 5))
-
-        if mean_real is not None:
-            plt.plot(mean_real, color="blue", linewidth=2, label="Réel - Moyenne")
-            plt.fill_between(
-                range(len(mean_real)),
-                mean_real - std_real,
-                mean_real + std_real,
-                color="blue",
-                alpha=0.2
-            )
-
-        if mean_aug is not None:
-            plt.plot(mean_aug, color="red", linewidth=2, label="Augmenté - Moyenne")
-            plt.fill_between(
-                range(len(mean_aug)),
-                mean_aug - std_aug,
-                mean_aug + std_aug,
-                color="red",
-                alpha=0.2
-            )
-
-        plt.title(f"Classe {class_name}")
-        plt.xlabel("Indice bande")
-        plt.ylabel("Reflectance")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
+        process_cube_inpaint(cube_folder, json_path, netG_path,
+                             out_dir, **kwargs)
 
 
 
+if __name__ == "__main__":
+    process_all_inpaint(
+        hsi_root     = "data/cubes",
+        ann_root     = "data/annotations",
+        netG_path    = "results/resine/netG_best.pth",
+        out_dir      = "output_inpainted",
+        dilate_radius= 3,
+        n_neighbors  = 5,       # nb de voisins réels tirés aléatoirement
+        search_radius= 10,      # rayon de recherche des voisins en pixels
+        n_candidates = 5,       # nb de spectres GAN générés pour choisir le meilleur
+        sam_threshold= 0.10,    # seuil SAM pour choisir GAN vs bruit
+        device       = "cuda",
+        save_plots   = True
+    )
 
-plot_real_vs_augmented(
-    real_root="extrudes_reels",
-    aug_root="extrudes_augmented"
-)
 
-
+##################3
 import numpy as np
-import matplotlib.pyplot as plt
-from spectral import envi
 from pathlib import Path
+import json
+import cv2
+import torch
+import matplotlib.pyplot as plt
+from specarray import SpecArray
+import spectral.io.envi as envi
+from skimage.morphology import dilation, disk
+from scipy.ndimage import gaussian_filter, distance_transform_edt
 
-def plot_real_with_its_augmented(cube_path, augmented_class_dir, null_threshold=1e-6):
-    cube_path = Path(cube_path)
-    class_name = cube_path.stem.split("_")[0]
 
-    # --- Cube réel ---
-    hdr_img = envi.open(str(cube_path))
-    cube = np.array(hdr_img.load(), dtype=np.float32)
+def load_labelme(json_path):
+    with open(json_path) as f:
+        data = json.load(f)
+    plots, polygons_to_remove = [], []
+    for shape in data["shapes"]:
+        label = shape["label"]
+        pts   = np.array(shape["points"], dtype=np.int32)
+        if label == "plot":
+            x1 = int(np.min(pts[:,0])); x2 = int(np.max(pts[:,0]))
+            y1 = int(np.min(pts[:,1])); y2 = int(np.max(pts[:,1]))
+            plots.append((x1, y1, x2, y2))
+        elif label != "trou":
+            polygons_to_remove.append(pts)
+    return plots, polygons_to_remove
+
+
+def build_mask(H, W, polygons, dilate_radius=3):
+    mask = np.zeros((H, W), dtype=np.uint8)
+    for poly in polygons:
+        cv2.fillPoly(mask, [poly], 1)
+    mask = dilation(mask, disk(dilate_radius))
+    return mask.astype(bool)
+
+
+def compute_sam(s1, s2):
+    num   = np.dot(s1, s2)
+    denom = np.linalg.norm(s1) * np.linalg.norm(s2) + 1e-8
+    return float(np.arccos(np.clip(num / denom, -1, 1)))
+
+
+def inject_local_variation(real_spec, gan_spec, selected_indices, beta=1.0, window_size=1):
+    S_aug = gan_spec.copy()
+    B     = len(real_spec)
+    for idx in selected_indices:
+        i     = int(idx)
+        start = max(0, i - window_size)
+        end   = min(B, i + window_size + 1)
+        real_win = real_spec[start:end]
+        gan_win  = gan_spec[start:end]
+        delta    = np.diff(real_win)
+        aug_win  = [gan_win[0]]
+        for d in delta:
+            aug_win.append(aug_win[-1] + d)
+        S_aug[start:end] = aug_win
+    return S_aug
+
+
+def get_real_neighbors(cube, remove_mask, row, col, n_neighbors=5, search_radius=10):
     B, H, W = cube.shape
-    spectra = cube.reshape(B, -1).T
-    valid_spectra = np.array([s for s in spectra if np.var(s) > null_threshold])
-    if len(valid_spectra) == 0:
-        print(f"Aucun spectre valide pour {cube_path}")
-        return
-    real_mean = np.mean(valid_spectra, axis=0)
-    real_std = np.std(valid_spectra, axis=0)
+    r0 = max(0, row - search_radius)
+    r1 = min(H, row + search_radius + 1)
+    c0 = max(0, col - search_radius)
+    c1 = min(W, col + search_radius + 1)
+    neighbors = []
+    for r in range(r0, r1):
+        for c in range(c0, c1):
+            if not remove_mask[r, c] and np.var(cube[:, r, c]) > 1e-6:
+                neighbors.append(cube[:, r, c])
+    if not neighbors:
+        return None
+    neighbors = np.array(neighbors)
+    idx = np.random.choice(len(neighbors), size=min(n_neighbors, len(neighbors)), replace=False)
+    return neighbors[idx]
 
-    # --- Cubes augmentés associés à ce cube ---
-    cube_index = cube_path.stem.split("_")[1]  # ex: '0' pour A1_0.hdr
-    aug_dir = Path(augmented_class_dir) / class_name
-    aug_files = sorted(aug_dir.rglob(f"{class_name}_cube{cube_index}_aug_*.hdr"))
 
-    all_aug_spectra = []
-    for f in aug_files:
-        hdr_aug = envi.open(str(f))
-        cube_aug = np.array(hdr_aug.load(), dtype=np.float32)
-        B_aug, H_aug, W_aug = cube_aug.shape
-        spectra_aug = cube_aug.reshape(B_aug, -1).T
-        valid_aug = np.array([s for s in spectra_aug if np.var(s) > null_threshold])
-        if len(valid_aug) > 0:
-            all_aug_spectra.append(valid_aug)
+def generate_pixel_spectrum(netG, real_neighbors, device, n_candidates=5, sam_threshold=0.10):
+    ref_spec  = real_neighbors.mean(axis=0)
+    best_sam  = float("inf")
+    best_fake = None
+    for _ in range(n_candidates):
+        noise = torch.randn(1, 1, 1, device=device)
+        with torch.no_grad():
+            fake = netG(noise).cpu().squeeze().numpy()
+        sam = compute_sam(ref_spec, fake)
+        if sam < best_sam:
+            best_sam  = sam
+            best_fake = fake
+    if best_sam < sam_threshold:
+        new_spec = inject_local_variation(ref_spec, best_fake,
+                                          selected_indices=range(len(ref_spec)),
+                                          beta=1.0, window_size=1)
+    else:
+        sigma    = real_neighbors.std(axis=0)
+        noise_np = np.random.randn(len(ref_spec)) * sigma * 0.05
+        new_spec = np.clip(ref_spec + noise_np, 0, 1)
+    return new_spec, best_sam
 
-    if len(all_aug_spectra) == 0:
-        print(f"Aucun cube augmenté valide pour {cube_path}")
-        return
 
-    all_aug_spectra = np.vstack(all_aug_spectra)
-    aug_mean = np.mean(all_aug_spectra, axis=0)
-    aug_std = np.std(all_aug_spectra, axis=0)
+def inpaint_cube(cube, remove_mask, netG, device,
+                 n_neighbors=5, search_radius=10,
+                 n_candidates=5, sam_threshold=0.10,
+                 save_plots=False, plot_dir=None, plot_max=10):
+    B, H, W       = cube.shape
+    result_cube   = cube.copy()
+    masked_pixels = list(zip(*np.where(remove_mask)))
+    print(f"  {len(masked_pixels)} pixels à inpainter...")
+    plot_count = 0
+    if save_plots and plot_dir:
+        Path(plot_dir).mkdir(parents=True, exist_ok=True)
+    for k, (row, col) in enumerate(masked_pixels):
+        neighbors = get_real_neighbors(cube, remove_mask, row, col,
+                                       n_neighbors=n_neighbors,
+                                       search_radius=search_radius)
+        if neighbors is None:
+            continue
+        new_spec, sam = generate_pixel_spectrum(netG, neighbors, device,
+                                                n_candidates=n_candidates,
+                                                sam_threshold=sam_threshold)
+        result_cube[:, row, col] = new_spec
+        if save_plots and plot_dir and plot_count < plot_max:
+            ref = neighbors.mean(axis=0)
+            plt.figure(figsize=(8, 4))
+            for nb in neighbors:
+                plt.plot(nb, color="gray", alpha=0.3, linewidth=0.8)
+            plt.plot(ref,      color="blue",  linewidth=1.5, label="Voisins (moy)")
+            plt.plot(new_spec, color="red",   linewidth=1.5, label=f"Généré SAM={sam:.3f}")
+            plt.title(f"Pixel ({row},{col})")
+            plt.xlabel("Bande"); plt.ylabel("Réflectance")
+            plt.legend(); plt.tight_layout()
+            plt.savefig(Path(plot_dir) / f"pixel_{k}.png")
+            plt.close()
+            plot_count += 1
+        if k % 500 == 0:
+            print(f"    {k}/{len(masked_pixels)} pixels traités")
+    return result_cube
 
-    # --- Plot ---
-    plt.figure(figsize=(10,5))
-    plt.plot(real_mean, color='blue', linewidth=2, label='Real Mean')
-    plt.fill_between(range(len(real_mean)), real_mean - real_std, real_mean + real_std,
-                     color='blue', alpha=0.2, label='Real ± STD')
 
-    plt.plot(aug_mean, color='orange', linewidth=2, label='Augmented Mean')
-    plt.fill_between(range(len(aug_mean)), aug_mean - aug_std, aug_mean + aug_std,
-                     color='orange', alpha=0.2, label='Augmented ± STD')
-
-    plt.title(f"{class_name} - {cube_path.stem}")
-    plt.xlabel("Indice bande")
-    plt.ylabel("Reflectance")
-    plt.legend()
+def plot_random_band(cube, remove_mask, title, out_path=None):
+    B, H, W  = cube.shape
+    band_idx = np.random.randint(0, B)
+    band_img = cube[band_idx]
+    fig, ax = plt.subplots(figsize=(7, 5))
+    im = ax.imshow(band_img, cmap="inferno", aspect="auto")
+    plt.colorbar(im, ax=ax, fraction=0.03)
+    if remove_mask is not None:
+        ax.contour(remove_mask.astype(float), levels=[0.5], colors="cyan", linewidths=1.2)
+    ax.set_title(f"{title}  —  bande {band_idx}")
+    ax.axis("off")
     plt.tight_layout()
+    if out_path:
+        plt.savefig(out_path, dpi=120)
     plt.show()
+    plt.close()
 
 
-def plot_all_real_and_augmented(data_dir, augmented_dir, null_threshold=1e-6):
-    data_dir = Path(data_dir)
-    real_hdr_files = sorted(data_dir.rglob("*.hdr"))
-    for cube_path in real_hdr_files:
-        plot_real_with_its_augmented(cube_path, augmented_dir, null_threshold=null_threshold)
+def smooth_inpainted_zone(cube, remove_mask, sigma=1.2, blend_radius=3):
+    B, H, W = cube.shape
+    result  = cube.copy()
+    dist_from_edge = distance_transform_edt(remove_mask)
+    max_dist       = dist_from_edge.max()
+    if max_dist == 0:
+        return result
+    alpha = np.clip(dist_from_edge / blend_radius, 0, 1)
+    for b in range(B):
+        band          = result[b].copy()
+        band_smoothed = gaussian_filter(band, sigma=sigma)
+        blended       = alpha * band + (1 - alpha) * band_smoothed
+        result[b][remove_mask] = blended[remove_mask]
+    return result
 
 
-plot_all_real_and_augmented("data", "augmented")
+def process_cube_inpaint(cube_folder, json_path, netG_path, out_dir,
+                         dilate_radius=3, n_neighbors=5, search_radius=10,
+                         n_candidates=5, sam_threshold=0.10,
+                         device="cpu", save_plots=True,
+                         smooth_sigma=1.2, blend_radius=3):
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
+    netG = torch.load(netG_path, weights_only=False)
+    netG.to(device)
+    netG.eval()
+    spec        = SpecArray.from_folder(str(cube_folder))
+    cube_HBW    = np.array(spec.spectral_albedo).transpose(1, 0, 2)
+    B, H, W     = cube_HBW.shape
+    wavelengths = np.array(spec.wavelengths)
+    meta        = spec.metadata.copy()
+    plots, polygons = load_labelme(json_path)
+    remove_mask     = build_mask(H, W, polygons, dilate_radius=dilate_radius)
+    cube_HBW[:, remove_mask] = 0
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n{'='*50}\nInpainting : {cube_folder.name}\n{'='*50}")
+    inpainted = inpaint_cube(
+        cube_HBW, remove_mask, netG, device,
+        n_neighbors=n_neighbors, search_radius=search_radius,
+        n_candidates=n_candidates, sam_threshold=sam_threshold,
+        save_plots=save_plots, plot_dir=out_dir / f"{cube_folder.name}_plots_pixels"
+    )
+    plot_random_band(inpainted, remove_mask,
+                     title=f"{cube_folder.name} — inpainté (avant lissage)",
+                     out_path=out_dir / f"{cube_folder.name}_before_smooth.png")
+    print("  Lissage des zones inpaintées...")
+    smoothed = smooth_inpainted_zone(inpainted, remove_mask,
+                                     sigma=smooth_sigma, blend_radius=blend_radius)
+    plot_random_band(smoothed, remove_mask,
+                     title=f"{cube_folder.name} — inpainté (après lissage)",
+                     out_path=out_dir / f"{cube_folder.name}_after_smooth.png")
+    i1 = np.argmin(np.abs(wavelengths - 996))
+    i2 = np.argmin(np.abs(wavelengths - 1197))
+    for i, (x1, y1, x2, y2) in enumerate(plots):
+        plot_cube = smoothed[:, y1:y2, x1:x2]
+        plot_mask = remove_mask[y1:y2, x1:x2]
+        m = meta.copy()
+        m["lines"]   = plot_cube.shape[1]
+        m["samples"] = plot_cube.shape[2]
+        m["bands"]   = plot_cube.shape[0]
+        hdr_path = out_dir / f"{cube_folder.name}_plot_{i}_inpainted.hdr"
+        envi.save_image(str(hdr_path), plot_cube, dtype=np.float32,
+                        interleave="bil", force=True, metadata=m)
+        ratio_before = inpainted[i1, y1:y2, x1:x2] / (inpainted[i2, y1:y2, x1:x2] + 1e-8)
+        rb_min, rb_max = ratio_before.min(), ratio_before.max()
+        if rb_max > rb_min:
+            ratio_before = (ratio_before - rb_min) / (rb_max - rb_min)
+        ratio_after = plot_cube[i1] / (plot_cube[i2] + 1e-8)
+        ra_min, ra_max = ratio_after.min(), ratio_after.max()
+        if ra_max > ra_min:
+            ratio_after = (ratio_after - ra_min) / (ra_max - ra_min)
+        band_idx  = np.random.randint(0, plot_cube.shape[0])
+        band_plot = plot_cube[band_idx]
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+        im0 = axes[0].imshow(band_plot, cmap="inferno", aspect="auto")
+        axes[0].contour(plot_mask.astype(float), levels=[0.5], colors="cyan", linewidths=1)
+        plt.colorbar(im0, ax=axes[0], fraction=0.03)
+        axes[0].set_title(f"Bande {band_idx}")
+        axes[0].axis("off")
+        im1 = axes[1].imshow(ratio_before, cmap="RdYlGn", aspect="auto", vmin=0, vmax=1)
+        axes[1].contour(plot_mask.astype(float), levels=[0.5], colors="cyan", linewidths=1)
+        plt.colorbar(im1, ax=axes[1], fraction=0.03)
+        axes[1].set_title("Ratio 996/1197nm — avant lissage")
+        axes[1].axis("off")
+        im2 = axes[2].imshow(ratio_after, cmap="RdYlGn", aspect="auto", vmin=0, vmax=1)
+        axes[2].contour(plot_mask.astype(float), levels=[0.5], colors="cyan", linewidths=1)
+        plt.colorbar(im2, ax=axes[2], fraction=0.03)
+        axes[2].set_title("Ratio 996/1197nm — après lissage")
+        axes[2].axis("off")
+        fig.suptitle(f"{cube_folder.name} — plot {i}", fontsize=13)
+        plt.tight_layout()
+        plt.savefig(out_dir / f"{cube_folder.name}_plot_{i}_compare.png", dpi=120)
+        plt.show()
+        plt.close()
+        print(f"  ✓ Plot {i} sauvegardé : {hdr_path.name}")
+    print(f"\n✓ {cube_folder.name} terminé — {len(plots)} plot(s) sauvegardés\n")
+
+
+def process_all_inpaint(hsi_root, ann_root, netG_path, out_dir, **kwargs):
+    hsi_root = Path(hsi_root)
+    ann_root = Path(ann_root)
+    cube_folders = sorted([f for f in hsi_root.iterdir() if f.is_dir()])
+    print(f"{len(cube_folders)} cube(s) trouvé(s) dans {hsi_root}")
+    for cube_folder in cube_folders:
+        json_path = ann_root / f"{cube_folder.name}.json"
+        if not json_path.exists():
+            print(f"  JSON manquant : {cube_folder.name} — ignoré")
+            continue
+        process_cube_inpaint(cube_folder, json_path, netG_path, out_dir, **kwargs)
+    print("\n✓ Tous les cubes traités.")
+
+
+if __name__ == "__main__":
+    process_all_inpaint(
+        hsi_root      = "data/cubes",
+        ann_root      = "data/annotations",
+        netG_path     = "results/resine/netG_best.pth",
+        out_dir       = "output_inpainted",
+        dilate_radius = 3,
+        n_neighbors   = 5,
+        search_radius = 10,
+        n_candidates  = 5,
+        sam_threshold = 0.10,
+        device        = "cuda",
+        save_plots    = True,
+        smooth_sigma  = 1.2,
+        blend_radius  = 3
+    )
