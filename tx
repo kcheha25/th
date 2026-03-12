@@ -573,3 +573,127 @@ if __name__ == "__main__":
         smooth_sigma  = 1.2,
         blend_radius  = 3
     )
+####################################################3
+def smooth_inpainted_zone(cube, remove_mask, d=9, sigma_color=0.1, sigma_space=10,
+                          smooth_method="bilateral", sigma_spatial=1.5, sigma_spectral=0.5,
+                          sharpen_method="unsharp", sharpen_sigma=1.0, sharpen_amount=1.5,
+                          wiener_size=5, wiener_noise=0.01,
+                          laplacian_strength=0.5, highboost_boost=2.0):
+    B, H, W = cube.shape
+
+    # ── KERNELS DE CONVOLUTION ───────────────────────────────────────────
+    kernel_mean = np.ones((3, 3), np.float32) / 9.0          # moyenne simple
+
+    kernel_gaussian = np.array([[1, 2, 1],                    # gaussien 3x3
+                                 [2, 4, 2],
+                                 [1, 2, 1]], np.float32) / 16.0
+
+    kernel_median_like = np.array([[1, 2, 1],                 # pondéré centre
+                                   [2, 8, 2],
+                                   [1, 2, 1]], np.float32) / 20.0
+
+    kernel_edge_preserve = np.array([[0,  1, 0],              # préserve les bords
+                                     [1,  4, 1],
+                                     [0,  1, 0]], np.float32) / 8.0
+
+    convolution_kernels = {
+        "conv_mean"          : kernel_mean,
+        "conv_gaussian"      : kernel_gaussian,
+        "conv_median_like"   : kernel_median_like,
+        "conv_edge_preserve" : kernel_edge_preserve
+    }
+
+    # ── LISSAGE ──────────────────────────────────────────────────────────
+    if smooth_method == "bilateral":
+        smoothed = cube.copy()
+        for b in range(B):
+            band = smoothed[b].copy()
+            band_min, band_max = band.min(), band.max()
+            band_norm = ((band - band_min) /
+                        (band_max - band_min + 1e-8)).astype(np.float32)
+            band_filtered = cv2.bilateralFilter(band_norm, d=d,
+                                                sigmaColor=sigma_color,
+                                                sigmaSpace=sigma_space)
+            smoothed[b] = band_filtered * (band_max - band_min) + band_min
+
+    elif smooth_method == "gaussian3d":
+        smoothed = gaussian_filter(cube.astype(np.float32),
+                                   sigma=[sigma_spectral, sigma_spatial, sigma_spatial])
+
+    elif smooth_method in convolution_kernels:
+        smoothed = cube.copy()
+        kernel   = convolution_kernels[smooth_method]
+        for b in range(B):
+            band = smoothed[b].copy().astype(np.float32)
+            smoothed[b] = cv2.filter2D(band, -1, kernel)
+
+    # ── NETTETE ──────────────────────────────────────────────────────────
+    result = smoothed.copy()
+
+    if sharpen_method == "unsharp":
+        for b in range(B):
+            band      = smoothed[b].copy()
+            blurred   = gaussian_filter(band, sigma=sharpen_sigma)
+            detail    = band - blurred
+            result[b] = np.clip(band + sharpen_amount * detail,
+                                band.min(), band.max())
+
+    elif sharpen_method == "wiener":
+        for b in range(B):
+            band_min, band_max = smoothed[b].min(), smoothed[b].max()
+            band_norm = ((smoothed[b] - band_min) /
+                        (band_max - band_min + 1e-8)).astype(np.float32)
+            filtered  = wiener(band_norm, mysize=wiener_size, noise=wiener_noise)
+            result[b] = np.clip(filtered, 0, 1) * (band_max - band_min) + band_min
+
+    elif sharpen_method == "laplacian":
+        for b in range(B):
+            band_min, band_max = smoothed[b].min(), smoothed[b].max()
+            band_norm = ((smoothed[b] - band_min) /
+                        (band_max - band_min + 1e-8)).astype(np.float32)
+            lap       = cv2.Laplacian(band_norm, cv2.CV_32F, ksize=3)
+            sharpened = np.clip(band_norm - laplacian_strength * lap, 0, 1)
+            result[b] = sharpened * (band_max - band_min) + band_min
+
+    elif sharpen_method == "highboost":
+        for b in range(B):
+            band      = smoothed[b].copy()
+            lowpass   = gaussian_filter(band, sigma=sharpen_sigma)
+            highpass  = band - lowpass
+            result[b] = np.clip(band + highboost_boost * highpass,
+                                band.min(), band.max())
+
+    elif sharpen_method == "none":
+        result = smoothed.copy()
+
+    return result
+
+smoothed = smooth_inpainted_zone(
+    cube           = inpainted,
+    remove_mask    = remove_mask,
+    smooth_method  = "bilateral",        # bilateral (préserve les bords) |
+                                         # gaussian3d (plus rapide) |
+                                         # conv_mean (moyenne simple) |
+                                         # conv_gaussian (gaussien 3x3) |
+                                         # conv_median_like (pondéré centre) |
+                                         # conv_edge_preserve (préserve les bords)
+    sharpen_method = "unsharp",          # unsharp | wiener | laplacian | highboost | none
+    d              = 9,                  # 5=local 9=standard 15=large
+    sigma_color    = 0.1,                # 0.05=strict 0.1=standard 0.5=agressif
+    sigma_space    = 10,                 # 2=local 10=standard 20=large
+    sharpen_sigma  = 1.0,                # 0.5=fins 1.0=standard 2.0=larges
+    sharpen_amount = 1.5                 # 0.5=leger 1.5=standard 3.0+=artefacts
+)
+
+
+elif sharpen_method == "conv_sharp":
+    sharp_kernel = np.array([[-1, -1, -1],
+                              [-1,  9, -1],
+                              [-1, -1, -1]], np.float32)
+    for b in range(B):
+        band      = smoothed[b].copy().astype(np.float32)
+        band_min, band_max = band.min(), band.max()
+        band_norm = ((band - band_min) /
+                    (band_max - band_min + 1e-8)).astype(np.float32)
+        sharpened = cv2.filter2D(band_norm, -1, sharp_kernel)
+        result[b] = np.clip(sharpened, 0, 1) * (band_max - band_min) + band_min

@@ -1,0 +1,623 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from pathlib import Path
+import json
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.patches import Polygon as MplPolygon
+import spectral.io.envi as envi
+from spectral import envi as envi_io
+from collections import defaultdict
+import random
+import cv2
+
+# ─────────────────────────────────────────────
+# UTILS
+# ─────────────────────────────────────────────
+WL1 = 996
+WL2 = 1197
+
+def find_nearest_idx(target, arr):
+    return int(np.argmin(np.abs(arr - target)))
+
+def compute_ratio(cube_BHW, wavelengths):
+    i1 = find_nearest_idx(WL1, wavelengths)
+    i2 = find_nearest_idx(WL2, wavelengths)
+    r  = cube_BHW[i1] / (cube_BHW[i2] + 1e-8)
+    rmin, rmax = r.min(), r.max()
+    if rmax > rmin:
+        r = (r - rmin) / (rmax - rmin)
+    return r
+
+def load_hdr(hdr_path):
+    img  = envi_io.open(str(hdr_path))
+    cube = np.array(img.load(), dtype=np.float32)  # (B, H, W)
+    meta = img.metadata.copy()
+    return cube, meta
+
+def rglob_hdr(root):
+    return sorted(Path(root).rglob("*.hdr"))
+
+def polygon_mask(H, W, pts):
+    mask = np.zeros((H, W), dtype=np.uint8)
+    cv2.fillPoly(mask, [np.array(pts, dtype=np.int32)], 1)
+    return mask.astype(bool)
+
+def place_extrude_random(plot_cube, extrude_cube, mask, rng=None):
+    """
+    Place extrude_cube (B, He, We) dans plot_cube (B, H, W)
+    à une position aléatoire dans le polygon mask.
+    Retourne le plot modifié et la position (r0, c0).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    B,  H,  W  = plot_cube.shape
+    Be, He, We = extrude_cube.shape
+    result     = plot_cube.copy()
+
+    # pixels valides dans le masque où l extrude peut rentrer entièrement
+    valid = []
+    for r in range(H - He + 1):
+        for c in range(W - We + 1):
+            sub_mask = mask[r:r+He, c:c+We]
+            if sub_mask.all():
+                valid.append((r, c))
+
+    if not valid:
+        # fallback : n importe quelle position dans le masque
+        rows, cols = np.where(mask)
+        if len(rows) == 0:
+            return result, None
+        idx = rng.integers(len(rows))
+        r0  = max(0, min(rows[idx], H - He))
+        c0  = max(0, min(cols[idx], W - We))
+    else:
+        r0, c0 = valid[rng.integers(len(valid))]
+
+    r1 = min(r0 + He, H)
+    c1 = min(c0 + We, W)
+    he = r1 - r0
+    we = c1 - c0
+    result[:, r0:r1, c0:c1] = extrude_cube[:, :he, :we]
+    return result, (r0, c0, r1, c1)
+
+def make_labelme_json(image_name, H, W, annotations):
+    """
+    annotations : liste de dict {label, points (liste de [x,y])}
+    """
+    shapes = []
+    for ann in annotations:
+        shapes.append({
+            "label"     : ann["label"],
+            "points"    : ann["points"],
+            "group_id"  : None,
+            "shape_type": "polygon",
+            "flags"     : {}
+        })
+    return {
+        "version"  : "5.0.1",
+        "flags"    : {},
+        "shapes"   : shapes,
+        "imagePath": image_name,
+        "imageData": None,
+        "imageHeight": H,
+        "imageWidth" : W
+    }
+
+# ─────────────────────────────────────────────
+# APPLICATION
+# ─────────────────────────────────────────────
+class ExtrudeApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Spectral Extrude Placer")
+        self.geometry("1300x860")
+        self.configure(bg="#0f0f17")
+        self._style()
+
+        # state
+        self.plots        = []      # list of {name, cube(B,H,W), meta, wavelengths, ratio, hdr_path}
+        self.extrudes     = []      # list of {name, cube(B,H,W), class_name, hdr_path}
+        self.current_plot = 0
+        self.polygon_pts  = []      # points en cours de dessin [(x,y),...]
+        self.polygon_done = False
+        self.polygon_patch= None
+        self.result_cube  = None
+        self.placed_rects = []      # [(r0,c0,r1,c1, class_name), ...]
+        self.annotations  = []      # labelme shapes
+
+        self._build_ui()
+
+    def _style(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        bg, fg, acc = "#0f0f17", "#e2e8f0", "#7c83fd"
+        s.configure(".",             background=bg, foreground=fg, font=("Courier New", 10))
+        s.configure("TFrame",        background=bg)
+        s.configure("TLabel",        background=bg, foreground=fg)
+        s.configure("TButton",       background="#1e1e2e", foreground=fg, padding=6)
+        s.configure("TLabelframe",   background=bg, foreground=acc)
+        s.configure("TLabelframe.Label", background=bg, foreground=acc,
+                    font=("Courier New", 10, "bold"))
+        s.configure("Treeview",      background="#1e1e2e", foreground=fg,
+                    fieldbackground="#1e1e2e", rowheight=20)
+        s.map("Treeview",            background=[("selected", acc)])
+        s.configure("TEntry",        fieldbackground="#1e1e2e", foreground=fg)
+        s.configure("TCombobox",     fieldbackground="#1e1e2e", foreground=fg)
+
+    def _build_ui(self):
+        # ── LEFT PANEL ────────────────────────────────────────────────────
+        left = ttk.Frame(self, width=260)
+        left.pack(side="left", fill="y", padx=(8,0), pady=8)
+        left.pack_propagate(False)
+
+        # plots
+        pf = ttk.LabelFrame(left, text="PLOTS HDR")
+        pf.pack(fill="x", pady=(0,6))
+        ttk.Button(pf, text="📂 Charger dossier plots",
+                   command=self._load_plots).pack(fill="x", padx=4, pady=2)
+        self.plot_list = tk.Listbox(pf, bg="#1e1e2e", fg="#e2e8f0",
+                                    font=("Courier New", 9), height=6,
+                                    selectmode="single", relief="flat", bd=0)
+        self.plot_list.pack(fill="x", padx=4, pady=2)
+        self.plot_list.bind("<<ListboxSelect>>", self._on_plot_select)
+
+        # wavelengths
+        wf = ttk.LabelFrame(left, text="LONGUEURS D'ONDE RATIO")
+        wf.pack(fill="x", pady=(0,6))
+        ttk.Label(wf, text="WL1 (nm):").grid(row=0, column=0, sticky="w", padx=4)
+        self.wl1_var = tk.StringVar(value=str(WL1))
+        ttk.Entry(wf, textvariable=self.wl1_var, width=8).grid(row=0, column=1, padx=4, pady=2)
+        ttk.Label(wf, text="WL2 (nm):").grid(row=1, column=0, sticky="w", padx=4)
+        self.wl2_var = tk.StringVar(value=str(WL2))
+        ttk.Entry(wf, textvariable=self.wl2_var, width=8).grid(row=1, column=1, padx=4, pady=2)
+        ttk.Button(wf, text="🔄 Recalculer ratio",
+                   command=self._recalc_ratio).grid(row=2, column=0, columnspan=2,
+                                                     sticky="ew", padx=4, pady=2)
+
+        # extrudes
+        ef = ttk.LabelFrame(left, text="EXTRUDES HDR")
+        ef.pack(fill="x", pady=(0,6))
+        ttk.Button(ef, text="📂 Charger dossier extrudes",
+                   command=self._load_extrudes).pack(fill="x", padx=4, pady=2)
+        self.extrude_info = ttk.Label(ef, text="0 extrude(s) chargé(s)",
+                                      font=("Courier New", 9))
+        self.extrude_info.pack(padx=4, pady=2)
+        ttk.Label(ef, text="Classe :").pack(anchor="w", padx=4)
+        self.class_var = tk.StringVar(value="")
+        self.class_combo = ttk.Combobox(ef, textvariable=self.class_var, width=18)
+        self.class_combo.pack(fill="x", padx=4, pady=2)
+
+        # polygon
+        pgf = ttk.LabelFrame(left, text="POLYGON ROI")
+        pgf.pack(fill="x", pady=(0,6))
+        self.draw_var = tk.StringVar(value="Navigation")
+        ttk.Label(pgf, textvariable=self.draw_var,
+                  foreground="#7c83fd", font=("Courier New", 9, "italic")).pack(padx=4)
+        ttk.Button(pgf, text="✏️  Dessiner polygon",
+                   command=self._start_polygon).pack(fill="x", padx=4, pady=2)
+        ttk.Button(pgf, text="✅ Fermer polygon",
+                   command=self._close_polygon).pack(fill="x", padx=4, pady=2)
+        ttk.Button(pgf, text="🗑  Effacer polygon",
+                   command=self._clear_polygon).pack(fill="x", padx=4, pady=2)
+
+        # placement
+        plf = ttk.LabelFrame(left, text="PLACEMENT")
+        plf.pack(fill="x", pady=(0,6))
+        ttk.Label(plf, text="Nb extrudes à placer :").pack(anchor="w", padx=4)
+        self.n_place_var = tk.StringVar(value="5")
+        ttk.Entry(plf, textvariable=self.n_place_var, width=8).pack(anchor="w", padx=4, pady=2)
+        ttk.Button(plf, text="🚀 Placer extrudes",
+                   command=self._place_extrudes).pack(fill="x", padx=4, pady=2)
+        ttk.Button(plf, text="🔄 Replacer (nouveau tirage)",
+                   command=self._place_extrudes).pack(fill="x", padx=4, pady=2)
+
+        # save
+        sf = ttk.LabelFrame(left, text="SAUVEGARDE")
+        sf.pack(fill="x", pady=(0,6))
+        ttk.Label(sf, text="Dossier sortie :").pack(anchor="w", padx=4)
+        self.out_var = tk.StringVar(value="./output_placed")
+        ttk.Entry(sf, textvariable=self.out_var, width=22).pack(fill="x", padx=4, pady=2)
+        ttk.Button(sf, text="📁", command=self._pick_outdir).pack(anchor="e", padx=4)
+        ttk.Button(sf, text="💾 Sauvegarder plot + JSON",
+                   command=self._save).pack(fill="x", padx=4, pady=2)
+
+        # log
+        lf = ttk.LabelFrame(left, text="LOG")
+        lf.pack(fill="both", expand=True, pady=(0,4))
+        self.log = tk.Text(lf, bg="#0a0a12", fg="#7c83fd", font=("Courier New", 8),
+                           state="disabled", relief="flat", height=6)
+        self.log.pack(fill="both", expand=True, padx=2, pady=2)
+
+        # ── RIGHT PANEL : matplotlib ──────────────────────────────────────
+        right = ttk.Frame(self)
+        right.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+
+        self.fig, self.axes = plt.subplots(1, 2, figsize=(10, 6),
+                                           facecolor="#0f0f17")
+        for ax in self.axes:
+            ax.set_facecolor("#0a0a12")
+            ax.axis("off")
+        self.axes[0].set_title("Plot original", color="#e2e8f0", fontsize=10)
+        self.axes[1].set_title("Après placement", color="#e2e8f0", fontsize=10)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, right)
+        self.toolbar.update()
+
+        self.canvas.mpl_connect("button_press_event",   self._on_press)
+        self.canvas.mpl_connect("scroll_event",          self._on_scroll)
+        self._drawing_polygon = False
+
+    # ── LOG ───────────────────────────────────────────────────────────────
+    def _log(self, msg):
+        self.log.configure(state="normal")
+        self.log.insert("end", f"► {msg}\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    # ── ZOOM ──────────────────────────────────────────────────────────────
+    def _on_scroll(self, event):
+        if event.inaxes not in self.axes:
+            return
+        ax     = event.inaxes
+        factor = 0.85 if event.button == "up" else 1.15
+        xlim   = ax.get_xlim(); ylim = ax.get_ylim()
+        cx, cy = event.xdata, event.ydata
+        ax.set_xlim([cx + (x - cx) * factor for x in xlim])
+        ax.set_ylim([cy + (y - cy) * factor for y in ylim])
+        self.canvas.draw_idle()
+
+    # ── LOAD PLOTS ────────────────────────────────────────────────────────
+    def _load_plots(self):
+        folder = filedialog.askdirectory(title="Dossier des plots HDR")
+        if not folder:
+            return
+        self.plots = []
+        self.plot_list.delete(0, "end")
+        for hdr in rglob_hdr(folder):
+            try:
+                cube, meta = load_hdr(hdr)
+                B, H, W    = cube.shape
+                # wavelengths depuis metadata
+                wl = None
+                if "wavelength" in meta:
+                    wl = np.array([float(x) for x in meta["wavelength"]])
+                else:
+                    wl = np.arange(B, dtype=np.float32)
+                ratio = compute_ratio(cube, wl)
+                self.plots.append({
+                    "name"       : hdr.stem,
+                    "cube"       : cube,
+                    "meta"       : meta,
+                    "wavelengths": wl,
+                    "ratio"      : ratio,
+                    "hdr_path"   : hdr
+                })
+                self.plot_list.insert("end", hdr.stem)
+            except Exception as e:
+                self._log(f"Erreur {hdr.name}: {e}")
+
+        self._log(f"{len(self.plots)} plot(s) chargé(s)")
+        if self.plots:
+            self._show_plot(0)
+
+    def _on_plot_select(self, event):
+        sel = self.plot_list.curselection()
+        if sel:
+            self._show_plot(sel[0])
+
+    def _show_plot(self, idx):
+        self.current_plot = idx
+        self._clear_polygon()
+        self.result_cube  = None
+        self.placed_rects = []
+        self.annotations  = []
+        p = self.plots[idx]
+        self.axes[0].clear()
+        self.axes[1].clear()
+        for ax in self.axes:
+            ax.set_facecolor("#0a0a12"); ax.axis("off")
+        self.axes[0].imshow(p["ratio"], cmap="RdYlGn", aspect="auto")
+        self.axes[0].set_title(f"{p['name']} — ratio {WL1}/{WL2}nm",
+                               color="#e2e8f0", fontsize=9)
+        self.axes[1].imshow(p["ratio"], cmap="RdYlGn", aspect="auto")
+        self.axes[1].set_title("Après placement", color="#e2e8f0", fontsize=9)
+        self.canvas.draw()
+        self._log(f"Plot : {p['name']}  shape={p['cube'].shape}")
+
+    def _recalc_ratio(self):
+        global WL1, WL2
+        try:
+            WL1 = float(self.wl1_var.get())
+            WL2 = float(self.wl2_var.get())
+        except ValueError:
+            messagebox.showerror("Erreur", "Valeurs de longueur d'onde invalides.")
+            return
+        if self.plots:
+            p = self.plots[self.current_plot]
+            p["ratio"] = compute_ratio(p["cube"], p["wavelengths"])
+            self._show_plot(self.current_plot)
+        self._log(f"Ratio recalculé : {WL1}nm / {WL2}nm")
+
+    # ── LOAD EXTRUDES ─────────────────────────────────────────────────────
+    def _load_extrudes(self):
+        folder = filedialog.askdirectory(title="Dossier des extrudes HDR")
+        if not folder:
+            return
+        self.extrudes = []
+        classes = set()
+        for hdr in rglob_hdr(folder):
+            try:
+                cube, meta = load_hdr(hdr)
+                # classe = nom du dossier parent
+                class_name = hdr.parent.name
+                self.extrudes.append({
+                    "name"      : hdr.stem,
+                    "cube"      : cube,
+                    "class_name": class_name,
+                    "hdr_path"  : hdr
+                })
+                classes.add(class_name)
+            except Exception as e:
+                self._log(f"Erreur {hdr.name}: {e}")
+
+        self.extrude_info.configure(text=f"{len(self.extrudes)} extrude(s) chargé(s)")
+        self.class_combo["values"] = ["Toutes"] + sorted(classes)
+        self.class_combo.set("Toutes")
+        self._log(f"{len(self.extrudes)} extrude(s) | classes : {sorted(classes)}")
+
+    # ── POLYGON ───────────────────────────────────────────────────────────
+    def _start_polygon(self):
+        self._drawing_polygon = True
+        self.polygon_pts      = []
+        self.polygon_done     = False
+        if self.polygon_patch:
+            try:
+                self.polygon_patch.remove()
+            except:
+                pass
+            self.polygon_patch = None
+        self.draw_var.set("✏️  Dessin polygon actif")
+        self.canvas.draw_idle()
+
+    def _close_polygon(self):
+        if len(self.polygon_pts) < 3:
+            messagebox.showwarning("Polygon", "Il faut au moins 3 points.")
+            return
+        self._drawing_polygon = False
+        self.polygon_done     = True
+        self.draw_var.set("✅ Polygon fermé")
+        self._redraw_polygon()
+        self._log(f"Polygon fermé : {len(self.polygon_pts)} points")
+
+    def _clear_polygon(self):
+        self._drawing_polygon = False
+        self.polygon_pts      = []
+        self.polygon_done     = False
+        self.draw_var.set("Navigation")
+        if self.polygon_patch:
+            try:
+                self.polygon_patch.remove()
+            except:
+                pass
+            self.polygon_patch = None
+        self.canvas.draw_idle()
+
+    def _on_press(self, event):
+        if not self._drawing_polygon:
+            return
+        if event.inaxes not in self.axes:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        self.polygon_pts.append((event.xdata, event.ydata))
+        self._redraw_polygon()
+
+    def _redraw_polygon(self):
+        if self.polygon_patch:
+            try:
+                self.polygon_patch.remove()
+            except:
+                pass
+        if len(self.polygon_pts) < 2:
+            self.canvas.draw_idle()
+            return
+        pts   = np.array(self.polygon_pts)
+        closed = self.polygon_done
+        patch  = MplPolygon(pts, closed=closed,
+                            linewidth=1.5, edgecolor="#7c83fd",
+                            facecolor="#7c83fd" if closed else "none",
+                            alpha=0.25 if closed else 1.0, linestyle="--")
+        self.axes[0].add_patch(patch)
+        self.polygon_patch = patch
+        self.canvas.draw_idle()
+
+    # ── PLACE EXTRUDES ────────────────────────────────────────────────────
+    def _place_extrudes(self):
+        if not self.plots:
+            messagebox.showwarning("Plots", "Chargez d'abord des plots.")
+            return
+        if not self.extrudes:
+            messagebox.showwarning("Extrudes", "Chargez d'abord des extrudes.")
+            return
+        if not self.polygon_done or len(self.polygon_pts) < 3:
+            messagebox.showwarning("Polygon", "Dessinez et fermez un polygon d'abord.")
+            return
+
+        try:
+            n_place = int(self.n_place_var.get())
+        except ValueError:
+            messagebox.showerror("Erreur", "Nombre d'extrudes invalide.")
+            return
+
+        p          = self.plots[self.current_plot]
+        B, H, W    = p["cube"].shape
+        result     = p["cube"].copy()
+        rng        = np.random.default_rng()
+        annotations= []
+
+        # polygon en coordonnées pixel (x=col, y=row)
+        poly_pts_px = [(int(round(x)), int(round(y))) for x, y in self.polygon_pts]
+        mask        = polygon_mask(H, W, [(y, x) for x, y in poly_pts_px])
+        # mask est (H,W) avec row=y, col=x
+
+        # filtrer les extrudes par classe
+        selected_class = self.class_var.get()
+        pool = self.extrudes if selected_class in ("Toutes", "") else \
+               [e for e in self.extrudes if e["class_name"] == selected_class]
+
+        if not pool:
+            messagebox.showwarning("Extrudes", f"Aucun extrude pour la classe '{selected_class}'.")
+            return
+
+        placed_rects = []
+        for _ in range(n_place):
+            ext        = pool[rng.integers(len(pool))]
+            ext_cube   = ext["cube"]               # (B, He, We)
+            class_name = ext["class_name"]
+
+            # adapter B si nécessaire
+            Be, He, We = ext_cube.shape
+            if Be != B:
+                self._log(f"  Attention : bandes extrude ({Be}) ≠ plot ({B}), ignoré")
+                continue
+
+            result, rect = place_extrude_random(result, ext_cube, mask, rng=rng)
+            if rect is None:
+                self._log("  Pas de place trouvée pour un extrude")
+                continue
+
+            r0, c0, r1, c1 = rect
+            placed_rects.append((r0, c0, r1, c1, class_name))
+
+            # annotation labelme : polygon rectangulaire
+            # points en [x, y] = [col, row]
+            pts_ann = [
+                [c0, r0], [c1, r0], [c1, r1], [c0, r1]
+            ]
+            annotations.append({
+                "label" : class_name,
+                "points": pts_ann
+            })
+            self._log(f"  Placé {class_name} @ ({r0},{c0})-({r1},{c1})")
+
+        self.result_cube  = result
+        self.placed_rects = placed_rects
+        self.annotations  = annotations
+
+        # calcul du ratio du résultat
+        wl    = p["wavelengths"]
+        ratio = compute_ratio(result, wl)
+
+        # redessiner le panneau droit
+        self.axes[1].clear()
+        self.axes[1].set_facecolor("#0a0a12")
+        self.axes[1].imshow(ratio, cmap="RdYlGn", aspect="auto")
+        self.axes[1].set_title("Après placement", color="#e2e8f0", fontsize=9)
+
+        # afficher les rectangles
+        from matplotlib.patches import Rectangle
+        for r0, c0, r1, c1, cname in placed_rects:
+            rect_patch = Rectangle((c0, r0), c1-c0, r1-r0,
+                                   linewidth=1.5, edgecolor="#f9a825",
+                                   facecolor="#f9a825", alpha=0.25)
+            self.axes[1].add_patch(rect_patch)
+            self.axes[1].text(c0+1, r0+1, cname, color="#f9a825",
+                              fontsize=6, va="top",
+                              bbox=dict(fc="#0f0f17", alpha=0.6, pad=1))
+
+        # afficher aussi le polygon sur les deux panneaux
+        from matplotlib.patches import Polygon as MplPoly
+        for ax in self.axes:
+            ax.add_patch(MplPoly(np.array(self.polygon_pts), closed=True,
+                                 linewidth=1.2, edgecolor="#7c83fd",
+                                 facecolor="none", linestyle="--"))
+
+        self.canvas.draw()
+        self._log(f"{len(placed_rects)} extrude(s) placé(s) sur '{p['name']}'")
+
+    # ── SAVE ──────────────────────────────────────────────────────────────
+    def _pick_outdir(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.out_var.set(d)
+
+    def _save(self):
+        if self.result_cube is None:
+            messagebox.showwarning("Sauvegarde", "Placez d'abord des extrudes.")
+            return
+
+        out_dir = Path(self.out_var.get())
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        p        = self.plots[self.current_plot]
+        B, H, W  = self.result_cube.shape
+        stem     = p["name"]
+
+        # sauvegarde HDR
+        meta = p["meta"].copy()
+        meta["lines"]   = H
+        meta["samples"] = W
+        meta["bands"]   = B
+        hdr_out = out_dir / f"{stem}_placed.hdr"
+        envi.save_image(str(hdr_out), self.result_cube, dtype=np.float32,
+                        interleave="bil", force=True, metadata=meta)
+        self._log(f"HDR sauvegardé : {hdr_out.name}")
+
+        # sauvegarde JSON labelme
+        # ajouter le polygon dessiné comme annotation "zone_placement"
+        ann_full = list(self.annotations)
+        ann_full.append({
+            "label" : "zone_placement",
+            "points": [[x, y] for x, y in self.polygon_pts]
+        })
+        json_data = make_labelme_json(f"{stem}_placed.png", H, W, ann_full)
+        json_out  = out_dir / f"{stem}_placed.json"
+        with open(json_out, "w") as f:
+            json.dump(json_data, f, indent=2)
+        self._log(f"JSON sauvegardé : {json_out.name}")
+
+        # sauvegarde cartographie ratio PNG
+        wl    = p["wavelengths"]
+        ratio = compute_ratio(self.result_cube, wl)
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5), facecolor="#0f0f17")
+        for ax in axes:
+            ax.set_facecolor("#0a0a12"); ax.axis("off")
+        axes[0].imshow(p["ratio"], cmap="RdYlGn", aspect="auto")
+        axes[0].set_title("Original", color="#e2e8f0")
+        axes[1].imshow(ratio, cmap="RdYlGn", aspect="auto")
+        axes[1].set_title("Après placement", color="#e2e8f0")
+        from matplotlib.patches import Rectangle, Polygon as MplPoly
+        for r0, c0, r1, c1, cname in self.placed_rects:
+            rp = Rectangle((c0, r0), c1-c0, r1-r0,
+                           linewidth=1.5, edgecolor="#f9a825",
+                           facecolor="#f9a825", alpha=0.3)
+            axes[1].add_patch(rp)
+            axes[1].text(c0+1, r0+1, cname, color="#f9a825", fontsize=6,
+                         va="top", bbox=dict(fc="#0f0f17", alpha=0.6, pad=1))
+        axes[1].add_patch(MplPoly(np.array(self.polygon_pts), closed=True,
+                                  linewidth=1.2, edgecolor="#7c83fd",
+                                  facecolor="none", linestyle="--"))
+        fig.suptitle(stem, color="#e2e8f0", fontsize=11)
+        plt.tight_layout()
+        png_out = out_dir / f"{stem}_placed_ratio.png"
+        plt.savefig(png_out, dpi=120, facecolor="#0f0f17")
+        plt.close()
+        self._log(f"PNG sauvegardé : {png_out.name}")
+
+        messagebox.showinfo("Sauvegarde",
+                            f"Fichiers sauvegardés dans :\n{out_dir}")
+
+
+# ─────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    app = ExtrudeApp()
+    app.mainloop()
