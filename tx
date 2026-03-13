@@ -730,8 +730,41 @@ print("  Recalage niveaux GAN sur voisins réels...")
 matched = match_gan_to_local_neighbors_vectorized(
     cube_gan      = inpainted,
     remove_mask   = remove_mask,
-    smooth_sigma  = 15.0    
+    smooth_sigma  = 15.0    # augmenter pour recalage plus global
+                            # diminuer pour recalage plus local
 )
 
 print("  Lissage des contours...")
 smoothed = smooth_inpainted_zone(matched, remove_mask, ...)
+
+
+if smooth_method == "bilateral":
+    smoothed = cube.copy()
+
+    for iteration in range(n_iter):
+        for b in range(B):
+            band                      = smoothed[b].copy()
+            band_min, band_max        = band.min(), band.max()
+            band_norm                 = ((band - band_min) / (band_max - band_min + 1e-8)).astype(np.float32)
+            band_filtered             = cv2.bilateralFilter(band_norm, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+            band_result               = band_filtered * (band_max - band_min) + band_min
+            smoothed[b][remove_mask]  = band_result[remove_mask]
+            smoothed[b][~remove_mask] = cube[b][~remove_mask]
+        print(f"  bilateral iter {iteration+1}/{n_iter}")
+
+
+    for iteration in range(n_iter_laplace):
+        for b in range(B):
+            band = smoothed[b].copy()
+
+            neighbors_mean = (
+                np.roll(band,  1, axis=0) +
+                np.roll(band, -1, axis=0) +
+                np.roll(band,  1, axis=1) +
+                np.roll(band, -1, axis=1)
+            ) / 4.0
+
+            smoothed[b][remove_mask]  = neighbors_mean[remove_mask]
+            smoothed[b][~remove_mask] = cube[b][~remove_mask]
+
+        print(f"  laplace iter {iteration+1}/{n_iter_laplace}")
