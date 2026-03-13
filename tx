@@ -842,24 +842,50 @@ for b in range(B):
     smoothed[b][~remove_mask] = cube[b][~remove_mask]
 
 
-# recaler les niveaux GAN sur les voisins réels AVANT tout lissage
 def recale_gan(cube_gan, remove_mask, sigma=20.0):
     from scipy.ndimage import gaussian_filter
     result = cube_gan.copy()
     B      = cube_gan.shape[0]
+
     for b in range(B):
         band      = cube_gan[b].copy()
-        real_mean = band[~remove_mask].mean()
-        real_std  = band[~remove_mask].std() + 1e-8
-        filled    = band.copy()
-        filled[remove_mask] = real_mean
-        local_mean          = gaussian_filter(filled, sigma=sigma)
-        gan_mean            = band[remove_mask].mean()
-        gan_std             = band[remove_mask].std() + 1e-8
+
+        # moyenne et std uniquement sur les pixels REELS
+        real_vals  = band[~remove_mask]
+        real_mean  = real_vals.mean()
+        real_std   = real_vals.std() + 1e-8
+
+        # champ de moyenne locale construit UNIQUEMENT depuis les pixels réels
+        # les pixels masqués sont mis à 0 pour ne pas polluer le lissage
+        real_only               = np.zeros_like(band)
+        real_only[~remove_mask] = band[~remove_mask]
+
+        # poids pour normaliser : 1 sur les pixels réels, 0 sur les masqués
+        weights               = np.zeros_like(band)
+        weights[~remove_mask] = 1.0
+
+        # lissage des deux séparément puis division
+        real_smoothed   = gaussian_filter(real_only, sigma=sigma)
+        weight_smoothed = gaussian_filter(weights,   sigma=sigma) + 1e-8
+
+        # champ de moyenne locale pondérée : moyenne des voisins réels uniquement
+        local_mean_real = real_smoothed / weight_smoothed
+
+        # std locale des pixels réels
+        real_sq_smoothed = gaussian_filter(real_only**2,  sigma=sigma)
+        local_var_real   = real_sq_smoothed / weight_smoothed - local_mean_real**2
+        local_std_real   = np.sqrt(np.maximum(local_var_real, 0)) + 1e-8
+
+        # recalage : centre le GAN sur le niveau local réel
+        gan_vals  = band[remove_mask]
+        gan_mean  = gan_vals.mean()
+        gan_std   = gan_vals.std() + 1e-8
+
         result[b][remove_mask] = (
-            local_mean[remove_mask] +
-            (band[remove_mask] - gan_mean) / gan_std * real_std
+            local_mean_real[remove_mask] +
+            (gan_vals - gan_mean) / gan_std * local_std_real[remove_mask]
         )
+
     return result
 
 inpainted = inpaint_cube(...)
