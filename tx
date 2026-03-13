@@ -697,3 +697,41 @@ elif sharpen_method == "conv_sharp":
                     (band_max - band_min + 1e-8)).astype(np.float32)
         sharpened = cv2.filter2D(band_norm, -1, sharp_kernel)
         result[b] = np.clip(sharpened, 0, 1) * (band_max - band_min) + band_min
+
+
+def match_gan_to_local_neighbors_vectorized(cube_gan, remove_mask, smooth_sigma=15.0):
+    from scipy.ndimage import gaussian_filter
+
+    result = cube_gan.copy()
+    B      = cube_gan.shape[0]
+
+    for b in range(B):
+        band      = cube_gan[b].copy()
+        real_mean = band[~remove_mask].mean()
+        real_std  = band[~remove_mask].std() + 1e-8
+
+        band_filled              = band.copy()
+        band_filled[remove_mask] = real_mean
+        local_mean               = gaussian_filter(band_filled, sigma=smooth_sigma)
+
+        gan_zone_mean = band[remove_mask].mean()
+        gan_zone_std  = band[remove_mask].std() + 1e-8
+
+        result[b][remove_mask] = (
+            local_mean[remove_mask] +
+            (band[remove_mask] - gan_zone_mean) / gan_zone_std * real_std
+        )
+
+    return result
+
+inpainted = inpaint_cube(...)
+
+print("  Recalage niveaux GAN sur voisins réels...")
+matched = match_gan_to_local_neighbors_vectorized(
+    cube_gan      = inpainted,
+    remove_mask   = remove_mask,
+    smooth_sigma  = 15.0    
+)
+
+print("  Lissage des contours...")
+smoothed = smooth_inpainted_zone(matched, remove_mask, ...)
