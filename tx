@@ -891,3 +891,14 @@ def recale_gan(cube_gan, remove_mask, sigma=20.0):
 inpainted = inpaint_cube(...)
 recaled   = recale_gan(inpainted, remove_mask, sigma=20.0)  
 smoothed  = smooth_inpainted_zone(recaled, remove_mask, ...) 
+
+neighbors_mean = (
+    np.roll(band,  1, axis=0) +
+    np.roll(band, -1, axis=0) +
+    np.roll(band,  1, axis=1) +
+    np.roll(band, -1, axis=1) +
+    np.roll(np.roll(band,  1, axis=0),  1, axis=1) +
+    np.roll(np.roll(band,  1, axis=0), -1, axis=1) +
+    np.roll(np.roll(band, -1, axis=0),  1, axis=1) +
+    np.roll(np.roll(band, -1, axis=0), -1, axis=1)
+) / 8.0
