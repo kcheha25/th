@@ -840,3 +840,28 @@ for b in range(B):
     smoothed[b][remove_mask]  = np.clip(sharpened[remove_mask],
                                          band_real_min, band_real_max)
     smoothed[b][~remove_mask] = cube[b][~remove_mask]
+
+
+# recaler les niveaux GAN sur les voisins réels AVANT tout lissage
+def recale_gan(cube_gan, remove_mask, sigma=20.0):
+    from scipy.ndimage import gaussian_filter
+    result = cube_gan.copy()
+    B      = cube_gan.shape[0]
+    for b in range(B):
+        band      = cube_gan[b].copy()
+        real_mean = band[~remove_mask].mean()
+        real_std  = band[~remove_mask].std() + 1e-8
+        filled    = band.copy()
+        filled[remove_mask] = real_mean
+        local_mean          = gaussian_filter(filled, sigma=sigma)
+        gan_mean            = band[remove_mask].mean()
+        gan_std             = band[remove_mask].std() + 1e-8
+        result[b][remove_mask] = (
+            local_mean[remove_mask] +
+            (band[remove_mask] - gan_mean) / gan_std * real_std
+        )
+    return result
+
+inpainted = inpaint_cube(...)
+recaled   = recale_gan(inpainted, remove_mask, sigma=20.0)  
+smoothed  = smooth_inpainted_zone(recaled, remove_mask, ...) 
