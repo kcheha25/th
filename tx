@@ -768,3 +768,39 @@ if smooth_method == "bilateral":
             smoothed[b][~remove_mask] = cube[b][~remove_mask]
 
         print(f"  laplace iter {iteration+1}/{n_iter_laplace}")
+
+
+# sauvegarder les détails AVANT le bilatéral
+    details = np.zeros_like(cube)
+    for b in range(B):
+        band          = cube[b].copy()
+        blurred       = gaussian_filter(band, sigma=sharpen_sigma)
+        details[b]    = band - blurred   # détails haute fréquence du cube original
+
+    # première passe : bilatéral
+    smoothed = cube.copy()
+    for iteration in range(n_iter):
+        for b in range(B):
+            band                      = smoothed[b].copy()
+            band_min, band_max        = band.min(), band.max()
+            band_norm                 = ((band - band_min) / (band_max - band_min + 1e-8)).astype(np.float32)
+            band_filtered             = cv2.bilateralFilter(band_norm, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+            band_result               = band_filtered * (band_max - band_min) + band_min
+            smoothed[b][remove_mask]  = band_result[remove_mask]
+            smoothed[b][~remove_mask] = cube[b][~remove_mask]
+        print(f"  bilateral iter {iteration+1}/{n_iter}")
+
+    # réinjecter les détails originaux APRES le bilatéral
+    # uniquement sur les pixels masqués
+    for b in range(B):
+        band_real_min = cube[b][~remove_mask].min()
+        band_real_max = cube[b][~remove_mask].max()
+
+        sharpened = smoothed[b] + sharpen_amount * details[b]
+
+        smoothed[b][remove_mask]  = np.clip(
+            sharpened[remove_mask],
+            band_real_min,
+            band_real_max
+        )
+        smoothed[b][~remove_mask] = cube[b][~remove_mask]
