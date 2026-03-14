@@ -447,17 +447,56 @@ def plot_random_band(cube, remove_mask, title, out_path=None):
 
 def smooth_inpainted_zone(cube, remove_mask, sigma=1.2, blend_radius=3):
     B, H, W = cube.shape
-    result  = cube.copy()
-    dist_from_edge = distance_transform_edt(remove_mask)
-    max_dist       = dist_from_edge.max()
-    if max_dist == 0:
-        return result
-    alpha = np.clip(dist_from_edge / blend_radius, 0, 1)
+smoothed = cube.copy()
+
+# ── 1. DIFFUSION DE LAPLACE AVEC OMEGA ───────────────────────────────────
+for iteration in range(n_iter_laplace):
     for b in range(B):
-        band          = result[b].copy()
-        band_smoothed = gaussian_filter(band, sigma=sigma)
-        blended       = alpha * band + (1 - alpha) * band_smoothed
-        result[b][remove_mask] = blended[remove_mask]
+        band           = smoothed[b].copy()
+        neighbors_mean = (
+            np.roll(band,  1, axis=0) +
+            np.roll(band, -1, axis=0) +
+            np.roll(band,  1, axis=1) +
+            np.roll(band, -1, axis=1)
+        ) / 4.0
+        smoothed[b][remove_mask]  = (
+            omega       * smoothed[b][remove_mask] +
+            (1 - omega) * neighbors_mean[remove_mask]
+        )
+        smoothed[b][~remove_mask] = cube[b][~remove_mask]
+
+# ── 2. EXTRACTION DES DETAILS REELS ──────────────────────────────────────
+details_real = np.zeros_like(cube)
+for b in range(B):
+    band_real              = cube[b].copy().astype(np.float32)
+    band_real[remove_mask] = 0
+    blurred                = cv2.bilateralFilter(band_real,
+                                                  d          = bilateral_d,
+                                                  sigmaColor = bilateral_sc,
+                                                  sigmaSpace = bilateral_ss)
+    details                = band_real - blurred
+    details_real[b]        = gaussian_filter(details, sigma=2.0)
+
+# ── 3. UNSHARP SUR TOUT LE PLOT AVEC BILATERAL ───────────────────────────
+for b in range(B):
+    band_real_min = cube[b][~remove_mask].min()
+    band_real_max = cube[b][~remove_mask].max()
+
+    band_norm     = ((smoothed[b] - band_real_min) /
+                    (band_real_max - band_real_min + 1e-8)).astype(np.float32)
+
+    blurred       = cv2.bilateralFilter(band_norm,
+                                         d          = bilateral_d,
+                                         sigmaColor = bilateral_sc,
+                                         sigmaSpace = bilateral_ss)
+    detail        = band_norm - blurred
+    sharpened     = band_norm + sharpen_amount * detail
+
+    sharpened[remove_mask] += details_real[b][remove_mask]
+
+    band_result               = np.clip(sharpened, 0, 1) * (band_real_max - band_real_min) + band_real_min
+    smoothed[b]               = band_result
+    smoothed[b][~remove_mask] = cube[b][~remove_mask]
     return result
 
 
@@ -955,3 +994,51 @@ for b in range(B):
     band_result               = np.clip(sharpened, 0, 1) * (band_real_max - band_real_min) + band_real_min
     smoothed[b]               = band_result
     smoothed[b][~remove_mask] = cube[b][~remove_mask]
+
+
+
+def blend_boundary(cube_inpainted, cube_original, remove_mask,
+                   blend_radius=8, sigma_blend=3.0):
+    result   = cube_inpainted.copy()
+    B, H, W  = cube_inpainted.shape
+
+    dist_outside               = distance_transform_edt(~remove_mask)
+    blend_zone                 = (dist_outside <= blend_radius) & (~remove_mask)
+    alpha_outside              = np.zeros((H, W), dtype=np.float32)
+    alpha_outside[blend_zone]  = dist_outside[blend_zone] / blend_radius
+    alpha_outside[~remove_mask & ~blend_zone] = 1.0
+    alpha_outside              = np.clip(alpha_outside, 0, 1)
+
+    dist_inside               = distance_transform_edt(remove_mask)
+    alpha_inside              = np.zeros((H, W), dtype=np.float32)
+    alpha_inside[remove_mask] = np.clip(dist_inside[remove_mask] / blend_radius, 0, 1)
+
+    for b in range(B):
+        inpainted_band = cube_inpainted[b].copy().astype(np.float32)
+        original_band  = cube_original[b].copy().astype(np.float32)
+        blended        = gaussian_filter(inpainted_band, sigma=sigma_blend)
+        final          = original_band.copy()
+        final[remove_mask] = (
+            alpha_inside[remove_mask]       * inpainted_band[remove_mask] +
+            (1 - alpha_inside[remove_mask]) * blended[remove_mask]
+        )
+        final[blend_zone] = (
+            alpha_outside[blend_zone]       * original_band[blend_zone] +
+            (1 - alpha_outside[blend_zone]) * blended[blend_zone]
+        )
+        result[b] = final
+        if b % 50 == 0:
+            print(f"  blend boundary bande {b}/{B}")
+
+    return result
+
+smoothed = smooth_inpainted_zone(recaled, remove_mask, ...)
+
+print("  Fondu des bords...")
+final = blend_boundary(
+    cube_inpainted = smoothed,
+    cube_original  = cube_HBW,
+    remove_mask    = remove_mask,
+    blend_radius   = 8,
+    sigma_blend    = 3.0
+)
