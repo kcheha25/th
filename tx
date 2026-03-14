@@ -902,3 +902,80 @@ for b in range(B):
     sharpened[remove_mask] += details_real[b][remove_mask]
     smoothed[b]               = np.clip(sharpened, band_real_min, band_real_max)
     smoothed[b][~remove_mask] = cube[b][~remove_mask]
+
+
+
+import numpy as np
+from scipy.ndimage import gaussian_filter
+
+smoothed = cube.copy()
+
+# image guide pour structure spatiale
+guide = np.mean(cube, axis=0)
+gx_real, gy_real = np.gradient(guide)
+
+for b in range(B):
+
+    band_real = cube[b].copy()
+    band_gan  = smoothed[b].copy()
+
+    # -------------------------
+    # 1. gradient transfer
+    # -------------------------
+    gx_gan, gy_gan = np.gradient(band_gan)
+
+    alpha = 0.75
+
+    gx_mix = gx_gan.copy()
+    gy_mix = gy_gan.copy()
+
+    gx_mix[remove_mask] = (
+        alpha * gx_real[remove_mask] +
+        (1 - alpha) * gx_gan[remove_mask]
+    )
+
+    gy_mix[remove_mask] = (
+        alpha * gy_real[remove_mask] +
+        (1 - alpha) * gy_gan[remove_mask]
+    )
+
+    # -------------------------
+    # 2. intégration des gradients
+    # -------------------------
+    recon = np.zeros_like(band_gan)
+
+    for y in range(1, recon.shape[0]):
+        recon[y,0] = recon[y-1,0] + gy_mix[y-1,0]
+
+    for x in range(1, recon.shape[1]):
+        recon[:,x] = recon[:,x-1] + gx_mix[:,x-1]
+
+    # -------------------------
+    # 3. texture réelle
+    # -------------------------
+    blur_small = gaussian_filter(band_real, 1)
+    blur_large = gaussian_filter(band_real, 3)
+
+    texture = blur_small - blur_large
+
+    texture[remove_mask] = gaussian_filter(
+        texture * (~remove_mask), 2
+    )[remove_mask]
+
+    texture_gain = 0.8
+
+    sharpened = recon + texture_gain * texture
+
+    # -------------------------
+    # 4. contraintes pixels réels
+    # -------------------------
+    band_real_min = band_real[~remove_mask].min()
+    band_real_max = band_real[~remove_mask].max()
+
+    smoothed[b][remove_mask] = np.clip(
+        sharpened[remove_mask],
+        band_real_min,
+        band_real_max
+    )
+
+    smoothed[b][~remove_mask] = band_real[~remove_mask]
