@@ -905,69 +905,53 @@ for b in range(B):
 
 
 
-def smooth_inpainted_zone(cube, remove_mask,
-                          guided_radius  = 8,
-                          guided_eps     = 0.01,
-                          aniso_iter     = 30,
-                          aniso_kappa    = 0.1,
-                          aniso_gamma    = 0.1,
-                          sharpen_sigma  = 0.5,
-                          sharpen_amount = 1.5):
+smoothed = cube.copy()
 
-    result  = cube.copy()
-    B, H, W = cube.shape
-
+# ── 1. DIFFUSION DE LAPLACE AVEC OMEGA ───────────────────────────────────
+for iteration in range(n_iter_laplace):
     for b in range(B):
-        band_gan      = cube[b].copy().astype(np.float32)
-        band_real     = cube[b].copy().astype(np.float32)
-        band_real_min = band_real[~remove_mask].min()
-        band_real_max = band_real[~remove_mask].max()
+        band           = smoothed[b].copy()
+        neighbors_mean = (
+            np.roll(band,  1, axis=0) +
+            np.roll(band, -1, axis=0) +
+            np.roll(band,  1, axis=1) +
+            np.roll(band, -1, axis=1)
+        ) / 4.0
+        smoothed[b][remove_mask]  = (
+            omega       * smoothed[b][remove_mask] +
+            (1 - omega) * neighbors_mean[remove_mask]
+        )
+        smoothed[b][~remove_mask] = cube[b][~remove_mask]
 
-        rng       = band_real_max - band_real_min + 1e-8
-        gan_norm  = ((band_gan  - band_real_min) / rng).astype(np.float32)
-        real_norm = ((band_real - band_real_min) / rng).astype(np.float32)
+# ── 2. EXTRACTION DES DETAILS REELS ──────────────────────────────────────
+details_real = np.zeros_like(cube)
+for b in range(B):
+    band_real              = cube[b].copy().astype(np.float32)
+    band_real[remove_mask] = 0
+    blurred                = cv2.bilateralFilter(band_real,
+                                                  d          = bilateral_d,
+                                                  sigmaColor = bilateral_sc,
+                                                  sigmaSpace = bilateral_ss)
+    details                = band_real - blurred
+    details_real[b]        = gaussian_filter(details, sigma=2.0)
 
-        # ── ETAPE 1 : filtre guidé ────────────────────────────────────────
-        mean_guide = cv2.boxFilter(real_norm, -1, (guided_radius, guided_radius))
-        mean_src   = cv2.boxFilter(gan_norm,  -1, (guided_radius, guided_radius))
-        mean_gs    = cv2.boxFilter(real_norm * gan_norm,   -1, (guided_radius, guided_radius))
-        mean_gg    = cv2.boxFilter(real_norm * real_norm,  -1, (guided_radius, guided_radius))
-        var_guide  = mean_gg  - mean_guide * mean_guide
-        cov_gs     = mean_gs  - mean_guide * mean_src
-        a          = cov_gs / (var_guide + guided_eps)
-        b_coef     = mean_src - a * mean_guide
-        mean_a     = cv2.boxFilter(a,      -1, (guided_radius, guided_radius))
-        mean_b     = cv2.boxFilter(b_coef, -1, (guided_radius, guided_radius))
-        guided     = mean_a * real_norm + mean_b
-        guided[~remove_mask] = real_norm[~remove_mask]
+# ── 3. UNSHARP SUR TOUT LE PLOT AVEC BILATERAL ───────────────────────────
+for b in range(B):
+    band_real_min = cube[b][~remove_mask].min()
+    band_real_max = cube[b][~remove_mask].max()
 
-        # ── ETAPE 2 : diffusion anisotrope ───────────────────────────────
-        diffused = guided.copy()
-        for _ in range(aniso_iter):
-            band_d = diffused.copy()
-            gN     = np.roll(band_d, -1, axis=0) - band_d
-            gS     = np.roll(band_d,  1, axis=0) - band_d
-            gE     = np.roll(band_d, -1, axis=1) - band_d
-            gW     = np.roll(band_d,  1, axis=1) - band_d
-            cN     = np.exp(-(gN / aniso_kappa)**2)
-            cS     = np.exp(-(gS / aniso_kappa)**2)
-            cE     = np.exp(-(gE / aniso_kappa)**2)
-            cW     = np.exp(-(gW / aniso_kappa)**2)
-            diff   = aniso_gamma * (cN*gN + cS*gS + cE*gE + cW*gW)
-            diffused[remove_mask] = (band_d + diff)[remove_mask]
-            diffused[~remove_mask] = real_norm[~remove_mask]
+    band_norm     = ((smoothed[b] - band_real_min) /
+                    (band_real_max - band_real_min + 1e-8)).astype(np.float32)
 
-        # ── ETAPE 3 : unsharp masking sur tout le plot ───────────────────
-        blurred                 = gaussian_filter(diffused, sigma=sharpen_sigma)
-        detail                  = diffused - blurred
-        sharpened               = diffused + sharpen_amount * detail
-        sharpened[~remove_mask] = real_norm[~remove_mask]
+    blurred       = cv2.bilateralFilter(band_norm,
+                                         d          = bilateral_d,
+                                         sigmaColor = bilateral_sc,
+                                         sigmaSpace = bilateral_ss)
+    detail        = band_norm - blurred
+    sharpened     = band_norm + sharpen_amount * detail
 
-        # remet à l échelle originale
-        result[b]               = np.clip(sharpened, 0, 1) * rng + band_real_min
-        result[b][~remove_mask] = cube[b][~remove_mask]
+    sharpened[remove_mask] += details_real[b][remove_mask]
 
-        if b % 50 == 0:
-            print(f"  smooth bande {b}/{B}")
-
-    return result
+    band_result               = np.clip(sharpened, 0, 1) * (band_real_max - band_real_min) + band_real_min
+    smoothed[b]               = band_result
+    smoothed[b][~remove_mask] = cube[b][~remove_mask]
