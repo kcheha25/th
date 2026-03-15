@@ -1,0 +1,578 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from pathlib import Path
+import json
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.collections import PatchCollection
+import spectral.io.envi as envi
+import cv2
+import random
+
+
+def load_hdr(hdr_path):
+    img  = envi.open(str(hdr_path))
+    cube = np.array(img.load(), dtype=np.float32)
+    meta = img.metadata.copy()
+    return cube, meta
+
+
+def get_valid_mask_fast(cube, threshold=1e-6):
+    return cube.var(axis=0) > threshold
+
+
+def find_contour_polygons(valid_mask):
+    mask_u8     = valid_mask.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    polygons = []
+    for cnt in contours:
+        pts = cnt.reshape(-1, 2).tolist()
+        if len(pts) >= 3:
+            polygons.append(pts)
+    return polygons
+
+
+def crop_to_valid(cube, valid_mask):
+    rows = np.where(valid_mask.any(axis=1))[0]
+    cols = np.where(valid_mask.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return cube, valid_mask, 0, 0
+    r0, r1 = rows[0], rows[-1]+1
+    c0, c1 = cols[0], cols[-1]+1
+    return cube[:, r0:r1, c0:c1], valid_mask[r0:r1, c0:c1], r0, c0
+
+
+def compute_mean_map(cube):
+    return cube.mean(axis=0)
+
+
+def polygon_mask_2d(H, W, pts):
+    mask = np.zeros((H, W), dtype=np.uint8)
+    cv2.fillPoly(mask, [np.array(pts, dtype=np.int32)], 1)
+    return mask.astype(bool)
+
+
+def make_labelme_json(image_name, H, W, annotations):
+    shapes = []
+    for ann in annotations:
+        shapes.append({
+            "label"     : ann["label"],
+            "points"    : ann["points"],
+            "group_id"  : None,
+            "shape_type": "polygon",
+            "flags"     : {}
+        })
+    return {
+        "version"    : "5.0.1",
+        "flags"      : {},
+        "shapes"     : shapes,
+        "imagePath"  : image_name,
+        "imageData"  : None,
+        "imageHeight": H,
+        "imageWidth" : W
+    }
+
+
+def place_polygon_in_zone(zone_mask, poly_pts, H, W, rng):
+    poly_arr  = np.array(poly_pts)
+    pw        = int(poly_arr[:, 0].max() - poly_arr[:, 0].min())
+    ph        = int(poly_arr[:, 1].max() - poly_arr[:, 1].min())
+    poly_min_x = int(poly_arr[:, 0].min())
+    poly_min_y = int(poly_arr[:, 1].min())
+
+    valid_positions = []
+    zone_rows, zone_cols = np.where(zone_mask)
+    for r, c in zip(zone_rows, zone_cols):
+        if r + ph < H and c + pw < W:
+            sub = zone_mask[r:r+ph, c:c+pw]
+            if sub.all():
+                valid_positions.append((r, c))
+
+    if not valid_positions:
+        if len(zone_rows) == 0:
+            return None
+        idx = rng.integers(len(zone_rows))
+        dr  = max(0, min(int(zone_rows[idx]), H - ph - 1))
+        dc  = max(0, min(int(zone_cols[idx]), W - pw - 1))
+    else:
+        idx = rng.integers(len(valid_positions))
+        dr, dc = valid_positions[idx]
+
+    offset_x = dc - poly_min_x
+    offset_y = dr - poly_min_y
+    new_pts  = [[int(x + offset_x), int(y + offset_y)] for x, y in poly_pts]
+    return new_pts
+
+
+class PlotReviewApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Plot Review & Extrude Placer")
+        self.geometry("1300x860")
+        self.configure(bg="#0f0f17")
+        self._style()
+
+        self.plots         = []
+        self.kept_plots    = []
+        self.extrudes      = []
+        self.current_idx   = 0
+        self.review_done   = False
+
+        self.polygon_pts   = []
+        self.drawing       = False
+        self.polygon_patch = None
+        self.annotations   = []
+        self.placed_patches= []
+
+        self._build_ui()
+
+    def _style(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        bg, fg, acc = "#0f0f17", "#e2e8f0", "#7c83fd"
+        s.configure(".",               background=bg, foreground=fg, font=("Courier New", 10))
+        s.configure("TFrame",          background=bg)
+        s.configure("TLabel",          background=bg, foreground=fg)
+        s.configure("TButton",         background="#1e1e2e", foreground=fg, padding=6)
+        s.configure("TLabelframe",     background=bg, foreground=acc)
+        s.configure("TLabelframe.Label", background=bg, foreground=acc, font=("Courier New", 10, "bold"))
+        s.configure("Treeview",        background="#1e1e2e", foreground=fg, fieldbackground="#1e1e2e", rowheight=20)
+        s.map("Treeview",              background=[("selected", acc)])
+        s.configure("TEntry",          fieldbackground="#1e1e2e", foreground=fg)
+
+    def _build_ui(self):
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self.tab_review = ttk.Frame(nb)
+        self.tab_place  = ttk.Frame(nb)
+        nb.add(self.tab_review, text="  ✅  Review plots  ")
+        nb.add(self.tab_place,  text="  📐  Placer extrudes  ")
+
+        self._build_review_tab()
+        self._build_place_tab()
+
+    def _build_review_tab(self):
+        p = self.tab_review
+
+        left = ttk.Frame(p, width=220)
+        left.pack(side="left", fill="y", padx=(6,0), pady=6)
+        left.pack_propagate(False)
+
+        ttk.Button(left, text="📂 Charger plots HDR",
+                   command=self._load_plots).pack(fill="x", pady=2)
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
+
+        self.review_info = ttk.Label(left, text="0 plot(s) chargé(s)", wraplength=200)
+        self.review_info.pack(pady=4)
+
+        self.kept_var = ttk.Label(left, text="Conservés : 0", foreground="#a6e3a1")
+        self.kept_var.pack()
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
+
+        ttk.Button(left, text="✅ Conserver",
+                   command=self._keep_plot).pack(fill="x", pady=2)
+        ttk.Button(left, text="❌ Supprimer",
+                   command=self._discard_plot).pack(fill="x", pady=2)
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
+
+        ttk.Button(left, text="✔️  Terminer review",
+                   command=self._finish_review).pack(fill="x", pady=2)
+
+        self.review_status = ttk.Label(left, text="", wraplength=200,
+                                       foreground="#f9a825", font=("Courier New", 9))
+        self.review_status.pack(pady=4)
+
+        right = ttk.Frame(p)
+        right.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+
+        self.fig_r, self.ax_r = plt.subplots(figsize=(8, 6), facecolor="#0f0f17")
+        self.ax_r.set_facecolor("#0a0a12")
+        self.ax_r.set_title("Aucun plot chargé", color="#e2e8f0")
+        self.canvas_r = FigureCanvasTkAgg(self.fig_r, master=right)
+        self.canvas_r.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(self.canvas_r, right).update()
+        self.canvas_r.mpl_connect("scroll_event", lambda e: self._scroll(e, self.ax_r, self.canvas_r))
+
+    def _build_place_tab(self):
+        p = self.tab_place
+
+        left = ttk.Frame(p, width=240)
+        left.pack(side="left", fill="y", padx=(6,0), pady=6)
+        left.pack_propagate(False)
+
+        ttk.Button(left, text="📂 Charger dossier extrudes",
+                   command=self._load_extrudes).pack(fill="x", pady=2)
+        self.ext_info = ttk.Label(left, text="0 extrude(s)", font=("Courier New", 9))
+        self.ext_info.pack(pady=2)
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
+
+        ttk.Label(left, text="Plots conservés :").pack(anchor="w", padx=4)
+        self.kept_list = tk.Listbox(left, bg="#1e1e2e", fg="#e2e8f0",
+                                    font=("Courier New", 9), height=6,
+                                    selectmode="single", relief="flat", bd=0)
+        self.kept_list.pack(fill="x", padx=4, pady=2)
+        self.kept_list.bind("<<ListboxSelect>>", self._on_kept_select)
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
+
+        pf = ttk.LabelFrame(left, text="POLYGON ROI")
+        pf.pack(fill="x", pady=(0,4))
+        self.draw_var = tk.StringVar(value="Navigation")
+        ttk.Label(pf, textvariable=self.draw_var, foreground="#7c83fd",
+                  font=("Courier New", 9, "italic")).pack(padx=4)
+        ttk.Button(pf, text="✏️  Dessiner polygon",
+                   command=self._start_polygon).pack(fill="x", padx=4, pady=2)
+        ttk.Button(pf, text="✅ Fermer polygon",
+                   command=self._close_polygon).pack(fill="x", padx=4, pady=2)
+        ttk.Button(pf, text="🗑  Effacer polygon",
+                   command=self._clear_polygon).pack(fill="x", padx=4, pady=2)
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
+
+        ef = ttk.LabelFrame(left, text="PLACEMENT")
+        ef.pack(fill="x", pady=(0,4))
+        ttk.Label(ef, text="Nb extrudes à placer :").pack(anchor="w", padx=4)
+        self.n_ext_var = tk.StringVar(value="5")
+        ttk.Entry(ef, textvariable=self.n_ext_var, width=8).pack(anchor="w", padx=4, pady=2)
+        ttk.Label(ef, text="Classe (vide=toutes) :").pack(anchor="w", padx=4)
+        self.class_var = tk.StringVar(value="")
+        self.class_combo = ttk.Combobox(ef, textvariable=self.class_var, width=16)
+        self.class_combo.pack(fill="x", padx=4, pady=2)
+        ttk.Button(ef, text="🚀 Placer extrudes",
+                   command=self._place_extrudes).pack(fill="x", padx=4, pady=2)
+        ttk.Button(ef, text="🗑  Effacer placements",
+                   command=self._clear_placements).pack(fill="x", padx=4, pady=2)
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
+
+        sf = ttk.LabelFrame(left, text="SAUVEGARDE")
+        sf.pack(fill="x", pady=(0,4))
+        ttk.Label(sf, text="Dossier sortie :").pack(anchor="w", padx=4)
+        self.out_var = tk.StringVar(value="./output_placed")
+        ttk.Entry(sf, textvariable=self.out_var, width=22).pack(fill="x", padx=4, pady=2)
+        ttk.Button(sf, text="📁", command=lambda: self.out_var.set(
+            filedialog.askdirectory() or self.out_var.get())).pack(anchor="e", padx=4)
+        ttk.Button(sf, text="💾 Sauvegarder JSON",
+                   command=self._save).pack(fill="x", padx=4, pady=2)
+
+        self.log = tk.Text(left, bg="#0a0a12", fg="#7c83fd", font=("Courier New", 8),
+                           state="disabled", relief="flat", height=6)
+        self.log.pack(fill="both", expand=True, padx=2, pady=4)
+
+        right = ttk.Frame(p)
+        right.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+
+        self.fig_p, self.ax_p = plt.subplots(figsize=(8, 6), facecolor="#0f0f17")
+        self.ax_p.set_facecolor("#0a0a12")
+        self.ax_p.axis("off")
+        self.canvas_p = FigureCanvasTkAgg(self.fig_p, master=right)
+        self.canvas_p.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(self.canvas_p, right).update()
+        self.canvas_p.mpl_connect("scroll_event",         lambda e: self._scroll(e, self.ax_p, self.canvas_p))
+        self.canvas_p.mpl_connect("button_press_event",   self._on_press)
+
+    def _log(self, msg):
+        self.log.configure(state="normal")
+        self.log.insert("end", f"► {msg}\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _scroll(self, event, ax, canvas):
+        if event.inaxes != ax:
+            return
+        factor = 0.85 if event.button == "up" else 1.15
+        xlim   = ax.get_xlim(); ylim = ax.get_ylim()
+        cx, cy = event.xdata, event.ydata
+        ax.set_xlim([cx + (x-cx)*factor for x in xlim])
+        ax.set_ylim([cy + (y-cy)*factor for y in ylim])
+        canvas.draw_idle()
+
+    def _load_plots(self):
+        folder = filedialog.askdirectory(title="Dossier des plots HDR smoothed")
+        if not folder:
+            return
+        self.plots = []
+        for hdr in sorted(Path(folder).rglob("*.hdr")):
+            try:
+                cube, meta = load_hdr(hdr)
+                self.plots.append({"name": hdr.stem, "cube": cube,
+                                   "meta": meta, "path": hdr})
+            except Exception as e:
+                print(f"Erreur {hdr.name}: {e}")
+        self.current_idx = 0
+        self.review_info.configure(text=f"{len(self.plots)} plot(s) chargé(s)")
+        self._log(f"{len(self.plots)} plots chargés")
+        if self.plots:
+            self._show_review(0)
+
+    def _show_review(self, idx):
+        if idx >= len(self.plots):
+            self.review_status.configure(text="Tous les plots reviewés.")
+            return
+        p        = self.plots[idx]
+        mean_map = compute_mean_map(p["cube"])
+        self.ax_r.clear()
+        self.ax_r.set_facecolor("#0a0a12")
+        self.ax_r.imshow(mean_map, cmap="inferno", aspect="auto")
+        self.ax_r.set_title(f"{p['name']}  ({idx+1}/{len(self.plots)})",
+                             color="#e2e8f0", fontsize=10)
+        self.ax_r.axis("off")
+        self.canvas_r.draw()
+        self.review_status.configure(text=f"Plot {idx+1}/{len(self.plots)}")
+
+    def _keep_plot(self):
+        if self.current_idx >= len(self.plots):
+            return
+        p = self.plots[self.current_idx]
+        self.kept_plots.append(p)
+        self.kept_var.configure(text=f"Conservés : {len(self.kept_plots)}")
+        self._log(f"✅ Conservé : {p['name']}")
+        self.current_idx += 1
+        self._show_review(self.current_idx)
+
+    def _discard_plot(self):
+        if self.current_idx >= len(self.plots):
+            return
+        p = self.plots[self.current_idx]
+        self._log(f"❌ Supprimé : {p['name']}")
+        self.current_idx += 1
+        self._show_review(self.current_idx)
+
+    def _finish_review(self):
+        if not self.kept_plots:
+            messagebox.showwarning("Review", "Aucun plot conservé.")
+            return
+        self.review_done = True
+        self.kept_list.delete(0, "end")
+        for p in self.kept_plots:
+            self.kept_list.insert("end", p["name"])
+        self._log(f"Review terminée : {len(self.kept_plots)} plot(s) conservé(s)")
+        messagebox.showinfo("Review", f"{len(self.kept_plots)} plot(s) conservé(s).\nPassez à l'onglet Placer extrudes.")
+
+    def _load_extrudes(self):
+        folder = filedialog.askdirectory(title="Dossier racine des extrudes")
+        if not folder:
+            return
+        self.extrudes = []
+        classes = set()
+        for hdr in sorted(Path(folder).rglob("*.hdr")):
+            try:
+                cube, meta   = load_hdr(hdr)
+                class_name   = hdr.parent.name
+                valid_mask   = get_valid_mask_fast(cube)
+                cube_c, mask_c, _, _ = crop_to_valid(cube, valid_mask)
+                polygons     = find_contour_polygons(mask_c)
+                if not polygons:
+                    continue
+                self.extrudes.append({
+                    "name"      : hdr.stem,
+                    "cube"      : cube_c,
+                    "class_name": class_name,
+                    "polygons"  : polygons,
+                    "H"         : cube_c.shape[1],
+                    "W"         : cube_c.shape[2],
+                    "path"      : hdr
+                })
+                classes.add(class_name)
+            except Exception as e:
+                print(f"Erreur {hdr.name}: {e}")
+        self.ext_info.configure(text=f"{len(self.extrudes)} extrude(s)")
+        self.class_combo["values"] = [""] + sorted(classes)
+        self._log(f"{len(self.extrudes)} extrudes | classes : {sorted(classes)}")
+
+    def _on_kept_select(self, event):
+        sel = self.kept_list.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        self.current_kept_idx = idx
+        self._show_place_plot(idx)
+
+    def _show_place_plot(self, idx):
+        self.annotations   = []
+        self.placed_patches= []
+        self._clear_polygon()
+        p        = self.kept_plots[idx]
+        mean_map = compute_mean_map(p["cube"])
+        self.ax_p.clear()
+        self.ax_p.set_facecolor("#0a0a12")
+        self.ax_p.imshow(mean_map, cmap="inferno", aspect="auto")
+        self.ax_p.set_title(p["name"], color="#e2e8f0", fontsize=10)
+        self.ax_p.axis("off")
+        self.canvas_p.draw()
+
+    def _start_polygon(self):
+        self.drawing     = True
+        self.polygon_pts = []
+        if self.polygon_patch:
+            try:
+                self.polygon_patch.remove()
+            except:
+                pass
+            self.polygon_patch = None
+        self.draw_var.set("✏️  Cliquer pour poser les points")
+        self.canvas_p.draw_idle()
+
+    def _close_polygon(self):
+        if len(self.polygon_pts) < 3:
+            messagebox.showwarning("Polygon", "Il faut au moins 3 points.")
+            return
+        self.drawing = False
+        self.draw_var.set("✅ Polygon fermé")
+        self._redraw_polygon(closed=True)
+        self._log(f"Polygon fermé : {len(self.polygon_pts)} points")
+
+    def _clear_polygon(self):
+        self.drawing     = False
+        self.polygon_pts = []
+        self.draw_var.set("Navigation")
+        if self.polygon_patch:
+            try:
+                self.polygon_patch.remove()
+            except:
+                pass
+            self.polygon_patch = None
+        self.canvas_p.draw_idle()
+
+    def _on_press(self, event):
+        if not self.drawing or event.inaxes != self.ax_p:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        self.polygon_pts.append((event.xdata, event.ydata))
+        self._redraw_polygon(closed=False)
+
+    def _redraw_polygon(self, closed=False):
+        if self.polygon_patch:
+            try:
+                self.polygon_patch.remove()
+            except:
+                pass
+        if len(self.polygon_pts) < 2:
+            self.canvas_p.draw_idle()
+            return
+        pts   = np.array(self.polygon_pts)
+        patch = MplPolygon(pts, closed=closed, linewidth=1.5,
+                           edgecolor="#7c83fd",
+                           facecolor="#7c83fd" if closed else "none",
+                           alpha=0.2 if closed else 1.0, linestyle="--")
+        self.ax_p.add_patch(patch)
+        self.polygon_patch = patch
+        self.canvas_p.draw_idle()
+
+    def _place_extrudes(self):
+        if not self.kept_plots:
+            messagebox.showwarning("Plots", "Terminez d abord la review.")
+            return
+        if not self.extrudes:
+            messagebox.showwarning("Extrudes", "Chargez d abord les extrudes.")
+            return
+        if len(self.polygon_pts) < 3:
+            messagebox.showwarning("Polygon", "Dessinez et fermez un polygon d abord.")
+            return
+
+        try:
+            n_place = int(self.n_ext_var.get())
+        except ValueError:
+            messagebox.showerror("Erreur", "Nombre d extrudes invalide.")
+            return
+
+        sel_class = self.class_var.get().strip()
+        pool      = self.extrudes if not sel_class else \
+                    [e for e in self.extrudes if e["class_name"] == sel_class]
+        if not pool:
+            messagebox.showwarning("Extrudes", f"Aucun extrude pour la classe '{sel_class}'.")
+            return
+
+        idx      = getattr(self, "current_kept_idx", 0)
+        p        = self.kept_plots[idx]
+        B, H, W  = p["cube"].shape
+        rng      = np.random.default_rng()
+
+        zone_pts = [(int(round(x)), int(round(y))) for x, y in self.polygon_pts]
+        zone_mask= polygon_mask_2d(H, W, [(y, x) for x, y in zone_pts])
+
+        COLORS = ["#f38ba8","#a6e3a1","#fab387","#89b4fa","#f9e2af","#cba6f7"]
+
+        for k in range(n_place):
+            ext        = pool[rng.integers(len(pool))]
+            class_name = ext["class_name"]
+            color      = COLORS[k % len(COLORS)]
+
+            chosen_poly = ext["polygons"][rng.integers(len(ext["polygons"]))]
+            new_pts     = place_polygon_in_zone(zone_mask, chosen_poly, H, W, rng)
+            if new_pts is None:
+                self._log(f"  Pas de place pour extrude {k+1}")
+                continue
+
+            self.annotations.append({
+                "label" : class_name,
+                "points": new_pts
+            })
+
+            arr   = np.array(new_pts)
+            patch = MplPolygon(arr, closed=True, linewidth=1.5,
+                               edgecolor=color, facecolor=color, alpha=0.3)
+            self.ax_p.add_patch(patch)
+            self.ax_p.text(arr[:, 0].mean(), arr[:, 1].mean(), class_name,
+                           color=color, fontsize=6, ha="center", va="center",
+                           bbox=dict(fc="#0f0f17", alpha=0.6, pad=1))
+            self.placed_patches.append(patch)
+            self._log(f"  Placé {class_name} @ centre ({int(arr[:,0].mean())},{int(arr[:,1].mean())})")
+
+        self.canvas_p.draw()
+        self._log(f"{len(self.annotations)} extrude(s) placé(s)")
+
+    def _clear_placements(self):
+        for patch in self.placed_patches:
+            try:
+                patch.remove()
+            except:
+                pass
+        self.placed_patches = []
+        self.annotations    = []
+        idx = getattr(self, "current_kept_idx", 0)
+        self._show_place_plot(idx)
+        self._log("Placements effacés")
+
+    def _save(self):
+        if not self.annotations:
+            messagebox.showwarning("Sauvegarde", "Aucune annotation à sauvegarder.")
+            return
+        idx      = getattr(self, "current_kept_idx", 0)
+        p        = self.kept_plots[idx]
+        B, H, W  = p["cube"].shape
+        out_dir  = Path(self.out_var.get())
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        ann_full = list(self.annotations)
+        ann_full.append({
+            "label" : "zone_placement",
+            "points": [[x, y] for x, y in self.polygon_pts]
+        })
+
+        json_data = make_labelme_json(f"{p['name']}.png", H, W, ann_full)
+        json_out  = out_dir / f"{p['name']}_annotations.json"
+        with open(json_out, "w") as f:
+            json.dump(json_data, f, indent=2)
+
+        fig_out = out_dir / f"{p['name']}_placed.png"
+        self.fig_p.savefig(fig_out, dpi=120, facecolor="#0f0f17")
+
+        self._log(f"JSON : {json_out.name}")
+        self._log(f"PNG  : {fig_out.name}")
+        messagebox.showinfo("Sauvegarde", f"Sauvegardé dans :\n{out_dir}")
+
+
+if __name__ == "__main__":
+    app = PlotReviewApp()
+    app.mainloop()
