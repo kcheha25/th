@@ -638,3 +638,92 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+import numpy as np
+from pathlib import Path
+import json
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import Polygon as MplPolygon
+import spectral.io.envi as envi
+
+
+PLOTS_DIR = "output_placed"
+
+COLORS = ["#f38ba8", "#a6e3a1", "#fab387", "#89b4fa",
+          "#f9e2af", "#cba6f7", "#94e2d5", "#eba0ac"]
+
+
+def load_hdr(hdr_path):
+    img  = envi.open(str(hdr_path))
+    cube = np.array(img.load(), dtype=np.float32)
+    return cube
+
+
+def plot_annotations(hdr_path, json_path):
+    cube     = load_hdr(hdr_path)
+    mean_map = cube.mean(axis=0)
+    name     = Path(hdr_path).stem
+
+    with open(json_path) as f:
+        data = json.load(f)
+
+    fig, ax = plt.subplots(figsize=(8, 6), facecolor="#1e1e2e")
+    ax.set_facecolor("#181825")
+    ax.imshow(mean_map, cmap="inferno", aspect="auto")
+
+    legend_classes = {}
+    color_idx      = 0
+
+    for shape in data["shapes"]:
+        label = shape["label"]
+        if label == "zone_placement":
+            continue
+
+        pts = np.array(shape["points"])
+
+        if label not in legend_classes:
+            legend_classes[label] = COLORS[color_idx % len(COLORS)]
+            color_idx += 1
+
+        color = legend_classes[label]
+        patch = MplPolygon(pts, closed=True, linewidth=1.5,
+                           edgecolor=color, facecolor=color, alpha=0.35)
+        ax.add_patch(patch)
+        ax.text(pts[:, 0].mean(), pts[:, 1].mean(), label,
+                color=color, fontsize=6, ha="center", va="center",
+                bbox=dict(fc="#1e1e2e", alpha=0.7, pad=1))
+
+    legend_patches = [
+        mpatches.Patch(color=c, label=cls, alpha=0.7)
+        for cls, c in legend_classes.items()
+    ]
+    ax.legend(handles=legend_patches, loc="upper right",
+              fontsize=7, framealpha=0.7,
+              facecolor="#1e1e2e", labelcolor="#cdd6f4")
+    ax.set_title(name, color="#cdd6f4", fontsize=10)
+    ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+    plt.close()
+
+
+def main():
+    plots_dir = Path(PLOTS_DIR)
+    pairs     = []
+
+    for hdr in sorted(plots_dir.rglob("*.hdr")):
+        json_path = hdr.parent / f"{hdr.stem}.json"
+        if json_path.exists():
+            pairs.append((hdr, json_path))
+
+    print(f"{len(pairs)} plot(s) trouvé(s)")
+
+    for hdr, json_path in pairs:
+        print(f"  Affichage : {hdr.stem}")
+        plot_annotations(hdr, json_path)
+
+
+if __name__ == "__main__":
+    main()
