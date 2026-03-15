@@ -484,25 +484,31 @@ def main():
         print("Aucun plot disponible.")
         return
 
-    # ── charger les extrudes ──────────────────────────────────────────────
     all_extrudes = {}
-    for hdr in sorted(Path(EXTRUDE_ROOT).rglob("*.hdr")):
-        try:
-            cube       = load_hdr(hdr)[0]
-            class_name = hdr.parent.name
-            valid_mask = get_valid_mask(cube, THRESHOLD)
-            cube_c, mask_c, _, _ = crop_to_valid(cube, valid_mask)
-            polygons   = find_contour_polygons(mask_c)
-            if not polygons:
-                continue
-            if class_name not in all_extrudes:
-                all_extrudes[class_name] = []
-            all_extrudes[class_name].append({
-                "name"    : hdr.stem,
-                "polygons": polygons
-            })
-        except Exception as e:
-            print(f"  Erreur extrude {hdr.name}: {e}")
+    extrude_root = Path(EXTRUDE_ROOT)
+
+    # itérer sur les sous-dossiers directement = chaque sous-dossier est une classe
+    for class_dir in sorted(extrude_root.iterdir()):
+        if not class_dir.is_dir():
+            continue
+        class_name = class_dir.name   # A1, B2, etc.
+        
+        for hdr in sorted(class_dir.rglob("*.hdr")):
+            try:
+                cube       = load_hdr(hdr)[0]
+                valid_mask = get_valid_mask(cube, THRESHOLD)
+                cube_c, mask_c, _, _ = crop_to_valid(cube, valid_mask)
+                polygons   = find_contour_polygons(mask_c)
+                if not polygons:
+                    continue
+                if class_name not in all_extrudes:
+                    all_extrudes[class_name] = []
+                all_extrudes[class_name].append({
+                    "name"    : hdr.stem,
+                    "polygons": polygons
+                })
+            except Exception as e:
+                print(f"  Erreur extrude {hdr.name}: {e}")
 
     print(f"Extrudes chargés : { {k: len(v) for k,v in all_extrudes.items()} }")
     if not all_extrudes:
