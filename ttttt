@@ -254,7 +254,6 @@ if __name__ == "__main__":
     app = AnnotatorApp()
     app.mainloop()
 
-
 import numpy as np
 from pathlib import Path
 import json
@@ -265,9 +264,8 @@ from matplotlib.patches import Polygon as MplPolygon
 import spectral.io.envi as envi
 
 
-PLOTS_DIR      = "plots_smoothed"
+PLOTS_DIR      = "output_annotated"
 EXTRUDE_ROOT   = "aug_data"
-ANNOTATIONS_DIR= "annotations"      # dossier contenant les json labelme des plots
 OUT_DIR        = "output_placed"
 N_PER_PLOT     = 5
 TARGET_TOTAL   = 200
@@ -386,7 +384,6 @@ def place_single_in_zone(zone_mask, ext_pool, H, W, rng, occupied_mask=None):
             new_pts  = [[int(x+offset_x), int(y+offset_y)] for x, y in poly]
             return cls, new_pts
 
-    # fallback : crop/scale
     print("    Aucun extrude ne rentre → crop/scale")
     zone_rows, zone_cols = np.where(zone_mask)
     if len(zone_rows) == 0:
@@ -445,10 +442,6 @@ def make_labelme_json(image_name, H, W, annotations):
 
 
 def load_plot_polygons(json_path):
-    """
-    Lit le JSON labelme du plot et retourne les polygons de zone de placement.
-    Cherche les shapes avec label 'zone_placement' ou prend tous les polygons.
-    """
     with open(json_path) as f:
         data = json.load(f)
     polygons = []
@@ -466,7 +459,7 @@ def main():
     # ── charger les plots ─────────────────────────────────────────────────
     plots = []
     for hdr in sorted(Path(PLOTS_DIR).rglob("*.hdr")):
-        json_path = Path(ANNOTATIONS_DIR) / f"{hdr.stem}.json"
+        json_path = hdr.parent / f"{hdr.stem}.json"
         if not json_path.exists():
             print(f"  JSON manquant pour {hdr.stem} → ignoré")
             continue
@@ -524,12 +517,10 @@ def main():
     generated = 0
 
     while generated < TARGET_TOTAL:
-        # tirage aléatoire d un plot
         plot      = plots[rng.integers(len(plots))]
         B, H, W   = plot["cube"].shape
         mean_map  = plot["cube"].mean(axis=0)
 
-        # tirage aléatoire d un polygon de zone dans ce plot
         polygon_roi = plot["polygons"][rng.integers(len(plot["polygons"]))]
         zone_pts    = [(int(round(x)), int(round(y))) for x, y in polygon_roi]
         zone_mask   = polygon_mask_2d(H, W, [(y, x) for x, y in zone_pts])
