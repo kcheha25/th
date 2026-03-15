@@ -331,14 +331,14 @@ from matplotlib.patches import Polygon as MplPolygon
 import spectral.io.envi as envi
 
 
-SESSION_PATH   = "session_annotations.json"
+PLOTS_DIR      = "plots_smoothed"
 EXTRUDE_ROOT   = "aug_data"
+ANNOTATIONS_DIR= "annotations"      # dossier contenant les json labelme des plots
 OUT_DIR        = "output_placed"
 N_PER_PLOT     = 5
 TARGET_TOTAL   = 200
 THRESHOLD      = 1e-6
 SINGLE_CLASSES = ["A1", "B2"]
-
 
 COLORS = ["#f38ba8", "#a6e3a1", "#fab387", "#89b4fa",
           "#f9e2af", "#cba6f7", "#94e2d5", "#eba0ac"]
@@ -351,8 +351,18 @@ def load_hdr(hdr_path):
     return cube, meta
 
 
-def get_valid_mask_fast(cube, threshold=1e-6):
+def get_valid_mask(cube, threshold=1e-6):
     return cube.var(axis=0) > threshold
+
+
+def crop_to_valid(cube, valid_mask):
+    rows = np.where(valid_mask.any(axis=1))[0]
+    cols = np.where(valid_mask.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return cube, valid_mask, 0, 0
+    r0, r1 = rows[0], rows[-1]+1
+    c0, c1 = cols[0], cols[-1]+1
+    return cube[:, r0:r1, c0:c1], valid_mask[r0:r1, c0:c1], r0, c0
 
 
 def find_contour_polygons(valid_mask):
@@ -364,16 +374,6 @@ def find_contour_polygons(valid_mask):
         if len(pts) >= 3:
             polygons.append(pts)
     return polygons
-
-
-def crop_to_valid(cube, valid_mask):
-    rows = np.where(valid_mask.any(axis=1))[0]
-    cols = np.where(valid_mask.any(axis=0))[0]
-    if len(rows) == 0 or len(cols) == 0:
-        return cube, valid_mask, 0, 0
-    r0, r1 = rows[0], rows[-1]+1
-    c0, c1 = cols[0], cols[-1]+1
-    return cube[:, r0:r1, c0:c1], valid_mask[r0:r1, c0:c1], r0, c0
 
 
 def polygon_mask_2d(H, W, pts):
@@ -397,7 +397,6 @@ def place_polygon_in_zone(zone_mask, poly_pts, H, W, rng, occupied_mask=None):
 
     zone_rows, zone_cols = np.where(zone_mask)
     valid_positions      = []
-
     for r, c in zip(zone_rows, zone_cols):
         if r + ph >= H or c + pw >= W:
             continue
@@ -421,7 +420,6 @@ def place_single_in_zone(zone_mask, ext_pool, H, W, rng, occupied_mask=None):
     indices = list(range(len(ext_pool)))
     rng.shuffle(indices)
 
-    # premier essai : extrude qui rentre entièrement sans chevauchement
     for i in indices:
         cls, ext = ext_pool[i]
         poly_indices = list(range(len(ext["polygons"])))
@@ -435,7 +433,6 @@ def place_single_in_zone(zone_mask, ext_pool, H, W, rng, occupied_mask=None):
 
             zone_rows, zone_cols = np.where(zone_mask)
             valid_positions      = []
-
             for r, c in zip(zone_rows, zone_cols):
                 if r + ph >= H or c + pw >= W:
                     continue
@@ -455,9 +452,8 @@ def place_single_in_zone(zone_mask, ext_pool, H, W, rng, occupied_mask=None):
             new_pts  = [[int(x+offset_x), int(y+offset_y)] for x, y in poly]
             return cls, new_pts
 
-    # fallback : aucun extrude ne rentre → crop/scale au bounding box de la zone
-    print("    Aucun extrude ne rentre → crop/scale au bounding box de la zone")
-
+    # fallback : crop/scale
+    print("    Aucun extrude ne rentre → crop/scale")
     zone_rows, zone_cols = np.where(zone_mask)
     if len(zone_rows) == 0:
         return None
@@ -475,7 +471,6 @@ def place_single_in_zone(zone_mask, ext_pool, H, W, rng, occupied_mask=None):
 
     orig_pw = float(poly_arr[:, 0].max() - poly_arr[:, 0].min())
     orig_ph = float(poly_arr[:, 1].max() - poly_arr[:, 1].min())
-
     if orig_pw == 0 or orig_ph == 0:
         return None
 
@@ -515,21 +510,60 @@ def make_labelme_json(image_name, H, W, annotations):
     }
 
 
-def process_session():
-    out_dir      = Path(OUT_DIR)
+def load_plot_polygons(json_path):
+    """
+    Lit le JSON labelme du plot et retourne les polygons de zone de placement.
+    Cherche les shapes avec label 'zone_placement' ou prend tous les polygons.
+    """
+    with open(json_path) as f:
+        data = json.load(f)
+    polygons = []
+    for shape in data["shapes"]:
+        if shape["shape_type"] == "polygon":
+            polygons.append(shape["points"])
+    return polygons
+
+
+def main():
+    out_dir = Path(OUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
-    extrude_root = Path(EXTRUDE_ROOT)
-    rng          = np.random.default_rng()
+    rng     = np.random.default_rng()
 
-    with open(SESSION_PATH) as f:
-        session = json.load(f)
+    # ── charger les plots ─────────────────────────────────────────────────
+    plots = []
+    for hdr in sorted(Path(PLOTS_DIR).rglob("*.hdr")):
+        json_path = Path(ANNOTATIONS_DIR) / f"{hdr.stem}.json"
+        if not json_path.exists():
+            print(f"  JSON manquant pour {hdr.stem} → ignoré")
+            continue
+        try:
+            cube, meta = load_hdr(hdr)
+            polygons   = load_plot_polygons(json_path)
+            if not polygons:
+                print(f"  Aucun polygon dans {json_path.name} → ignoré")
+                continue
+            plots.append({
+                "name"    : hdr.stem,
+                "cube"    : cube,
+                "meta"    : meta,
+                "path"    : str(hdr),
+                "polygons": polygons
+            })
+        except Exception as e:
+            print(f"  Erreur {hdr.name}: {e}")
 
+    print(f"{len(plots)} plot(s) chargé(s)")
+    if not plots:
+        print("Aucun plot disponible.")
+        return
+
+    # ── charger les extrudes ──────────────────────────────────────────────
     all_extrudes = {}
-    for hdr in sorted(extrude_root.rglob("*.hdr")):
+    for hdr in sorted(Path(EXTRUDE_ROOT).rglob("*.hdr")):
         try:
             cube       = load_hdr(hdr)[0]
             class_name = hdr.parent.name
-            valid_mask = get_valid_mask_fast(cube, THRESHOLD)
+            valid_mask = get_valid_mask(cube, THRESHOLD)
             cube_c, mask_c, _, _ = crop_to_valid(cube, valid_mask)
             polygons   = find_contour_polygons(mask_c)
             if not polygons:
@@ -544,49 +578,35 @@ def process_session():
             print(f"  Erreur extrude {hdr.name}: {e}")
 
     print(f"Extrudes chargés : { {k: len(v) for k,v in all_extrudes.items()} }")
-
-    class_counts = {cls: 0 for cls in all_extrudes}
-    print(f"Classes disponibles   : {sorted(class_counts.keys())}")
-    print(f"Classes single (1/plot): {SINGLE_CLASSES}")
-
-    if not session:
-        print("Session vide.")
+    if not all_extrudes:
+        print("Aucun extrude disponible.")
         return
 
+    class_counts = {cls: 0 for cls in all_extrudes}
+    print(f"Classes disponibles    : {sorted(class_counts.keys())}")
+    print(f"Classes single (1/plot): {SINGLE_CLASSES}")
+
+    # ── génération ────────────────────────────────────────────────────────
     generated = 0
 
     while generated < TARGET_TOTAL:
-        entry           = session[rng.integers(len(session))]
-        plot_name       = entry["plot_name"]
-        plot_path       = entry["plot_path"]
-        polygon_roi     = entry["polygon"]
-        extrude_classes = entry["extrude_classes"]
+        # tirage aléatoire d un plot
+        plot      = plots[rng.integers(len(plots))]
+        B, H, W   = plot["cube"].shape
+        mean_map  = plot["cube"].mean(axis=0)
 
-        allowed_classes = [cls for cls in extrude_classes if cls in all_extrudes]
-        if not allowed_classes:
-            print(f"  Aucune classe disponible pour {plot_name}")
-            continue
+        # tirage aléatoire d un polygon de zone dans ce plot
+        polygon_roi = plot["polygons"][rng.integers(len(plot["polygons"]))]
+        zone_pts    = [(int(round(x)), int(round(y))) for x, y in polygon_roi]
+        zone_mask   = polygon_mask_2d(H, W, [(y, x) for x, y in zone_pts])
 
-        try:
-            cube, meta = load_hdr(plot_path)
-        except Exception as e:
-            print(f"  Erreur chargement {plot_path}: {e}")
-            continue
-
-        B, H, W   = cube.shape
-        mean_map  = cube.mean(axis=0)
-
-        zone_pts  = [(int(round(x)), int(round(y))) for x, y in polygon_roi]
-        zone_mask = polygon_mask_2d(H, W, [(y, x) for x, y in zone_pts])
-
-        out_name      = f"{plot_name}_aug_{generated:04d}"
+        out_name      = f"{plot['name']}_aug_{generated:04d}"
         annotations   = [{"label": "zone_placement", "points": polygon_roi}]
         placed        = []
         occupied_mask = np.zeros((H, W), dtype=np.uint8)
 
-        # ── classes normales : N_PER_PLOT placements ──────────────────────
-        normal_classes = [cls for cls in allowed_classes
-                          if cls not in SINGLE_CLASSES]
+        # ── classes normales ──────────────────────────────────────────────
+        normal_classes = [cls for cls in all_extrudes if cls not in SINGLE_CLASSES]
 
         for k in range(N_PER_PLOT):
             if not normal_classes:
@@ -598,11 +618,10 @@ def process_session():
 
             ext         = all_extrudes[cls][rng.integers(len(all_extrudes[cls]))]
             poly_chosen = ext["polygons"][rng.integers(len(ext["polygons"]))]
-
-            new_pts = place_polygon_in_zone(zone_mask, poly_chosen, H, W, rng,
-                                            occupied_mask=occupied_mask)
+            new_pts     = place_polygon_in_zone(zone_mask, poly_chosen, H, W, rng,
+                                                occupied_mask=occupied_mask)
             if new_pts is None:
-                print(f"  Pas de place libre pour extrude normal {k+1} ({cls})")
+                print(f"  Pas de place libre pour extrude {k+1} ({cls})")
                 continue
 
             occupied_mask = update_occupied_mask(occupied_mask, new_pts)
@@ -610,9 +629,8 @@ def process_session():
             placed.append((cls, new_pts))
             class_counts[cls] += 1
 
-        # ── classes single : 1 extrude sans chevauchement ─────────────────
-        avail_single = [cls for cls in SINGLE_CLASSES
-                        if cls in allowed_classes and cls in all_extrudes]
+        # ── classes single ────────────────────────────────────────────────
+        avail_single = [cls for cls in SINGLE_CLASSES if cls in all_extrudes]
 
         if avail_single:
             min_count    = min(class_counts[cls] for cls in avail_single)
@@ -636,11 +654,13 @@ def process_session():
             print(f"  Aucun placement réussi pour {out_name}, on réessaie")
             continue
 
+        # ── sauvegarde JSON ───────────────────────────────────────────────
         json_data = make_labelme_json(f"{out_name}.png", H, W, annotations)
         json_out  = out_dir / f"{out_name}.json"
         with open(json_out, "w") as f:
             json.dump(json_data, f, indent=2)
 
+        # ── cartographie ──────────────────────────────────────────────────
         fig, ax = plt.subplots(figsize=(8, 6), facecolor="#1e1e2e")
         ax.set_facecolor("#181825")
         ax.imshow(mean_map, cmap="inferno", aspect="auto")
@@ -693,4 +713,4 @@ def process_session():
 
 
 if __name__ == "__main__":
-    process_session()
+    main()
