@@ -1,9 +1,3 @@
-"""
-PARTIE 1 : Interface simple pour dessiner des polygons sur les plots
-et choisir les extrudes à placer.
-Lance : python annotator.py
-"""
-
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -21,7 +15,8 @@ import cv2
 def load_hdr(hdr_path):
     img  = envi.open(str(hdr_path))
     cube = np.array(img.load(), dtype=np.float32)
-    return cube
+    meta = img.metadata.copy()
+    return cube, meta
 
 
 def compute_mean_map(cube):
@@ -53,6 +48,24 @@ def crop_to_valid(cube, valid_mask):
     return cube[:, r0:r1, c0:c1], valid_mask[r0:r1, c0:c1], r0, c0
 
 
+def make_labelme_json(image_name, H, W, polygon_pts):
+    return {
+        "version"    : "5.0.1",
+        "flags"      : {},
+        "shapes"     : [{
+            "label"     : "zone_placement",
+            "points"    : polygon_pts,
+            "group_id"  : None,
+            "shape_type": "polygon",
+            "flags"     : {}
+        }],
+        "imagePath"  : image_name,
+        "imageData"  : None,
+        "imageHeight": H,
+        "imageWidth" : W
+    }
+
+
 class AnnotatorApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -67,7 +80,7 @@ class AnnotatorApp(tk.Tk):
         self.polygon_pts  = []
         self.drawing      = False
         self.polygon_patch= None
-        self.session_data = []   # [{plot_name, plot_path, polygon, extrude_classes}]
+        self.out_dir      = None
 
         self._build_ui()
 
@@ -105,7 +118,7 @@ class AnnotatorApp(tk.Tk):
         ttk.Label(left, text="Classes extrudes à placer :").pack(anchor="w", padx=4)
         self.class_frame = ttk.Frame(left)
         self.class_frame.pack(fill="x", padx=4, pady=2)
-        self.class_vars = {}
+        self.class_vars  = {}
 
         ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
 
@@ -123,12 +136,17 @@ class AnnotatorApp(tk.Tk):
 
         ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
 
+        sf = ttk.LabelFrame(left, text="SAUVEGARDE")
+        sf.pack(fill="x", pady=(0,4))
+        ttk.Label(sf, text="Dossier sortie :").pack(anchor="w", padx=4)
+        self.out_var = tk.StringVar(value="./output_annotated")
+        ttk.Entry(sf, textvariable=self.out_var, width=22).pack(fill="x", padx=4, pady=2)
+        ttk.Button(sf, text="📁", command=self._pick_outdir).pack(anchor="e", padx=4)
+
         ttk.Button(left, text="💾 Sauvegarder ce plot",
                    command=self._save_current).pack(fill="x", pady=2)
         ttk.Button(left, text="⏭  Plot suivant",
                    command=self._next_plot).pack(fill="x", pady=2)
-        ttk.Button(left, text="✔️  Terminer & exporter session",
-                   command=self._export_session).pack(fill="x", pady=2)
 
         self.status = ttk.Label(left, text="", wraplength=240,
                                 foreground="#a6e3a1", font=("Segoe UI", 9))
@@ -145,6 +163,11 @@ class AnnotatorApp(tk.Tk):
         NavigationToolbar2Tk(self.canvas, right).update()
         self.canvas.mpl_connect("scroll_event",       self._on_scroll)
         self.canvas.mpl_connect("button_press_event", self._on_press)
+
+    def _pick_outdir(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.out_var.set(d)
 
     def _on_scroll(self, event):
         if event.inaxes != self.ax:
@@ -163,8 +186,13 @@ class AnnotatorApp(tk.Tk):
         self.plots = []
         for hdr in sorted(Path(folder).rglob("*.hdr")):
             try:
-                cube = load_hdr(hdr)
-                self.plots.append({"name": hdr.stem, "cube": cube, "path": str(hdr)})
+                cube, meta = load_hdr(hdr)
+                self.plots.append({
+                    "name": hdr.stem,
+                    "cube": cube,
+                    "meta": meta,
+                    "path": str(hdr)
+                })
             except Exception as e:
                 print(f"Erreur {hdr.name}: {e}")
         self.current_idx = 0
@@ -180,7 +208,7 @@ class AnnotatorApp(tk.Tk):
         classes = set()
         for hdr in sorted(Path(folder).rglob("*.hdr")):
             try:
-                cube       = load_hdr(hdr)
+                cube, _    = load_hdr(hdr)
                 class_name = hdr.parent.name
                 valid_mask = get_valid_mask_fast(cube)
                 cube_c, mask_c, _, _ = crop_to_valid(cube, valid_mask)
@@ -198,7 +226,8 @@ class AnnotatorApp(tk.Tk):
             except Exception as e:
                 print(f"Erreur {hdr.name}: {e}")
 
-        self.ext_info.configure(text=f"{len(self.extrudes)} extrude(s) | classes : {sorted(classes)}")
+        self.ext_info.configure(
+            text=f"{len(self.extrudes)} extrude(s) | classes : {sorted(classes)}")
 
         for w in self.class_frame.winfo_children():
             w.destroy()
@@ -280,16 +309,37 @@ class AnnotatorApp(tk.Tk):
             messagebox.showwarning("Polygon", "Dessinez et fermez un polygon d abord.")
             return
 
+        out_dir = Path(self.out_var.get())
+        out_dir.mkdir(parents=True, exist_ok=True)
+
         p              = self.plots[self.current_idx]
+        cube           = p["cube"]
+        meta           = p["meta"]
+        name           = p["name"]
+        B, H, W        = cube.shape
         selected_classes = [cls for cls, v in self.class_vars.items() if v.get()]
 
-        self.session_data.append({
-            "plot_name"      : p["name"],
-            "plot_path"      : p["path"],
-            "polygon"        : self.polygon_pts,
-            "extrude_classes": selected_classes
-        })
-        self.status.configure(text=f"✅ Sauvegardé : {p['name']}")
+        # sauvegarde HDR
+        m = meta.copy()
+        m["lines"]   = H
+        m["samples"] = W
+        m["bands"]   = B
+        hdr_out = out_dir / f"{name}.hdr"
+        envi.save_image(str(hdr_out), cube, dtype=np.float32,
+                        interleave="bil", force=True, metadata=m)
+
+        # sauvegarde JSON labelme
+        json_data = make_labelme_json(f"{name}.png", H, W, self.polygon_pts)
+        # ajouter les classes sélectionnées dans les flags
+        json_data["extrude_classes"] = selected_classes
+        json_out  = out_dir / f"{name}.json"
+        with open(json_out, "w") as f:
+            json.dump(json_data, f, indent=2)
+
+        msg = f"✅ {name}\nHDR + JSON sauvegardés"
+        self.status.configure(text=msg)
+        print(f"  HDR : {hdr_out.name}")
+        print(f"  JSON: {json_out.name}")
 
     def _next_plot(self):
         self.current_idx += 1
@@ -297,21 +347,6 @@ class AnnotatorApp(tk.Tk):
             messagebox.showinfo("Plots", "Tous les plots ont été annotés.")
             return
         self._show_plot(self.current_idx)
-
-    def _export_session(self):
-        if not self.session_data:
-            messagebox.showwarning("Session", "Aucune annotation sauvegardée.")
-            return
-        out = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json")],
-            initialfile="session_annotations.json"
-        )
-        if not out:
-            return
-        with open(out, "w") as f:
-            json.dump(self.session_data, f, indent=2)
-        messagebox.showinfo("Export", f"Session exportée :\n{out}")
 
 
 if __name__ == "__main__":
