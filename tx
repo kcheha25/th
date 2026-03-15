@@ -1042,3 +1042,137 @@ final = blend_boundary(
     blend_radius   = 8,
     sigma_blend    = 3.0
 )
+
+import numpy as np
+from pathlib import Path
+import spectral.io.envi as envi
+import matplotlib.pyplot as plt
+import cv2
+import json
+
+
+def load_extrude(hdr_path):
+    img  = envi.open(str(hdr_path))
+    cube = np.array(img.load(), dtype=np.float32)
+    return cube
+
+
+def get_valid_mask(cube, threshold=1e-6):
+    B, H, W    = cube.shape
+    valid_mask = np.zeros((H, W), dtype=bool)
+    for r in range(H):
+        for c in range(W):
+            if np.var(cube[:, r, c]) > threshold:
+                valid_mask[r, c] = True
+    return valid_mask
+
+
+def get_valid_mask_fast(cube, threshold=1e-6):
+    var_map    = cube.var(axis=0)
+    return var_map > threshold
+
+
+def find_contour_polygons(valid_mask):
+    mask_u8     = valid_mask.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    polygons = []
+    for cnt in contours:
+        pts = cnt.reshape(-1, 2).tolist()   # [[x,y], [x,y], ...]
+        if len(pts) >= 3:
+            polygons.append(pts)
+    return polygons
+
+
+def crop_to_valid(cube, valid_mask):
+    rows = np.where(valid_mask.any(axis=1))[0]
+    cols = np.where(valid_mask.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return cube, valid_mask
+    r0, r1 = rows[0], rows[-1]+1
+    c0, c1 = cols[0], cols[-1]+1
+    return cube[:, r0:r1, c0:c1], valid_mask[r0:r1, c0:c1]
+
+
+def save_labelme_json(polygons, image_name, H, W, out_path):
+    shapes = []
+    for pts in polygons:
+        shapes.append({
+            "label"     : "extrude",
+            "points"    : pts,
+            "group_id"  : None,
+            "shape_type": "polygon",
+            "flags"     : {}
+        })
+    data = {
+        "version"    : "5.0.1",
+        "flags"      : {},
+        "shapes"     : shapes,
+        "imagePath"  : image_name,
+        "imageData"  : None,
+        "imageHeight": H,
+        "imageWidth" : W
+    }
+    with open(out_path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def plot_extrude_contours(cube_cropped, valid_mask, polygons,
+                          title="Extrude", out_path=None):
+    mean_map = cube_cropped.mean(axis=0)
+    fig, ax  = plt.subplots(figsize=(6, 5))
+    im       = ax.imshow(mean_map, cmap="inferno", aspect="auto")
+    plt.colorbar(im, ax=ax, fraction=0.03)
+
+    for pts in polygons:
+        poly = np.array(pts)
+        poly = np.vstack([poly, poly[0]])   # fermer le polygone
+        ax.plot(poly[:, 0], poly[:, 1], color="cyan", linewidth=1.5)
+
+    ax.set_title(title, fontsize=10)
+    ax.axis("off")
+    plt.tight_layout()
+    if out_path:
+        plt.savefig(out_path, dpi=120)
+    plt.show()
+    plt.close()
+
+
+def process_all_extrudes(extrude_root, out_dir, threshold=1e-6):
+    extrude_root = Path(extrude_root)
+    out_dir      = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    hdr_files    = sorted(extrude_root.rglob("*.hdr"))
+    print(f"{len(hdr_files)} extrude(s) trouvé(s)")
+
+    for hdr in hdr_files:
+        print(f"  Traitement : {hdr.name}")
+        cube                     = load_extrude(hdr)
+        valid_mask               = get_valid_mask_fast(cube, threshold=threshold)
+        cube_cropped, mask_crop  = crop_to_valid(cube, valid_mask)
+        B, H, W                  = cube_cropped.shape
+        polygons                 = find_contour_polygons(mask_crop)
+        print(f"    {len(polygons)} polygone(s) détecté(s)")
+
+        plot_extrude_contours(
+            cube_cropped, mask_crop, polygons,
+            title    = hdr.stem,
+            out_path = out_dir / f"{hdr.stem}_contours.png"
+        )
+
+        save_labelme_json(
+            polygons   = polygons,
+            image_name = f"{hdr.stem}.png",
+            H          = H,
+            W          = W,
+            out_path   = out_dir / f"{hdr.stem}.json"
+        )
+        print(f"    JSON sauvegardé : {hdr.stem}.json")
+
+
+if __name__ == "__main__":
+    process_all_extrudes(
+        extrude_root = "data/extrudes",
+        out_dir      = "output_extrudes",
+        threshold    = 1e-6
+    )
