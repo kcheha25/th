@@ -1699,3 +1699,505 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+placed        = []
+annotations   = [{"label": "zone_placement", "points": polygon_roi}]
+occupied_mask = np.zeros((H, W), dtype=np.uint8)
+strategy1_applied = False
+
+for k in range(N_PER_PLOT):
+    min_count  = min(class_counts[cls] for cls in all_classes)
+    least_used = [cls for cls in all_classes if class_counts[cls] == min_count]
+    cls        = least_used[rng.integers(len(least_used))]
+    is_single  = cls in SINGLE_CLASSES
+
+    if is_single:
+        strategy = int(rng.integers(1, 3))
+        print(f"  [{k+1}] Single {cls} → Stratégie {strategy}")
+
+        if strategy == 1:
+            # annuler tous les placements normaux déjà faits
+            for cls_placed, _ in placed:
+                class_counts[cls_placed] -= 1
+            placed        = []
+            annotations   = [{"label": "zone_placement", "points": polygon_roi}]
+            occupied_mask = np.zeros((H, W), dtype=np.uint8)
+
+            new_pts = place_single_strategy1(cls, all_extrudes[cls],
+                                              zone_mask, H, W, rng, occupied_mask)
+            if new_pts is not None:
+                occupied_mask = update_occupied_mask(occupied_mask, new_pts)
+                annotations.append({"label": cls, "points": new_pts})
+                placed.append((cls, new_pts))
+                class_counts[cls] += 1
+            strategy1_applied = True
+            break   # pas d autres placements après stratégie 1
+
+        else:
+            # stratégie 2 : rectangle, les normaux déjà placés restent
+            new_pts = place_single_strategy2(cls, zone_mask, H, W, rng,
+                                              occupied_mask, min_size=15, max_size=30)
+            if new_pts is not None:
+                occupied_mask = update_occupied_mask(occupied_mask, new_pts)
+                annotations.append({"label": cls, "points": new_pts})
+                placed.append((cls, new_pts))
+                class_counts[cls] += 1
+
+    else:
+        ext         = all_extrudes[cls][rng.integers(len(all_extrudes[cls]))]
+        poly_chosen = ext["polygons"][rng.integers(len(ext["polygons"]))]
+        new_pts     = place_polygon_in_zone(zone_mask, poly_chosen, H, W, rng,
+                                            occupied_mask=occupied_mask)
+        if new_pts is None:
+            print(f"  [{k+1}] Pas de place pour {cls}")
+            continue
+        occupied_mask = update_occupied_mask(occupied_mask, new_pts)
+        annotations.append({"label": cls, "points": new_pts})
+        placed.append((cls, new_pts))
+        class_counts[cls] += 1
+
+
+import numpy as np
+from pathlib import Path
+import json
+import cv2
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import Polygon as MplPolygon
+import spectral.io.envi as envi
+
+
+PLOTS_DIR      = "output_annotated"
+EXTRUDE_ROOT   = "aug_data"
+OUT_DIR        = "output_placed"
+N_PER_PLOT     = 5
+TARGET_TOTAL   = 200
+THRESHOLD      = 1e-6
+SINGLE_CLASSES = ["A1", "B2"]
+
+COLORS = ["#f38ba8", "#a6e3a1", "#fab387", "#89b4fa",
+          "#f9e2af", "#cba6f7", "#94e2d5", "#eba0ac"]
+
+
+def load_hdr(hdr_path):
+    img  = envi.open(str(hdr_path))
+    cube = np.array(img.load(), dtype=np.float32)
+    meta = img.metadata.copy()
+    return cube, meta
+
+
+def get_valid_mask(cube, threshold=1e-6):
+    return cube.var(axis=0) > threshold
+
+
+def crop_to_valid(cube, valid_mask):
+    rows = np.where(valid_mask.any(axis=1))[0]
+    cols = np.where(valid_mask.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return cube, valid_mask, 0, 0
+    r0, r1 = rows[0], rows[-1]+1
+    c0, c1 = cols[0], cols[-1]+1
+    return cube[:, r0:r1, c0:c1], valid_mask[r0:r1, c0:c1], r0, c0
+
+
+def find_contour_polygons(valid_mask):
+    mask_u8     = valid_mask.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    polygons    = []
+    for cnt in contours:
+        pts = cnt.reshape(-1, 2).tolist()
+        if len(pts) >= 3:
+            polygons.append(pts)
+    return polygons
+
+
+def polygon_mask_2d(H, W, pts):
+    mask = np.zeros((H, W), dtype=np.uint8)
+    cv2.fillPoly(mask, [np.array(pts, dtype=np.int32)], 1)
+    return mask.astype(bool)
+
+
+def update_occupied_mask(occupied_mask, new_pts):
+    pts_arr = np.array(new_pts, dtype=np.int32).reshape(-1, 1, 2)
+    cv2.fillPoly(occupied_mask, [pts_arr], 1)
+    return occupied_mask
+
+
+def place_polygon_in_zone(zone_mask, poly_pts, H, W, rng, occupied_mask=None):
+    poly_arr   = np.array(poly_pts)
+    poly_min_x = int(poly_arr[:, 0].min())
+    poly_min_y = int(poly_arr[:, 1].min())
+    pw         = int(poly_arr[:, 0].max() - poly_min_x)
+    ph         = int(poly_arr[:, 1].max() - poly_min_y)
+
+    zone_rows, zone_cols = np.where(zone_mask)
+    valid_positions      = []
+    for r, c in zip(zone_rows, zone_cols):
+        if r + ph >= H or c + pw >= W:
+            continue
+        if not zone_mask[r:r+ph, c:c+pw].all():
+            continue
+        if occupied_mask is not None and occupied_mask[r:r+ph, c:c+pw].any():
+            continue
+        valid_positions.append((r, c))
+
+    if not valid_positions:
+        return None
+
+    idx      = rng.integers(len(valid_positions))
+    dr, dc   = valid_positions[idx]
+    offset_x = dc - poly_min_x
+    offset_y = dr - poly_min_y
+    return [[int(x + offset_x), int(y + offset_y)] for x, y in poly_pts]
+
+
+def crop_polygon_to_zone(poly_pts, zone_mask, H, W, rng, occupied_mask=None):
+    poly_arr   = np.array(poly_pts)
+    poly_min_x = int(poly_arr[:, 0].min())
+    poly_min_y = int(poly_arr[:, 1].min())
+
+    zone_rows, zone_cols = np.where(zone_mask)
+    if len(zone_rows) == 0:
+        return None
+
+    zone_r0 = int(zone_rows.min()); zone_r1 = int(zone_rows.max())
+    zone_c0 = int(zone_cols.min()); zone_c1 = int(zone_cols.max())
+
+    valid_positions = []
+    for r, c in zip(zone_rows, zone_cols):
+        if occupied_mask is not None and occupied_mask[r, c]:
+            continue
+        valid_positions.append((r, c))
+
+    if not valid_positions:
+        return None
+
+    idx      = rng.integers(len(valid_positions))
+    dr, dc   = valid_positions[idx]
+    offset_x = dc - poly_min_x
+    offset_y = dr - poly_min_y
+
+    new_pts = [
+        [max(zone_c0, min(zone_c1, int(x + offset_x))),
+         max(zone_r0, min(zone_r1, int(y + offset_y)))]
+        for x, y in poly_pts
+    ]
+    return new_pts
+
+
+def place_single_strategy1(cls, ext_list, zone_mask, H, W, rng, occupied_mask):
+    ext_indices = list(range(len(ext_list)))
+    rng.shuffle(ext_indices)
+
+    for i in ext_indices:
+        ext          = ext_list[i]
+        poly_indices = list(range(len(ext["polygons"])))
+        rng.shuffle(poly_indices)
+        for j in poly_indices:
+            poly     = ext["polygons"][j]
+            poly_arr = np.array(poly)
+            pw       = int(poly_arr[:, 0].max() - poly_arr[:, 0].min())
+            ph       = int(poly_arr[:, 1].max() - poly_arr[:, 1].min())
+
+            zone_rows, zone_cols = np.where(zone_mask)
+            valid_positions      = []
+            for r, c in zip(zone_rows, zone_cols):
+                if r + ph >= H or c + pw >= W:
+                    continue
+                if not zone_mask[r:r+ph, c:c+pw].all():
+                    continue
+                if occupied_mask[r:r+ph, c:c+pw].any():
+                    continue
+                valid_positions.append((r, c))
+
+            if not valid_positions:
+                continue
+
+            idx      = rng.integers(len(valid_positions))
+            dr, dc   = valid_positions[idx]
+            offset_x = dc - int(poly_arr[:, 0].min())
+            offset_y = dr - int(poly_arr[:, 1].min())
+            new_pts  = [[int(x+offset_x), int(y+offset_y)] for x, y in poly]
+            print(f"    S1 {cls} : placé entièrement")
+            return new_pts
+
+    print(f"    S1 {cls} : aucun ne rentre → crop")
+    i    = rng.integers(len(ext_list))
+    ext  = ext_list[i]
+    j    = rng.integers(len(ext["polygons"]))
+    poly = ext["polygons"][j]
+    return crop_polygon_to_zone(poly, zone_mask, H, W, rng, occupied_mask)
+
+
+def place_single_strategy2(cls, zone_mask, H, W, rng, occupied_mask,
+                            min_size=15, max_size=30):
+    pw = int(rng.integers(min_size, max_size + 1))
+    ph = int(rng.integers(min_size, max_size + 1))
+
+    zone_rows, zone_cols = np.where(zone_mask)
+    valid_positions      = []
+    for r, c in zip(zone_rows, zone_cols):
+        if r + ph >= H or c + pw >= W:
+            continue
+        if not zone_mask[r:r+ph, c:c+pw].all():
+            continue
+        if occupied_mask[r:r+ph, c:c+pw].any():
+            continue
+        valid_positions.append((r, c))
+
+    if not valid_positions:
+        print(f"    S2 {cls} : pas de place pour le rectangle")
+        return None
+
+    idx    = rng.integers(len(valid_positions))
+    r0, c0 = valid_positions[idx]
+    r1     = r0 + ph
+    c1     = c0 + pw
+    print(f"    S2 {cls} : rectangle {pw}x{ph}px")
+    return [[c0, r0], [c1, r0], [c1, r1], [c0, r1]]
+
+
+def make_labelme_json(image_name, H, W, annotations):
+    shapes = []
+    for ann in annotations:
+        shapes.append({
+            "label"     : ann["label"],
+            "points"    : ann["points"],
+            "group_id"  : None,
+            "shape_type": "polygon",
+            "flags"     : {}
+        })
+    return {
+        "version"    : "5.0.1",
+        "flags"      : {},
+        "shapes"     : shapes,
+        "imagePath"  : image_name,
+        "imageData"  : None,
+        "imageHeight": H,
+        "imageWidth" : W
+    }
+
+
+def load_plot_polygons(json_path):
+    with open(json_path) as f:
+        data = json.load(f)
+    polygons = []
+    for shape in data["shapes"]:
+        if shape["shape_type"] == "polygon":
+            polygons.append(shape["points"])
+    return polygons
+
+
+def save_cartography(mean_map, annotations, H, W, out_path):
+    fig, ax = plt.subplots(1, 1, figsize=(W / 100, H / 100), dpi=100)
+    fig.subplots_adjust(0, 0, 1, 1)
+    ax.set_facecolor("#181825")
+    ax.imshow(mean_map, cmap="inferno", aspect="auto",
+              extent=[0, W, H, 0])
+    ax.set_xlim(0, W)
+    ax.set_ylim(H, 0)
+
+    legend_classes = {}
+    color_idx      = 0
+
+    for shape in annotations:
+        label = shape["label"]
+        pts   = np.array(shape["points"])
+        if label == "zone_placement":
+            ax.add_patch(MplPolygon(pts, closed=True, linewidth=1.5,
+                                    edgecolor="#89b4fa", facecolor="none",
+                                    linestyle="--"))
+            continue
+        if label not in legend_classes:
+            legend_classes[label] = COLORS[color_idx % len(COLORS)]
+            color_idx += 1
+        color = legend_classes[label]
+        ax.add_patch(MplPolygon(pts, closed=True, linewidth=1.5,
+                                edgecolor=color, facecolor=color, alpha=0.35))
+        ax.text(pts[:, 0].mean(), pts[:, 1].mean(), label,
+                color=color, fontsize=6, ha="center", va="center",
+                bbox=dict(fc="#1e1e2e", alpha=0.7, pad=1))
+
+    if legend_classes:
+        legend_patches = [
+            mpatches.Patch(color=c, label=cls, alpha=0.7)
+            for cls, c in legend_classes.items()
+        ]
+        ax.legend(handles=legend_patches, loc="upper right", fontsize=7,
+                  framealpha=0.7, facecolor="#1e1e2e", labelcolor="#cdd6f4")
+
+    ax.axis("off")
+    plt.savefig(out_path, dpi=100, facecolor="#181825",
+                bbox_inches="tight", pad_inches=0)
+    plt.show()
+    plt.close()
+
+
+def main():
+    out_dir = Path(OUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rng     = np.random.default_rng()
+
+    plots = []
+    for hdr in sorted(Path(PLOTS_DIR).rglob("*.hdr")):
+        json_path = hdr.parent / f"{hdr.stem}.json"
+        if not json_path.exists():
+            print(f"  JSON manquant pour {hdr.stem} → ignoré")
+            continue
+        try:
+            cube, meta = load_hdr(hdr)
+            polygons   = load_plot_polygons(json_path)
+            if not polygons:
+                print(f"  Aucun polygon dans {json_path.name} → ignoré")
+                continue
+            plots.append({
+                "name"    : hdr.stem,
+                "cube"    : cube,
+                "meta"    : meta,
+                "path"    : str(hdr),
+                "polygons": polygons
+            })
+        except Exception as e:
+            print(f"  Erreur {hdr.name}: {e}")
+
+    print(f"{len(plots)} plot(s) chargé(s)")
+    if not plots:
+        print("Aucun plot disponible.")
+        return
+
+    all_extrudes = {}
+    for hdr in sorted(Path(EXTRUDE_ROOT).rglob("*.hdr")):
+        try:
+            class_name = hdr.stem.split("_")[0]
+            cube       = load_hdr(hdr)[0]
+            valid_mask = get_valid_mask(cube, THRESHOLD)
+            cube_c, mask_c, _, _ = crop_to_valid(cube, valid_mask)
+            polygons   = find_contour_polygons(mask_c)
+            if not polygons:
+                continue
+            if class_name not in all_extrudes:
+                all_extrudes[class_name] = []
+            all_extrudes[class_name].append({
+                "name"    : hdr.stem,
+                "polygons": polygons
+            })
+        except Exception as e:
+            print(f"  Erreur extrude {hdr.name}: {e}")
+
+    print(f"Extrudes chargés : { {k: len(v) for k,v in all_extrudes.items()} }")
+    if not all_extrudes:
+        print("Aucun extrude disponible.")
+        return
+
+    class_counts = {cls: 0 for cls in all_extrudes}
+    all_classes  = sorted(class_counts.keys())
+    print(f"Toutes les classes : {all_classes}")
+    print(f"Classes single     : {SINGLE_CLASSES}")
+
+    generated = 0
+
+    while generated < TARGET_TOTAL:
+        plot      = plots[rng.integers(len(plots))]
+        B, H, W   = plot["cube"].shape
+        mean_map  = plot["cube"].mean(axis=0)
+
+        polygon_roi = plot["polygons"][rng.integers(len(plot["polygons"]))]
+        zone_pts    = [(int(round(x)), int(round(y))) for x, y in polygon_roi]
+        zone_mask   = polygon_mask_2d(H, W, [(y, x) for x, y in zone_pts])
+
+        out_name      = f"{plot['name']}_aug_{generated:04d}"
+        annotations   = [{"label": "zone_placement", "points": polygon_roi}]
+        placed        = []
+        occupied_mask = np.zeros((H, W), dtype=np.uint8)
+
+        print(f"\n{out_name}")
+
+        for k in range(N_PER_PLOT):
+            min_count  = min(class_counts[cls] for cls in all_classes)
+            least_used = [cls for cls in all_classes
+                          if class_counts[cls] == min_count]
+            cls        = least_used[rng.integers(len(least_used))]
+            is_single  = cls in SINGLE_CLASSES
+
+            if is_single:
+                strategy = int(rng.integers(1, 3))
+                print(f"  [{k+1}] Single {cls} → Stratégie {strategy}")
+
+                if strategy == 1:
+                    # annuler tous les placements normaux déjà faits
+                    for cls_placed, _ in placed:
+                        class_counts[cls_placed] -= 1
+                    placed        = []
+                    annotations   = [{"label": "zone_placement", "points": polygon_roi}]
+                    occupied_mask = np.zeros((H, W), dtype=np.uint8)
+
+                    new_pts = place_single_strategy1(
+                        cls, all_extrudes[cls],
+                        zone_mask, H, W, rng, occupied_mask
+                    )
+                    if new_pts is not None:
+                        occupied_mask = update_occupied_mask(occupied_mask, new_pts)
+                        annotations.append({"label": cls, "points": new_pts})
+                        placed.append((cls, new_pts))
+                        class_counts[cls] += 1
+                    break   # plus de placements après stratégie 1
+
+                else:
+                    # stratégie 2 : rectangle, les normaux déjà placés restent
+                    new_pts = place_single_strategy2(
+                        cls, zone_mask, H, W, rng, occupied_mask,
+                        min_size=15, max_size=30
+                    )
+                    if new_pts is not None:
+                        occupied_mask = update_occupied_mask(occupied_mask, new_pts)
+                        annotations.append({"label": cls, "points": new_pts})
+                        placed.append((cls, new_pts))
+                        class_counts[cls] += 1
+
+            else:
+                print(f"  [{k+1}] Normale {cls}")
+                ext         = all_extrudes[cls][rng.integers(len(all_extrudes[cls]))]
+                poly_chosen = ext["polygons"][rng.integers(len(ext["polygons"]))]
+                new_pts     = place_polygon_in_zone(
+                    zone_mask, poly_chosen, H, W, rng,
+                    occupied_mask=occupied_mask
+                )
+                if new_pts is None:
+                    print(f"    Pas de place pour {cls}")
+                    continue
+
+                occupied_mask = update_occupied_mask(occupied_mask, new_pts)
+                annotations.append({"label": cls, "points": new_pts})
+                placed.append((cls, new_pts))
+                class_counts[cls] += 1
+
+        if not placed:
+            print(f"  Aucun placement réussi pour {out_name}, on réessaie")
+            continue
+
+        json_data = make_labelme_json(f"{out_name}.png", H, W, annotations)
+        json_out  = out_dir / f"{out_name}.json"
+        with open(json_out, "w") as f:
+            json.dump(json_data, f, indent=2)
+
+        m = plot["meta"].copy()
+        m["lines"]   = H
+        m["samples"] = W
+        m["bands"]   = B
+        envi.save_image(str(out_dir / f"{out_name}.hdr"),
+                        plot["cube"], dtype=np.float32,
+                        interleave="bil", force=True, metadata=m)
+
+        png_out = out_dir / f"{out_name}.png"
+        save_cartography(mean_map, annotations, H, W, png_out)
+
+        generated += 1
+        print(f"  [{generated}/{TARGET_TOTAL}] {out_name} — {len(placed)} extrude(s)")
+        print(f"  Compteurs : { {k:v for k,v in sorted(class_counts.items())} }")
+
+    print(f"\n✓ {generated} plots générés dans {out_dir}")
+    print(f"Bilan final : { {k:v for k,v in sorted(class_counts.items())} }")
+
+
+if __name__ == "__main__":
+    main()
