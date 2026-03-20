@@ -2324,3 +2324,6 @@ else:
         annotations.append({"label": cls, "points": new_pts})
         placed.append((cls, new_pts, ext["cube"], poly))
         class_counts[cls] += 1
+
+
+Another commonly used approach is based on SVM algorithms, which are supervised learning methods adapted to processing high dimensional data with a limited number of samples. [7] proposed a spectral spatial classification framework for HSI based on SVM, in which spatial patches are extracted around each pixel and combined with the raw spectral signature before being fed into the SVM classifier. [8] introduced a novel application of the ν-Support Vector Machine (ν-SVM) to HSI classification. The ν-SVM outperformed the classical SVM for classification tasks on unbalanced datasets. This model has an advantage over the conventional SVM by limiting the regularization parameter from a range of 0 to +∞ to a narrow range of 0 to 1. This makes model tuning more interpretable and potentially less prone to overfitting in high dimensional spectral spaces.
