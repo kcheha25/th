@@ -2304,3 +2304,23 @@ result_cube = plot["cube"].copy()
         mean_map_result = result_cube.mean(axis=0)
         png_out         = out_dir / f"{out_name}.png"
         save_cartography(mean_map_result, annotations, H, W, png_out)
+
+
+
+else:
+    # tirage de l extrude AVANT place_single_strategy2
+    # car la fonction génère juste un rectangle
+    # et insert_extrude_spectra copiera les spectres de cet extrude dans le rectangle
+    ext      = all_extrudes[cls][rng.integers(len(all_extrudes[cls]))]
+    idx_poly = rng.integers(len(ext["polygons"]))
+    poly     = ext["polygons"][idx_poly]
+
+    new_pts = place_single_strategy2(
+        cls, zone_mask, H, W, rng, occupied_mask,
+        min_size=15, max_size=30
+    )
+    if new_pts is not None:
+        occupied_mask = update_occupied_mask(occupied_mask, new_pts)
+        annotations.append({"label": cls, "points": new_pts})
+        placed.append((cls, new_pts, ext["cube"], poly))
+        class_counts[cls] += 1
