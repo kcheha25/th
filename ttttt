@@ -2201,3 +2201,106 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# return entier — ajouter poly dans le return
+return clip_pts_to_zone(new_pts, zone_mask), ext["cube"], poly
+
+# return crop fallback — ajouter poly dans le return
+return clip_pts_to_zone(new_pts, zone_mask), ext["cube"], poly
+
+# cas None
+return None, None, None
+
+
+def insert_extrude_spectra(plot_cube, extrude_cube, new_pts, poly_extrude, H, W):
+    result           = plot_cube.copy()
+    Be, He, We       = extrude_cube.shape
+    poly_placed_mask = polygon_mask_2d(H, W, [(int(y), int(x)) for x, y in new_pts])
+    ext_contour_mask = polygon_mask_2d(He, We, [(int(y), int(x)) for x, y in poly_extrude])
+    pts_arr          = np.array(new_pts)
+    placed_c0        = int(pts_arr[:, 0].min())
+    placed_r0        = int(pts_arr[:, 1].min())
+    ext_pts          = np.array(poly_extrude)
+    ext_c0           = int(ext_pts[:, 0].min())
+    ext_r0           = int(ext_pts[:, 1].min())
+    ext_h            = max(1, int(ext_pts[:, 1].max() - ext_r0))
+    ext_w            = max(1, int(ext_pts[:, 0].max() - ext_c0))
+    for r, c in zip(*np.where(poly_placed_mask)):
+        dr = r - placed_r0
+        dc = c - placed_c0
+        er = ext_r0 + (dr % ext_h)
+        ec = ext_c0 + (dc % ext_w)
+        if er >= He or ec >= We:
+            continue
+        if not ext_contour_mask[er, ec]:
+            continue
+        result[:, r, c] = extrude_cube[:, er, ec]
+    return result
+
+
+
+# classe normale
+idx_poly    = rng.integers(len(ext["polygons"]))
+poly_chosen = ext["polygons"][idx_poly]
+new_pts     = place_polygon_in_zone(zone_mask, poly_chosen, H, W, rng,
+                                    occupied_mask=occupied_mask)
+if new_pts is not None:
+    new_pts       = clip_pts_to_zone(new_pts, zone_mask)
+    occupied_mask = update_occupied_mask(occupied_mask, new_pts)
+    annotations.append({"label": cls, "points": new_pts})
+    placed.append((cls, new_pts, ext["cube"], poly_chosen))
+    class_counts[cls] += 1
+
+# single petit pw < 20
+idx_poly = rng.integers(len(ext["polygons"]))
+poly     = ext["polygons"][idx_poly]
+new_pts  = place_polygon_in_zone(zone_mask, poly, H, W, rng,
+                                 occupied_mask=occupied_mask)
+if new_pts is not None:
+    new_pts       = clip_pts_to_zone(new_pts, zone_mask)
+    occupied_mask = update_occupied_mask(occupied_mask, new_pts)
+    annotations.append({"label": cls, "points": new_pts})
+    placed.append((cls, new_pts, ext["cube"], poly))
+    class_counts[cls] += 1
+
+# stratégie 1
+new_pts, ext_cube, poly_ext = place_single_strategy1(
+    cls, all_extrudes[cls], zone_mask, H, W, rng, occupied_mask
+)
+if new_pts is not None:
+    occupied_mask = update_occupied_mask(occupied_mask, new_pts)
+    annotations.append({"label": cls, "points": new_pts})
+    placed.append((cls, new_pts, ext_cube, poly_ext))
+    class_counts[cls] += 1
+
+# stratégie 2 — rectangle, on prend un polygon aléatoire de l extrude comme référence
+idx_poly = rng.integers(len(ext["polygons"]))
+poly     = ext["polygons"][idx_poly]
+new_pts  = place_single_strategy2(cls, zone_mask, H, W, rng, occupied_mask,
+                                   min_size=15, max_size=30)
+if new_pts is not None:
+    new_pts       = clip_pts_to_zone(new_pts, zone_mask)
+    occupied_mask = update_occupied_mask(occupied_mask, new_pts)
+    annotations.append({"label": cls, "points": new_pts})
+    placed.append((cls, new_pts, ext["cube"], poly))
+    class_counts[cls] += 1
+
+
+result_cube = plot["cube"].copy()
+        for cls_p, pts_p, ext_cube, poly_ext in placed:
+            result_cube = insert_extrude_spectra(
+                result_cube, ext_cube, pts_p, poly_ext, H, W
+            )
+
+        m = plot["meta"].copy()
+        m["lines"]   = H
+        m["samples"] = W
+        m["bands"]   = B
+        envi.save_image(str(out_dir / f"{out_name}.hdr"),
+                        result_cube, dtype=np.float32,
+                        interleave="bil", force=True, metadata=m)
+
+        mean_map_result = result_cube.mean(axis=0)
+        png_out         = out_dir / f"{out_name}.png"
+        save_cartography(mean_map_result, annotations, H, W, png_out)
