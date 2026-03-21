@@ -2307,27 +2307,97 @@ result_cube = plot["cube"].copy()
 
 
 
-else:
-    # tirage de l extrude AVANT place_single_strategy2
-    # car la fonction génère juste un rectangle
-    # et insert_extrude_spectra copiera les spectres de cet extrude dans le rectangle
-    ext      = all_extrudes[cls][rng.integers(len(all_extrudes[cls]))]
+def place_single_strategy2(cls, ext, zone_mask, H, W, rng, occupied_mask):
+    """
+    Utilise le vrai polygon de contour de l extrude
+    et le place dans la zone sans chevauchement.
+    """
     idx_poly = rng.integers(len(ext["polygons"]))
     poly     = ext["polygons"][idx_poly]
+    poly_arr = np.array(poly)
+    pw       = int(poly_arr[:, 0].max() - poly_arr[:, 0].min())
+    ph       = int(poly_arr[:, 1].max() - poly_arr[:, 1].min())
 
-    new_pts = place_single_strategy2(
-        cls, zone_mask, H, W, rng, occupied_mask,
-        min_size=15, max_size=30
-    )
-    if new_pts is not None:
-        occupied_mask = update_occupied_mask(occupied_mask, new_pts)
-        annotations.append({"label": cls, "points": new_pts})
-        placed.append((cls, new_pts, ext["cube"], poly))
-        class_counts[cls] += 1
+    zone_rows, zone_cols = np.where(zone_mask)
+    valid_positions      = []
+    for r, c in zip(zone_rows, zone_cols):
+        if r + ph >= H or c + pw >= W:
+            continue
+        if not zone_mask[r:r+ph, c:c+pw].all():
+            continue
+        if occupied_mask[r:r+ph, c:c+pw].any():
+            continue
+        valid_positions.append((r, c))
+
+    if not valid_positions:
+        print(f"    S2 {cls} : pas de place")
+        return None, None
+
+    idx      = rng.integers(len(valid_positions))
+    r0, c0   = valid_positions[idx]
+    r0 = int(r0); c0 = int(c0)
+
+    # translater le polygon de l extrude vers la position trouvée
+    poly_min_x = int(poly_arr[:, 0].min())
+    poly_min_y = int(poly_arr[:, 1].min())
+    offset_x   = c0 - poly_min_x
+    offset_y   = r0 - poly_min_y
+
+    new_pts = [[int(x + offset_x), int(y + offset_y)] for x, y in poly]
+    new_pts = clip_pts_to_zone(new_pts, zone_mask)
+
+    print(f"    S2 {cls} : polygon {pw}x{ph}px placé @ ({r0},{c0})")
+    return new_pts, poly
 
 
-Bonjour Marion,
-Suite à votre mail concernant la convention, je souhaiterais vérifier : dois-je imprimer et envoyer uniquement la page de signature en 4 exemplaires ou l’ensemble du document ?
-Je vous communique également l’adresse à laquelle retourner l’exemplaire original signé par tous.
+else:
+                    ext     = all_extrudes[cls][rng.integers(len(all_extrudes[cls]))]
+                    new_pts, poly = place_single_strategy2(
+                        cls, ext, zone_mask, H, W, rng, occupied_mask
+                    )
+                    if new_pts is not None:
+                        occupied_mask = update_occupied_mask(occupied_mask, new_pts)
+                        annotations.append({"label": cls, "points": new_pts})
+                        placed.append((cls, new_pts, ext["cube"], poly))
+                        class_counts[cls] += 1
 
-Je vous remercie par avance et vous souhaite un bon week-end.
+
+def insert_extrude_spectra(plot_cube, extrude_cube, new_pts, poly_extrude, H, W):
+    result           = plot_cube.copy()
+    Be, He, We       = extrude_cube.shape
+
+    # masque du polygon placé dans le plot
+    poly_placed_mask = polygon_mask_2d(H, W, [(int(y), int(x)) for x, y in new_pts])
+
+    # masque du contour de l extrude — pixels valides uniquement
+    ext_contour_mask = polygon_mask_2d(He, We, [(int(y), int(x)) for x, y in poly_extrude])
+
+    # supprimer aussi les pixels nuls même à l intérieur du polygon
+    valid_mask_e     = get_valid_mask(extrude_cube)
+    ext_valid        = ext_contour_mask & valid_mask_e
+
+    pts_arr   = np.array(new_pts)
+    placed_c0 = int(pts_arr[:, 0].min())
+    placed_r0 = int(pts_arr[:, 1].min())
+
+    ext_pts   = np.array(poly_extrude)
+    ext_c0    = int(ext_pts[:, 0].min())
+    ext_r0    = int(ext_pts[:, 1].min())
+    ext_h     = max(1, int(ext_pts[:, 1].max() - ext_r0))
+    ext_w     = max(1, int(ext_pts[:, 0].max() - ext_c0))
+
+    for r, c in zip(*np.where(poly_placed_mask)):
+        dr = r - placed_r0
+        dc = c - placed_c0
+        er = ext_r0 + (dr % ext_h)
+        ec = ext_c0 + (dc % ext_w)
+
+        if er >= He or ec >= We:
+            continue
+        # ne copier que si pixel valide dans l extrude
+        if not ext_valid[er, ec]:
+            continue
+
+        result[:, r, c] = extrude_cube[:, er, ec]
+
+    return result
