@@ -2401,3 +2401,68 @@ def insert_extrude_spectra(plot_cube, extrude_cube, new_pts, poly_extrude, H, W)
         result[:, r, c] = extrude_cube[:, er, ec]
 
     return result
+
+
+def place_single_strategy2(cls, ext, zone_mask, H, W, rng, occupied_mask):
+    idx_poly = rng.integers(len(ext["polygons"]))
+    poly     = ext["polygons"][idx_poly]
+    poly_arr = np.array(poly)
+    pw       = int(poly_arr[:, 0].max() - poly_arr[:, 0].min())
+    ph       = int(poly_arr[:, 1].max() - poly_arr[:, 1].min())
+
+    zone_rows, zone_cols = np.where(zone_mask)
+    if len(zone_rows) == 0:
+        return None, None
+
+    zone_r0 = int(zone_rows.min()); zone_r1 = int(zone_rows.max())
+    zone_c0 = int(zone_cols.min()); zone_c1 = int(zone_cols.max())
+
+    poly_min_x = int(poly_arr[:, 0].min())
+    poly_min_y = int(poly_arr[:, 1].min())
+
+    # essai 1 : extrude entier qui rentre dans la zone
+    valid_positions = []
+    for r, c in zip(zone_rows, zone_cols):
+        if r + ph >= H or c + pw >= W:
+            continue
+        if not zone_mask[r:r+ph, c:c+pw].all():
+            continue
+        if occupied_mask[r:r+ph, c:c+pw].any():
+            continue
+        valid_positions.append((r, c))
+
+    if valid_positions:
+        idx      = rng.integers(len(valid_positions))
+        r0, c0   = int(valid_positions[idx][0]), int(valid_positions[idx][1])
+        offset_x = c0 - poly_min_x
+        offset_y = r0 - poly_min_y
+        new_pts  = [[int(x + offset_x), int(y + offset_y)] for x, y in poly]
+        new_pts  = clip_pts_to_zone(new_pts, zone_mask)
+        print(f"    S2 {cls} : placé entier @ ({r0},{c0})")
+        return new_pts, poly
+
+    # essai 2 : crop depuis le début de la zone de placement
+    print(f"    S2 {cls} : crop depuis début zone")
+    offset_x = zone_c0 - poly_min_x
+    offset_y = zone_r0 - poly_min_y
+
+    # translater et cropper aux bords de la zone
+    new_pts = [
+        [max(zone_c0, min(zone_c1, int(x + offset_x))),
+         max(zone_r0, min(zone_r1, int(y + offset_y)))]
+        for x, y in poly
+    ]
+
+    # crop aussi le polygon de l extrude pour correspondre
+    poly_cropped = [
+        [max(0, min(int(x), int(poly_arr[:, 0].max()))),
+         max(0, min(int(y), int(poly_arr[:, 1].max())))]
+        for x, y in poly
+    ]
+
+    if occupied_mask[zone_r0:min(zone_r0+ph, zone_r1),
+                     zone_c0:min(zone_c0+pw, zone_c1)].any():
+        print(f"    S2 {cls} : chevauchement après crop")
+        return None, None
+
+    return new_pts, poly_cropped
