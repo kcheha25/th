@@ -83,78 +83,67 @@ def align_cube_mask(cube, mask):
 def can_place(mask, occ, x, y):
     h,w = mask.shape
     region = occ[y:y+h, x:x+w]
-
     hh = min(region.shape[0], h)
     ww = min(region.shape[1], w)
-
     if hh == 0 or ww == 0:
         return False
-
-    region = region[:hh, :ww]
-    mask_crop = mask[:hh, :ww]
-
-    return not (region & mask_crop).any()
+    return not (region[:hh,:ww] & mask[:hh,:ww]).any()
 
 def update_occ(occ, mask, x, y):
     h,w = mask.shape
     region = occ[y:y+h, x:x+w]
-
     hh = min(region.shape[0], h)
     ww = min(region.shape[1], w)
-
     if hh == 0 or ww == 0:
         return
-
-    occ[y:y+hh, x:x+ww] |= mask[:hh, :ww]
+    occ[y:y+hh, x:x+ww] |= mask[:hh,:ww]
 
 def safe_paste(plot, cube, mask, x, y):
     h,w = mask.shape
-
     for b in range(plot.shape[0]):
         patch = plot[b, y:y+h, x:x+w]
-
         hh = patch.shape[0]
         ww = patch.shape[1]
-
         if hh == 0 or ww == 0:
             continue
-
-        mask_crop = mask[:hh, :ww]
-        cube_crop = cube[b][:hh, :ww]
-
-        patch[mask_crop] = cube_crop[mask_crop]
+        patch[mask[:hh,:ww]] = cube[b][:hh,:ww][mask[:hh,:ww]]
         plot[b, y:y+hh, x:x+ww] = patch
 
 def place_full(plot, occ, cube, mask, zone_poly):
     _,H,W = plot.shape
-
     cube, mask = align_cube_mask(cube, mask)
+    h,w = mask.shape
 
     zone_mask = polygon_to_mask(zone_poly,H,W)
     valid = compute_valid_positions(zone_mask, mask)
     ys,xs = np.where(valid)
 
-    if len(xs)==0:
-        return False,None
+    for idx in np.random.permutation(len(xs)):
+        y,x = ys[idx], xs[idx]
 
-    idx = random.randint(0,len(xs)-1)
-    y,x = ys[idx], xs[idx]
+        if not can_place(mask, occ, x, y):
+            continue
 
-    if not can_place(mask, occ, x, y):
-        return False,None
+        sub_zone = zone_mask[y:y+h, x:x+w]
+        hh = sub_zone.shape[0]
+        ww = sub_zone.shape[1]
 
-    safe_paste(plot, cube, mask, x, y)
-    update_occ(occ, mask, x, y)
+        if not np.all(sub_zone[:hh,:ww][mask[:hh,:ww]]):
+            continue
 
-    poly = find_contour_polygons(mask)
-    if not poly:
-        return False,None
+        safe_paste(plot, cube, mask, x, y)
+        update_occ(occ, mask, x, y)
 
-    poly = np.array(poly[0])
-    poly[:,0]+=x
-    poly[:,1]+=y
+        poly = find_contour_polygons(mask)
+        if not poly:
+            return False,None
 
-    return True, poly.tolist()
+        poly = np.array(poly[0])
+        poly[:,0]+=x
+        poly[:,1]+=y
+        return True, poly.tolist()
+
+    return False,None
 
 def random_patch(mask):
     h,w=mask.shape
@@ -176,37 +165,44 @@ def random_patch(mask):
 
 def place_patch(plot, occ, cube, mask, zone_poly):
     _,H,W=plot.shape
-
     cube, mask = align_cube_mask(cube, mask)
 
     rp = random_patch(mask)
     combined = rp & mask
+    if not combined.any():
+        return False,None
 
+    h,w = combined.shape
     zone_mask = polygon_to_mask(zone_poly,H,W)
     valid = compute_valid_positions(zone_mask, combined)
     ys,xs = np.where(valid)
 
-    if len(xs)==0:
-        return False,None
+    for idx in np.random.permutation(len(xs)):
+        y,x = ys[idx], xs[idx]
 
-    idx = random.randint(0,len(xs)-1)
-    y,x = ys[idx], xs[idx]
+        if not can_place(combined, occ, x, y):
+            continue
 
-    if not can_place(combined, occ, x, y):
-        return False,None
+        sub_zone = zone_mask[y:y+h, x:x+w]
+        hh = sub_zone.shape[0]
+        ww = sub_zone.shape[1]
 
-    safe_paste(plot, cube, combined, x, y)
-    update_occ(occ, combined, x, y)
+        if not np.all(sub_zone[:hh,:ww][combined[:hh,:ww]]):
+            continue
 
-    poly = find_contour_polygons(combined)
-    if not poly:
-        return False,None
+        safe_paste(plot, cube, combined, x, y)
+        update_occ(occ, combined, x, y)
 
-    poly = np.array(poly[0])
-    poly[:,0]+=x
-    poly[:,1]+=y
+        poly = find_contour_polygons(combined)
+        if not poly:
+            return False,None
 
-    return True, poly.tolist()
+        poly = np.array(poly[0])
+        poly[:,0]+=x
+        poly[:,1]+=y
+        return True, poly.tolist()
+
+    return False,None
 
 def get_class(name):
     return name.split("_")[0]
@@ -267,9 +263,7 @@ def generate(plot_root, extrude_root, out_dir):
                         pool.remove(e)
                         break
 
-                others=[x for x in selected if x!=e]
-
-                for e2 in others:
+                for e2 in [x for x in selected if x!=e]:
                     cube,_=load_cube(e2["hdr"])
                     mask=get_valid_mask_fast(cube)
                     cube,mask=crop_to_valid(cube,mask)
