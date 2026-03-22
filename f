@@ -344,26 +344,22 @@ def random_polygon_mask(h, w, dmin=10, dmax=40):
 def place_single_strategy(plot_cube, occ_mask, extrude_cube, extrude_mask, polygon, zone_polygon):
     _, H, W = plot_cube.shape
     zone_mask = polygon_to_mask(zone_polygon, H, W)
-    ys, xs = np.where(zone_mask)
-    if len(xs) == 0:
-        return False, plot_cube, occ_mask, None
-    idx = random.randint(0, len(xs)-1)
-    y0, x0 = ys[idx], xs[idx]
     h, w = extrude_mask.shape
-    y1 = min(y0+h, H)
-    x1 = min(x0+w, W)
-    sub_zone = zone_mask[y0:y1, x0:x1]
-    sub_mask = extrude_mask[:y1-y0, :x1-x0]
+    y0, x0 = 0, 0
+    h1 = min(h, H)
+    w1 = min(w, W)
+    sub_zone = zone_mask[y0:h1, x0:w1]
+    sub_mask = extrude_mask[:h1, :w1]
     valid = sub_mask & sub_zone
     if not valid.any():
         return False, plot_cube, occ_mask, None
     for b in range(plot_cube.shape[0]):
-        patch = plot_cube[b, y0:y1, x0:x1]
-        patch[valid] = extrude_cube[b][:y1-y0, :x1-x0][valid]
-        plot_cube[b, y0:y1, x0:x1] = patch
+        patch = plot_cube[b, y0:h1, x0:w1]
+        patch[valid] = extrude_cube[b][:h1, :w1][valid]
+        plot_cube[b, y0:h1, x0:w1] = patch
     update_occupancy(occ_mask, valid, x0, y0)
-    mask_full = np.zeros((H,W), dtype=np.uint8)
-    mask_full[y0:y1, x0:x1][valid] = 1
+    mask_full = np.zeros((H, W), dtype=np.uint8)
+    mask_full[y0:h1, x0:w1][valid] = 1
     polys = find_contour_polygons(mask_full)
     return True, plot_cube, occ_mask, polys[0] if polys else None
 
@@ -381,13 +377,21 @@ def place_random_patch_strategy(plot_cube, occ_mask, extrude_cube, extrude_mask,
         return False, plot_cube, occ_mask, None
     idx = random.randint(0, len(xs)-1)
     y, x = ys[idx], xs[idx]
+    y1 = min(y + h, H)
+    x1 = min(x + w, W)
+    hh = y1 - y
+    ww = x1 - x
+    combined_crop = combined[:hh, :ww]
+    cube_crop = extrude_cube[:, :hh, :ww]
+    if not can_place(combined_crop, occ_mask, x, y):
+        return False, plot_cube, occ_mask, None
     for b in range(plot_cube.shape[0]):
-        patch = plot_cube[b, y:y+h, x:x+w]
-        patch[combined] = extrude_cube[b][combined]
-        plot_cube[b, y:y+h, x:x+w] = patch
-    update_occupancy(occ_mask, combined, x, y)
-    mask_full = np.zeros((H,W), dtype=np.uint8)
-    mask_full[y:y+h, x:x+w][combined] = 1
+        patch = plot_cube[b, y:y1, x:x1]
+        patch[combined_crop] = cube_crop[b][combined_crop]
+        plot_cube[b, y:y1, x:x1] = patch
+    update_occupancy(occ_mask, combined_crop, x, y)
+    mask_full = np.zeros((H, W), dtype=np.uint8)
+    mask_full[y:y1, x:x1][combined_crop] = 1
     polys = find_contour_polygons(mask_full)
     return True, plot_cube, occ_mask, polys[0] if polys else None
 
