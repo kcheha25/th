@@ -5,18 +5,49 @@ import spectral.io.envi as envi
 import cv2
 import json
 from collections import defaultdict
+import matplotlib.pyplot as plt
 
 N_EXTRUDES_PER_PLOT = 12
 MAX_PLOTS = 500
 IGNORE_CLASSES = []
 TARGET_PER_CLASS = 200
 
+WAVELENGTH_1 = 996
+WAVELENGTH_2 = 1197
+
 def load_cube(hdr_path):
     img = envi.open(str(hdr_path))
-    return np.array(img.load(), dtype=np.float32)
+    return np.array(img.load(), dtype=np.float32), img
 
 def save_envi_cube(cube, path):
     envi.save_image(str(path) + ".hdr", cube, dtype=np.float32, interleave="bsq", force=True)
+
+def get_band_index(img, wavelength):
+    wl = np.array(img.metadata["wavelength"], dtype=float)
+    return np.argmin(np.abs(wl - wavelength))
+
+def compute_ratio_map(cube, b1, b2):
+    band1 = cube[b1]
+    band2 = cube[b2]
+    ratio = np.zeros_like(band1)
+    valid = band2 > 1e-6
+    ratio[valid] = band1[valid] / band2[valid]
+    return ratio
+
+def save_ratio_map(ratio, polygons, out_path):
+    fig, ax = plt.subplots(figsize=(6,5))
+    im = ax.imshow(ratio, cmap="viridis")
+    plt.colorbar(im, ax=ax, fraction=0.03)
+
+    for poly in polygons:
+        p = np.array(poly)
+        p = np.vstack([p, p[0]])
+        ax.plot(p[:,0], p[:,1], color="red", linewidth=1.5)
+
+    ax.axis("off")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=120)
+    plt.close()
 
 def get_valid_mask_fast(cube, threshold=1e-6):
     return cube.var(axis=0) > threshold
@@ -101,12 +132,12 @@ def load_extrude_pool(root, ignore):
     return pool
 
 def load_plot(plot_hdr):
-    cube = load_cube(plot_hdr)
+    cube, img = load_cube(plot_hdr)
     json_path = plot_hdr.with_suffix(".json")
     with open(json_path) as f:
         data = json.load(f)
     zones = [s["points"] for s in data["shapes"] if s["label"] == "zone_placement"]
-    return cube, zones
+    return cube, zones, img
 
 def init_class_counter(pool):
     d = defaultdict(int)
@@ -145,23 +176,34 @@ def generate(plot_root, extrude_root, out_dir):
     out_dir = Path(out_dir)
     out_dir.mkdir(exist_ok=True)
     count = 0
+
     while count < MAX_PLOTS:
         selected = select_balanced(pool, counter, N_EXTRUDES_PER_PLOT, TARGET_PER_CLASS)
         if selected is None:
             break
+
         plot_hdr = random.choice(plot_files)
-        plot_cube, zones = load_plot(plot_hdr)
+        plot_cube, zones, img = load_plot(plot_hdr)
+
+        b1 = get_band_index(img, WAVELENGTH_1)
+        b2 = get_band_index(img, WAVELENGTH_2)
+
         _, H, W = plot_cube.shape
         occ_mask = np.zeros((H, W), dtype=bool)
+
         shapes = []
+
         for e in selected:
-            cube = load_cube(e["hdr"])
+            cube, _ = load_cube(e["hdr"])
             mask = get_valid_mask_fast(cube)
             cube, mask = crop_to_valid(cube, mask)
             polys = find_contour_polygons(mask)
+
             if not polys:
                 continue
+
             placed = False
+
             for zone in zones:
                 ok, plot_cube, occ_mask, poly = place_extrude(
                     plot_cube,
@@ -171,6 +213,7 @@ def generate(plot_root, extrude_root, out_dir):
                     polys[0],
                     zone
                 )
+
                 if ok:
                     shapes.append({
                         "label": e["class"],
@@ -180,12 +223,20 @@ def generate(plot_root, extrude_root, out_dir):
                     counter[e["class"]] += 1
                     placed = True
                     break
+
             if not placed:
                 continue
+
         pool = [x for x in pool if x not in selected]
+
         name = f"aug_plot_{count}"
+
         save_envi_cube(plot_cube, out_dir / name)
         save_labelme(shapes, name, H, W, out_dir / f"{name}.json")
+
+        ratio = compute_ratio_map(plot_cube, b1, b2)
+        save_ratio_map(ratio, [s["points"] for s in shapes], out_dir / f"{name}_ratio.png")
+
         count += 1
 
 if __name__ == "__main__":
