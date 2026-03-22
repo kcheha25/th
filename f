@@ -38,12 +38,10 @@ def save_ratio_map(ratio, polygons, out_path):
     fig, ax = plt.subplots(figsize=(6,5))
     im = ax.imshow(ratio, cmap="viridis")
     plt.colorbar(im, ax=ax, fraction=0.03)
-
     for poly in polygons:
         p = np.array(poly)
         p = np.vstack([p, p[0]])
         ax.plot(p[:,0], p[:,1], color="red", linewidth=1.5)
-
     ax.axis("off")
     plt.tight_layout()
     plt.savefig(out_path, dpi=120)
@@ -80,7 +78,7 @@ def polygon_to_mask(polygon, H, W):
 def compute_valid_positions(zone_mask, extrude_mask):
     zone_u8 = zone_mask.astype(np.uint8) * 255
     kernel = extrude_mask.astype(np.uint8)
-    valid = cv2.erode(zone_u8, kernel)
+    valid = cv2.erode(zone_u8, kernel, iterations=1)
     return valid.astype(bool)
 
 def can_place(mask_extrude, occ_mask, x, y):
@@ -100,12 +98,15 @@ def place_extrude(plot_cube, occ_mask, extrude_cube, extrude_mask, polygon, zone
     ys, xs = np.where(valid_positions)
     if len(xs) == 0:
         return False, plot_cube, occ_mask, None
-    indices = np.random.permutation(len(xs))
-    for idx in indices[:100]:
+    idxs = np.random.permutation(len(xs))
+    for idx in idxs:
         y, x = ys[idx], xs[idx]
         if y + h > H or x + w > W:
             continue
         if not can_place(extrude_mask, occ_mask, x, y):
+            continue
+        sub_zone = zone_mask[y:y+h, x:x+w]
+        if not np.all(sub_zone[extrude_mask]):
             continue
         for b in range(plot_cube.shape[0]):
             patch = plot_cube[b, y:y+h, x:x+w]
@@ -176,34 +177,25 @@ def generate(plot_root, extrude_root, out_dir):
     out_dir = Path(out_dir)
     out_dir.mkdir(exist_ok=True)
     count = 0
-
     while count < MAX_PLOTS:
         selected = select_balanced(pool, counter, N_EXTRUDES_PER_PLOT, TARGET_PER_CLASS)
         if selected is None:
             break
-
         plot_hdr = random.choice(plot_files)
         plot_cube, zones, img = load_plot(plot_hdr)
-
         b1 = get_band_index(img, WAVELENGTH_1)
         b2 = get_band_index(img, WAVELENGTH_2)
-
         _, H, W = plot_cube.shape
         occ_mask = np.zeros((H, W), dtype=bool)
-
         shapes = []
-
         for e in selected:
             cube, _ = load_cube(e["hdr"])
             mask = get_valid_mask_fast(cube)
             cube, mask = crop_to_valid(cube, mask)
             polys = find_contour_polygons(mask)
-
             if not polys:
                 continue
-
             placed = False
-
             for zone in zones:
                 ok, plot_cube, occ_mask, poly = place_extrude(
                     plot_cube,
@@ -213,7 +205,6 @@ def generate(plot_root, extrude_root, out_dir):
                     polys[0],
                     zone
                 )
-
                 if ok:
                     shapes.append({
                         "label": e["class"],
@@ -223,20 +214,14 @@ def generate(plot_root, extrude_root, out_dir):
                     counter[e["class"]] += 1
                     placed = True
                     break
-
             if not placed:
                 continue
-
         pool = [x for x in pool if x not in selected]
-
         name = f"aug_plot_{count}"
-
         save_envi_cube(plot_cube, out_dir / name)
         save_labelme(shapes, name, H, W, out_dir / f"{name}.json")
-
         ratio = compute_ratio_map(plot_cube, b1, b2)
         save_ratio_map(ratio, [s["points"] for s in shapes], out_dir / f"{name}_ratio.png")
-
         count += 1
 
 if __name__ == "__main__":
