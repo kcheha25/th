@@ -41,7 +41,7 @@ def save_ratio_map(ratio, polygons, out_path):
             continue
         p = np.array(poly)
         p = np.vstack([p, p[0]])
-        ax.plot(p[:,0], p[:,1], color="red", linewidth=1.5)
+        ax.plot(p[:,0], p[:,1], color="red")
     ax.axis("off")
     plt.tight_layout()
     plt.savefig(out_path, dpi=120)
@@ -75,6 +75,11 @@ def polygon_to_mask(poly,H,W):
 def compute_valid_positions(zone_mask, extrude_mask):
     return cv2.erode(zone_mask.astype(np.uint8)*255, extrude_mask.astype(np.uint8)).astype(bool)
 
+def align_cube_mask(cube, mask):
+    h = min(mask.shape[0], cube.shape[1])
+    w = min(mask.shape[1], cube.shape[2])
+    return cube[:, :h, :w], mask[:h, :w]
+
 def can_place(mask, occ, x, y):
     h,w=mask.shape
     return not (occ[y:y+h,x:x+w] & mask).any()
@@ -83,60 +88,99 @@ def update_occ(occ, mask, x, y):
     h,w=mask.shape
     occ[y:y+h,x:x+w] |= mask
 
+def safe_paste(plot, cube, mask, x, y):
+    h,w = mask.shape
+    for b in range(plot.shape[0]):
+        patch = plot[b, y:y+h, x:x+w]
+        hh = patch.shape[0]
+        ww = patch.shape[1]
+        mask_crop = mask[:hh, :ww]
+        cube_crop = cube[b][:hh, :ww]
+        patch[mask_crop] = cube_crop[mask_crop]
+        plot[b, y:y+h, x:x+w] = patch
+
 def place_full(plot, occ, cube, mask, zone_poly):
-    _,H,W=plot.shape
-    zone_mask=polygon_to_mask(zone_poly,H,W)
-    valid=compute_valid_positions(zone_mask,mask)
-    ys,xs=np.where(valid)
+    _,H,W = plot.shape
+
+    cube, mask = align_cube_mask(cube, mask)
+
+    zone_mask = polygon_to_mask(zone_poly,H,W)
+    valid = compute_valid_positions(zone_mask, mask)
+    ys,xs = np.where(valid)
+
     if len(xs)==0:
         return False,None
-    idx=random.randint(0,len(xs)-1)
-    y,x=ys[idx],xs[idx]
-    h,w=mask.shape
-    for b in range(plot.shape[0]):
-        patch=plot[b,y:y+h,x:x+w]
-        patch[mask]=cube[b][mask]
-        plot[b,y:y+h,x:x+w]=patch
-    update_occ(occ,mask,x,y)
-    poly=find_contour_polygons(mask)[0]
-    poly=np.array(poly); poly[:,0]+=x; poly[:,1]+=y
-    return True,poly.tolist()
+
+    idx = random.randint(0,len(xs)-1)
+    y,x = ys[idx], xs[idx]
+
+    if not can_place(mask, occ, x, y):
+        return False,None
+
+    safe_paste(plot, cube, mask, x, y)
+    update_occ(occ, mask, x, y)
+
+    poly = find_contour_polygons(mask)
+    if not poly:
+        return False,None
+
+    poly = np.array(poly[0])
+    poly[:,0]+=x
+    poly[:,1]+=y
+
+    return True, poly.tolist()
 
 def random_patch(mask):
     h,w=mask.shape
     m=np.zeros((h,w),dtype=np.uint8)
-    cx=random.randint(0,w-1); cy=random.randint(0,h-1)
+    cx=random.randint(0,w-1)
+    cy=random.randint(0,h-1)
     r=random.randint(10,40)
     pts=[]
     for _ in range(random.randint(5,10)):
         a=random.uniform(0,2*np.pi)
         rr=random.uniform(r*0.5,r)
-        x=int(cx+rr*np.cos(a)); y=int(cy+rr*np.sin(a))
-        x=np.clip(x,0,w-1); y=np.clip(y,0,h-1)
+        x=int(cx+rr*np.cos(a))
+        y=int(cy+rr*np.sin(a))
+        x=np.clip(x,0,w-1)
+        y=np.clip(y,0,h-1)
         pts.append([x,y])
     cv2.fillPoly(m,[np.array(pts,dtype=np.int32)],1)
     return m.astype(bool)
 
 def place_patch(plot, occ, cube, mask, zone_poly):
     _,H,W=plot.shape
-    zone_mask=polygon_to_mask(zone_poly,H,W)
-    rp=random_patch(mask)
-    combined=rp & mask
-    valid=compute_valid_positions(zone_mask,combined)
-    ys,xs=np.where(valid)
+
+    cube, mask = align_cube_mask(cube, mask)
+
+    rp = random_patch(mask)
+    combined = rp & mask
+
+    zone_mask = polygon_to_mask(zone_poly,H,W)
+    valid = compute_valid_positions(zone_mask, combined)
+    ys,xs = np.where(valid)
+
     if len(xs)==0:
         return False,None
-    idx=random.randint(0,len(xs)-1)
-    y,x=ys[idx],xs[idx]
-    h,w=combined.shape
-    for b in range(plot.shape[0]):
-        patch=plot[b,y:y+h,x:x+w]
-        patch[combined]=cube[b][combined]
-        plot[b,y:y+h,x:x+w]=patch
-    update_occ(occ,combined,x,y)
-    poly=find_contour_polygons(combined)[0]
-    poly=np.array(poly); poly[:,0]+=x; poly[:,1]+=y
-    return True,poly.tolist()
+
+    idx = random.randint(0,len(xs)-1)
+    y,x = ys[idx], xs[idx]
+
+    if not can_place(combined, occ, x, y):
+        return False,None
+
+    safe_paste(plot, cube, combined, x, y)
+    update_occ(occ, combined, x, y)
+
+    poly = find_contour_polygons(combined)
+    if not poly:
+        return False,None
+
+    poly = np.array(poly[0])
+    poly[:,0]+=x
+    poly[:,1]+=y
+
+    return True, poly.tolist()
 
 def get_class(name):
     return name.split("_")[0]
@@ -158,6 +202,7 @@ def generate(plot_root, extrude_root, out_dir):
     out_dir=Path(out_dir); out_dir.mkdir(exist_ok=True)
 
     for i in range(MAX_PLOTS):
+
         if len(pool)<12:
             break
 
@@ -197,10 +242,12 @@ def generate(plot_root, extrude_root, out_dir):
                         break
 
                 others=[x for x in selected if x!=e]
+
                 for e2 in others:
                     cube,_=load_cube(e2["hdr"])
                     mask=get_valid_mask_fast(cube)
                     cube,mask=crop_to_valid(cube,mask)
+
                     for z in zones:
                         ok,poly=place_full(plot,occ,cube,mask,z)
                         if ok:
@@ -214,6 +261,7 @@ def generate(plot_root, extrude_root, out_dir):
                 cube,_=load_cube(e["hdr"])
                 mask=get_valid_mask_fast(cube)
                 cube,mask=crop_to_valid(cube,mask)
+
                 for z in zones:
                     ok,poly=place_full(plot,occ,cube,mask,z)
                     if ok:
