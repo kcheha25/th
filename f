@@ -310,6 +310,12 @@ def polygon_to_mask(polygon, H, W):
     cv2.fillPoly(mask, [pts], 1)
     return mask.astype(bool)
 
+def compute_valid_positions(zone_mask, extrude_mask):
+    zone_u8 = zone_mask.astype(np.uint8) * 255
+    kernel = extrude_mask.astype(np.uint8)
+    valid = cv2.erode(zone_u8, kernel, iterations=1)
+    return valid.astype(bool)
+
 def crop_extrude_to_zone(extrude_cube, extrude_mask, zone_mask):
     extrude_h, extrude_w = extrude_mask.shape
     zone_coords = np.argwhere(zone_mask)
@@ -340,70 +346,31 @@ def place_single_strategy(plot_cube, occ_mask, extrude_cube, extrude_mask, zone_
     extrude_crop, mask_crop, poly = crop_extrude_to_zone(extrude_cube, extrude_mask, zone_mask)
     if extrude_crop is None or not mask_crop.any():
         return False, plot_cube, occ_mask, None
-    ys, xs = np.where(mask_crop)
-    y_shift, x_shift = ys.min(), xs.min()
-    h, w = mask_crop.shape
+    h,w = mask_crop.shape
     for b in range(plot_cube.shape[0]):
         patch = plot_cube[b, 0:h, 0:w]
         patch[mask_crop] = extrude_crop[b][mask_crop]
         plot_cube[b, 0:h, 0:w] = patch
     update_occupancy(occ_mask, mask_crop, 0,0)
     poly = np.array(poly)
-    poly[:,0] += 0
-    poly[:,1] += 0
+    poly[:,0]+=0
+    poly[:,1]+=0
     return True, plot_cube, occ_mask, poly.tolist()
 
-def place_random_patch_strategy(plot_cube, occ_mask, extrude_cube, extrude_mask, zone_polygon):
-    _, H, W = plot_cube.shape
-    zone_mask = polygon_to_mask(zone_polygon,H,W)
-    h,w = extrude_mask.shape
-    for attempt in range(50):
-        rand_mask = np.zeros((h,w),dtype=bool)
-        cx = random.randint(0,w-1)
-        cy = random.randint(0,h-1)
-        radius = random.randint(10,40)
-        for _ in range(random.randint(5,10)):
-            angle = random.uniform(0,2*np.pi)
-            r = random.uniform(radius*0.5,radius)
-            x = int(cx+r*np.cos(angle))
-            y = int(cy+r*np.sin(angle))
-            x = np.clip(x,0,w-1)
-            y = np.clip(y,0,h-1)
-            rand_mask[y,x]=True
-        combined = extrude_mask & rand_mask
-        extrude_crop = extrude_cube[:, :h, :w]
-        ys, xs = np.where(compute_valid_positions(zone_mask, combined))
-        if len(xs)==0:
-            continue
-        idx = random.randint(0,len(xs)-1)
-        y0,x0 = ys[idx], xs[idx]
-        if not can_place(combined, occ_mask, x0, y0):
-            continue
-        for b in range(plot_cube.shape[0]):
-            patch = plot_cube[b, y0:y0+h, x0:x0+w]
-            patch[combined] = extrude_crop[b][combined]
-            plot_cube[b, y0:y0+h, x0:x0+w] = patch
-        update_occupancy(occ_mask, combined, x0, y0)
-        polys = find_contour_polygons(combined)
-        return True, plot_cube, occ_mask, polys[0] if polys else None
-    return False, plot_cube, occ_mask, None
-
 def place_extrude(plot_cube, occ_mask, extrude_cube, extrude_mask, polygon, zone_polygon, cls):
-    if cls in IGNORE_CLASSES:
-        return place_single_strategy(plot_cube, occ_mask, extrude_cube, extrude_mask, zone_polygon)
-    h,w = extrude_mask.shape
     _, H, W = plot_cube.shape
     zone_mask = polygon_to_mask(zone_polygon,H,W)
     extrude_crop, mask_crop, poly = crop_extrude_to_zone(extrude_cube, extrude_mask, zone_mask)
     if extrude_crop is None or not mask_crop.any():
         return False, plot_cube, occ_mask, None
     valid_positions = compute_valid_positions(zone_mask, mask_crop)
-    ys, xs = np.where(valid_positions)
+    ys,xs = np.where(valid_positions)
     if len(xs)==0:
         return False, plot_cube, occ_mask, None
     idxs = np.random.permutation(len(xs))
     for idx in idxs:
         y,x = ys[idx], xs[idx]
+        h,w = mask_crop.shape
         if y+h>H or x+w>W:
             continue
         if not can_place(mask_crop, occ_mask, x, y):
@@ -465,25 +432,22 @@ def generate(plot_root, extrude_root, out_dir):
     out_dir.mkdir(exist_ok=True)
     count=0
     while count<MAX_PLOTS:
-        selected = []
-        # équilibrer classes
         classes = list(set([e["class"] for e in pool]))
-        min_remaining = min([TARGET_PER_CLASS-counter[c] for c in classes])
-        if min_remaining<=0:
+        if not classes:
             break
+        selected=[]
         for cls in classes:
             candidates = [e for e in pool if e["class"]==cls]
-            if not candidates:
-                continue
-            selected.append(random.choice(candidates))
+            if candidates:
+                selected.append(random.choice(candidates))
         plot_hdr = random.choice(plot_files)
         plot_cube, zones, img = load_plot(plot_hdr)
         b1 = get_band_index(img,WAVELENGTH_1)
         b2 = get_band_index(img,WAVELENGTH_2)
         _,H,W = plot_cube.shape
         occ_mask = np.zeros((H,W),dtype=bool)
-        shapes = []
-        single_used = False
+        shapes=[]
+        single_used=False
         for e in selected:
             cube,_ = load_cube(e["hdr"])
             mask = get_valid_mask_fast(cube)
@@ -508,7 +472,6 @@ def generate(plot_root, extrude_root, out_dir):
                         counter[cls]+=1
                         break
             if single_used:
-                # si single utilisé, supprimer autres extrudes et finir le plot
                 selected=[e]
                 break
         if not shapes:
