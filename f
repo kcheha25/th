@@ -81,23 +81,49 @@ def align_cube_mask(cube, mask):
     return cube[:, :h, :w], mask[:h, :w]
 
 def can_place(mask, occ, x, y):
-    h,w=mask.shape
-    return not (occ[y:y+h,x:x+w] & mask).any()
+    h,w = mask.shape
+    region = occ[y:y+h, x:x+w]
+
+    hh = min(region.shape[0], h)
+    ww = min(region.shape[1], w)
+
+    if hh == 0 or ww == 0:
+        return False
+
+    region = region[:hh, :ww]
+    mask_crop = mask[:hh, :ww]
+
+    return not (region & mask_crop).any()
 
 def update_occ(occ, mask, x, y):
-    h,w=mask.shape
-    occ[y:y+h,x:x+w] |= mask
+    h,w = mask.shape
+    region = occ[y:y+h, x:x+w]
+
+    hh = min(region.shape[0], h)
+    ww = min(region.shape[1], w)
+
+    if hh == 0 or ww == 0:
+        return
+
+    occ[y:y+hh, x:x+ww] |= mask[:hh, :ww]
 
 def safe_paste(plot, cube, mask, x, y):
     h,w = mask.shape
+
     for b in range(plot.shape[0]):
         patch = plot[b, y:y+h, x:x+w]
+
         hh = patch.shape[0]
         ww = patch.shape[1]
+
+        if hh == 0 or ww == 0:
+            continue
+
         mask_crop = mask[:hh, :ww]
         cube_crop = cube[b][:hh, :ww]
+
         patch[mask_crop] = cube_crop[mask_crop]
-        plot[b, y:y+h, x:x+w] = patch
+        plot[b, y:y+hh, x:x+ww] = patch
 
 def place_full(plot, occ, cube, mask, zone_poly):
     _,H,W = plot.shape
