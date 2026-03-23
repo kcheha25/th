@@ -313,4 +313,4 @@ def generate(plot_root, extrude_root, out_dir):
         print("Plot",i,"->",dict(counter))
 
 if __name__=="__main__":
-    generate("plots_zone_to_add","aug_after_rot_flip","output")
+    generate("plots_zone_to_add","aug_after_rot_flip","output") 
