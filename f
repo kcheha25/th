@@ -7,16 +7,16 @@ import json
 from collections import defaultdict
 import matplotlib.pyplot as plt
 
-MAX_PLOTS   = 500
+MAX_PLOTS      = 500
 SINGLE_CLASSES = []          # ex: ["mildiou", "rouille"]
-MIN_PATCHES = 10
-MAX_PATCHES = 14
-WAVELENGTH_1 = 996
-WAVELENGTH_2 = 1197
+MIN_PATCHES    = 10
+MAX_PATCHES    = 14
+WAVELENGTH_1   = 996
+WAVELENGTH_2   = 1197
 
-# ──────────────────────────────────────────────
-# I/O
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# I/O  –  cubes ENVI
+# ═══════════════════════════════════════════════════════════════
 
 def load_cube(hdr_path):
     img = envi.open(str(hdr_path))
@@ -30,6 +30,10 @@ def get_band_index(img, wavelength):
     wl = np.array(img.metadata["wavelength"], dtype=float)
     return np.argmin(np.abs(wl - wavelength))
 
+# ═══════════════════════════════════════════════════════════════
+# Carte ratio
+# ═══════════════════════════════════════════════════════════════
+
 def compute_ratio_map(cube, b1, b2):
     band1 = cube[b1]
     band2 = cube[b2]
@@ -38,24 +42,43 @@ def compute_ratio_map(cube, b1, b2):
     ratio[valid] = band1[valid] / band2[valid]
     return ratio
 
-def save_ratio_map(ratio, polygons, out_path):
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(ratio, cmap="viridis")
-    plt.colorbar(im, ax=ax, fraction=0.03)
+def _ratio_to_bgr(ratio):
+    """Normalise ratio → uint8 puis applique colormap viridis (BGR)."""
+    r = ratio.copy()
+    rmin, rmax = r.min(), r.max()
+    if rmax - rmin > 1e-8:
+        r = (r - rmin) / (rmax - rmin)
+    else:
+        r = np.zeros_like(r)
+    u8 = (r * 255).astype(np.uint8)
+    return cv2.applyColorMap(u8, cv2.COLORMAP_VIRIDIS)   # shape H×W×3 BGR
+
+def save_ratio_plain(ratio, out_path):
+    """
+    PNG ratio SANS contours.
+    Même nom que le .json → c'est l'image référencée par LabelMe
+    (imagePath = "<name>.png").
+    """
+    bgr = _ratio_to_bgr(ratio)
+    cv2.imwrite(str(out_path), bgr)
+
+def save_ratio_with_contours(ratio, polygons, out_path):
+    """
+    PNG ratio AVEC contours rouges des polygones annotés.
+    Nom : "<name>_ratio.png"  (fichier de visualisation).
+    """
+    bgr = _ratio_to_bgr(ratio).copy()
     for poly in polygons:
         if poly is None or len(poly) < 3:
             continue
-        p = np.array(poly)
-        p = np.vstack([p, p[0]])
-        ax.plot(p[:, 0], p[:, 1], color="red", linewidth=1.5)
-    ax.axis("off")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=120)
-    plt.close()
+        pts = np.array(poly, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(bgr, [pts], isClosed=True,
+                      color=(0, 0, 255), thickness=2)   # rouge en BGR
+    cv2.imwrite(str(out_path), bgr)
 
-# ──────────────────────────────────────────────
-# Masques
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# Masques utilitaires
+# ═══════════════════════════════════════════════════════════════
 
 def get_valid_mask_fast(cube):
     return cube.var(axis=0) > 1e-6
@@ -84,9 +107,10 @@ def polygon_to_mask(poly, H, W):
     cv2.fillPoly(m, [np.array(poly, dtype=np.int32)], 1)
     return m.astype(bool)
 
-# ──────────────────────────────────────────────
-# Positions valides (érosion anchor coin TL)
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# Positions valides (érosion, anchor coin TL)
+# Garantit que chaque pixel actif de l'extrude reste dans zone_mask
+# ═══════════════════════════════════════════════════════════════
 
 def compute_valid_positions(zone_mask, extrude_mask):
     kernel = extrude_mask.astype(np.uint8)
@@ -99,9 +123,9 @@ def compute_valid_positions(zone_mask, extrude_mask):
     ).astype(bool)
     return valid
 
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 # Occupation
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 
 def can_place(occ, mask, x, y):
     h, w = mask.shape
@@ -114,9 +138,9 @@ def update_occ(occ, mask, x, y):
     h, w = mask.shape
     occ[y:y+h, x:x+w] |= mask
 
-# ──────────────────────────────────────────────
-# Placement full
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# Placement – full extrude (dans zone)
+# ═══════════════════════════════════════════════════════════════
 
 def place_full(plot, occ, cube, extrude_mask, zone_poly):
     _, H, W = plot.shape
@@ -148,15 +172,17 @@ def place_full(plot, occ, cube, extrude_mask, zone_poly):
     poly[:, 1] += y
     return True, poly.tolist()
 
-# ──────────────────────────────────────────────
-# Placement patch circulaire (single strat 2)
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# Placement – patch circulaire (single, stratégie 2)
+# Diamètre aléatoire 10–30 px, spectres copiés depuis une zone
+# de même taille dans le cube source
+# ═══════════════════════════════════════════════════════════════
 
 def place_circle_patch(plot, occ, cube, zone_poly):
     _, H, W = plot.shape
     zone_mask = polygon_to_mask(zone_poly, H, W)
 
-    r = random.randint(5, 15)
+    r = random.randint(5, 15)   # rayon → diamètre 10–30 px
     d = 2 * r + 1
 
     circle_mask = np.zeros((d, d), dtype=np.uint8)
@@ -196,9 +222,9 @@ def place_circle_patch(plot, occ, cube, zone_poly):
     poly[:, 1] += y_dst
     return True, poly.tolist()
 
-# ──────────────────────────────────────────────
-# Helpers zones
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# Helpers : essaie toutes les zones disponibles
+# ═══════════════════════════════════════════════════════════════
 
 def try_place_full(plot, occ, cube, mask, zones):
     for z in zones:
@@ -214,9 +240,9 @@ def try_place_circle_patch(plot, occ, cube, zones):
             return True, poly
     return False, None
 
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 # Pool
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 
 def get_class(name):
     return name.split("_")[0]
@@ -233,29 +259,18 @@ def load_plot(p):
              if s["label"] == "zone_placement"]
     return cube, zones, img
 
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 # Queue PARFAITEMENT équilibrée
 #
 # Principe :
-#   On génère d'abord les tailles de batches (10–14) pour tous les plots.
-#   On connaît donc le nombre exact de slots par plot.
-#   On répartit les slots entre les classes de façon EXACTEMENT égale,
-#   en distribuant les éventuels restes un par un.
-#   Résultat : toutes les classes ont exactement le même compte,
-#   à ±1 près (inévitable si total_slots n'est pas divisible par nb_classes).
-#
-#   Pour chaque classe, on remplit sa liste jusqu'au quota exact
-#   (répétition si nécessaire, shuffle, sans remise si assez d'exemples).
-#
-#   Enfin, on construit chaque batch en piochant round-robin dans
-#   les queues de classes → équilibre GARANTI plot par plot et global.
-# ──────────────────────────────────────────────
+#   1. On connaît à l'avance le nombre exact de slots (sum batch_sizes).
+#   2. Quota identique pour toutes les classes (±1 si non divisible).
+#   3. Distribution round-robin dans chaque batch → équilibre local
+#      ET global garanti.
+# ═══════════════════════════════════════════════════════════════
 
 def make_class_queue(items, quota):
-    """
-    Retourne une liste de `quota` entrées issues de `items`.
-    Sans répétition si len(items) >= quota, avec répétition sinon.
-    """
+    """quota entrees issues de items (sans repetition si possible)."""
     if len(items) >= quota:
         q = random.sample(items, quota)
     else:
@@ -268,84 +283,110 @@ def make_class_queue(items, quota):
 
 def build_balanced_batches(pool, max_plots, min_p, max_p):
     """
-    Retourne une liste de listes :
-      batches[i] = liste des extrudes pour le plot i.
+    Garantie ecart = 0 entre toutes les classes, sur tous les tirages.
 
-    Garantie : chaque classe apparaît EXACTEMENT le même nombre de fois
-    dans l'ensemble de tous les batches (à ±1 près si le total n'est pas
-    divisible par le nombre de classes — différence max = 1 tirage).
+    Principe en 5 etapes :
+      1. Tirer les tailles de batches aleatoirement (min_p..max_p).
+      2. Ajuster le total pour qu'il soit exactement divisible par
+         nb_classes en ajoutant au plus (nb_classes-1) slots sur les
+         derniers batches -> ecart = 0 mathematiquement garanti.
+      3. Q = total / nb_classes : quota identique pour toutes les classes.
+      4. Construire la queue globale en mode interleaved :
+         pour chaque round r, on prend l'element r de chaque classe
+         dans un ordre aleatoire. Resultat : chaque classe apparait
+         exactement Q fois, dans un ordre varie.
+      5. Decouper la queue globale en batches selon les tailles calculees.
     """
-    # ── 1. Regrouper par classe ────────────────────────────────────
+
+    # 1. Regrouper par classe
     by_class = defaultdict(list)
     for e in pool:
         by_class[e["class"]].append(e)
-    classes = sorted(by_class.keys())
+    classes    = sorted(by_class.keys())
     nb_classes = len(classes)
     if nb_classes == 0:
-        return []
+        return [], {}
 
-    # ── 2. Générer les tailles de batches ─────────────────────────
+    # 2. Tirer les tailles de batches
     batch_sizes = [random.randint(min_p, max_p) for _ in range(max_plots)]
+    raw_total   = sum(batch_sizes)
+
+    # 3. Ajuster pour que raw_total % nb_classes == 0
+    #    On ajoute au plus (nb_classes - 1) slots sur les derniers batches
+    remainder = raw_total % nb_classes
+    if remainder != 0:
+        extra_needed = nb_classes - remainder
+        for k in range(extra_needed):
+            idx = len(batch_sizes) - 1 - k
+            batch_sizes[idx] += 1
+
     total_slots = sum(batch_sizes)
+    assert total_slots % nb_classes == 0
+    Q = total_slots // nb_classes   # quota identique pour toutes les classes
 
-    # ── 3. Quota EXACT par classe ──────────────────────────────────
-    # base : chaque classe reçoit floor(total / nb_classes)
-    # reste : les `r` premières classes reçoivent 1 slot de plus
-    base_quota = total_slots // nb_classes
-    remainder  = total_slots % nb_classes   # 0 ≤ remainder < nb_classes
+    quotas = {cls: Q for cls in classes}   # ecart = 0 garanti
 
-    quotas = {}
-    for k, cls in enumerate(classes):
-        quotas[cls] = base_quota + (1 if k < remainder else 0)
-
-    # Vérification : somme des quotas == total_slots
-    assert sum(quotas.values()) == total_slots, "Erreur quota"
-
-    # ── 4. Construire une queue par classe ─────────────────────────
-    class_queues = {cls: make_class_queue(by_class[cls], quotas[cls])
+    # 4. Queue de Q elements par classe
+    class_queues = {cls: make_class_queue(by_class[cls], Q)
                     for cls in classes}
 
-    # ── 5. Construire les batches en distribuant round-robin ───────
-    # On distribue les slots de chaque batch entre les classes
-    # de façon cyclique → équilibre local dans chaque batch aussi.
-    #
-    # Pour chaque batch de taille N :
-    #   - base_per_class = N // nb_classes  (chaque classe reçoit ça)
-    #   - les (N % nb_classes) premières classes (dans un ordre
-    #     aléatoire pour ce batch) reçoivent 1 slot de plus.
-    #
-    # On pioche dans class_queues dans l'ordre.
-
-    # Pointeurs courants dans chaque queue
-    pointers = {cls: 0 for cls in classes}
-
-    batches = []
-    for size in batch_sizes:
-        base   = size // nb_classes
-        extra  = size % nb_classes
-        # ordre des classes aléatoire pour ce batch (pour répartir le reste équitablement)
+    # 5. Queue globale interleaved (ABCABC... avec ordre aleatoire par round)
+    global_queue = []
+    for r in range(Q):
         cls_order = classes[:]
         random.shuffle(cls_order)
+        for cls in cls_order:
+            global_queue.append(class_queues[cls][r])
+    assert len(global_queue) == total_slots
 
-        batch = []
-        for k, cls in enumerate(cls_order):
-            n = base + (1 if k < extra else 0)
-            p = pointers[cls]
-            q = class_queues[cls]
-            # sécurité : ne pas dépasser la queue
-            n = min(n, len(q) - p)
-            batch.extend(q[p:p+n])
-            pointers[cls] += n
-
-        random.shuffle(batch)   # mélanger l'ordre à l'intérieur du batch
+    # 6. Decouper exactement selon batch_sizes
+    batches = []
+    pos = 0
+    for size in batch_sizes:
+        batch = global_queue[pos:pos + size]
+        random.shuffle(batch)   # ordre interne aleatoire
         batches.append(batch)
+        pos += size
 
     return batches, quotas
 
+# ═══════════════════════════════════════════════════════════════
+# Sauvegarde JSON compatible LabelMe
+# ═══════════════════════════════════════════════════════════════
 
-# ──────────────────────────────────────────────
-# Génération
-# ──────────────────────────────────────────────
+def save_labelme_json(path, shapes, image_name, H, W):
+    """
+    Écrit un JSON lisible par LabelMe.
+    - imageData: null  → LabelMe charge l'image depuis le disque
+    - imagePath pointe vers "<name>.png" (image ratio sans contours)
+    - Tous les champs obligatoires de chaque shape sont présents
+    """
+    labelme_shapes = [
+        {
+            "label":       s["label"],
+            "points":      s["points"],
+            "group_id":    None,
+            "description": "",
+            "shape_type":  s["shape_type"],
+            "flags":       {},
+            "mask":        None,
+        }
+        for s in shapes
+    ]
+    with open(path, "w") as f:
+        json.dump({
+            "version":     "5.4.1",
+            "flags":       {},
+            "shapes":      labelme_shapes,
+            "imagePath":   image_name,   # "<name>.png" dans le même dossier
+            "imageData":   None,         # null explicite = LabelMe lit depuis disque
+            "imageHeight": H,
+            "imageWidth":  W,
+        }, f, indent=2)
+
+# ═══════════════════════════════════════════════════════════════
+# Génération principale
+# ═══════════════════════════════════════════════════════════════
 
 def generate(plot_root, extrude_root, out_dir):
     plots    = list(Path(plot_root).rglob("*.hdr"))
@@ -353,13 +394,13 @@ def generate(plot_root, extrude_root, out_dir):
     out_dir  = Path(out_dir)
     out_dir.mkdir(exist_ok=True)
 
-    # ── Queue parfaitement équilibrée ─────────────────────────────
+    # ── Queue équilibrée ──────────────────────────────────────────
     batches, quotas = build_balanced_batches(
         raw_pool, MAX_PLOTS, MIN_PATCHES, MAX_PATCHES)
 
     print(f"[INFO] {len(batches)} plots planifiés "
           f"({MIN_PATCHES}–{MAX_PATCHES} patches/plot)")
-    print("[INFO] Quota prévu par classe (parfaitement équilibré) :")
+    print("[INFO] Quota prévu par classe :")
     for cls, q in sorted(quotas.items()):
         print(f"       {cls}: {q}")
 
@@ -393,7 +434,7 @@ def generate(plot_root, extrude_root, out_dir):
                     counter[e["class"]] += 1
 
             else:
-                # Stratégie 2 : patch circulaire + autres en full
+                # Stratégie 2 : patch circulaire single + autres en full
                 ok, poly = try_place_circle_patch(plot, occ, cube_e, zones)
                 if ok:
                     shapes.append({"label": e["class"], "points": poly,
@@ -426,35 +467,44 @@ def generate(plot_root, extrude_root, out_dir):
             continue
 
         name = f"aug_{i}"
+
+        # ── 1. Sauvegarde du cube hyperspectral ───────────────────
         save_envi_cube(plot, out_dir / name)
 
-        with open(out_dir / f"{name}.json", "w") as f:
-            json.dump({
-                "version": "5.0.1",
-                "shapes": shapes,
-                "imagePath": f"{name}.png",
-                "imageHeight": H,
-                "imageWidth": W
-            }, f, indent=2)
-
+        # ── 2. Carte ratio ────────────────────────────────────────
         b1    = get_band_index(img, WAVELENGTH_1)
         b2    = get_band_index(img, WAVELENGTH_2)
         ratio = compute_ratio_map(plot, b1, b2)
-        save_ratio_map(ratio, [s["points"] for s in shapes],
-                       out_dir / f"{name}_ratio.png")
 
-        print(f"Plot {i:>4}  patches placés: {len(shapes):>2}  "
-              f"compteur global: {dict(counter)}")
+        # ── 3. PNG SANS contours → même nom que le JSON (pour LabelMe)
+        save_ratio_plain(ratio, out_dir / f"{name}.png")
+
+        # ── 4. PNG AVEC contours rouges → fichier de visualisation
+        save_ratio_with_contours(
+            ratio,
+            [s["points"] for s in shapes],
+            out_dir / f"{name}_ratio.png"
+        )
+
+        # ── 5. JSON compatible LabelMe ────────────────────────────
+        save_labelme_json(
+            path        = out_dir / f"{name}.json",
+            shapes      = shapes,
+            image_name  = f"{name}.png",   # pointe vers le PNG sans contours
+            H           = H,
+            W           = W,
+        )
+
+        print(f"Plot {i:>4}  patches: {len(shapes):>2}  {dict(counter)}")
 
     # ── Résumé final ──────────────────────────────────────────────
     print("\n[RÉSUMÉ] Placements réels par classe :")
     for cls, cnt in sorted(counter.items()):
         print(f"  {cls}: {cnt}")
-
     counts = list(counter.values())
     if counts:
-        print(f"\n  min={min(counts)}  max={max(counts)}  "
-              f"écart={max(counts)-min(counts)}")
+        print(f"  min={min(counts)}  max={max(counts)}  "
+              f"écart={max(counts) - min(counts)}")
 
 
 if __name__ == "__main__":
