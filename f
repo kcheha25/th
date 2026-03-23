@@ -7,9 +7,10 @@ import json
 from collections import defaultdict
 import matplotlib.pyplot as plt
 
-N_EXTRUDES_PER_PLOT = 12
 MAX_PLOTS = 500
-SINGLE_CLASSES = []
+SINGLE_CLASSES = []          # ex: ["mildiou", "rouille"]
+MIN_PATCHES = 10
+MAX_PATCHES = 14
 WAVELENGTH_1 = 996
 WAVELENGTH_2 = 1197
 
@@ -53,7 +54,7 @@ def save_ratio_map(ratio, polygons, out_path):
     plt.close()
 
 # ──────────────────────────────────────────────
-# Masques utilitaires
+# Masques
 # ──────────────────────────────────────────────
 
 def get_valid_mask_fast(cube):
@@ -84,9 +85,7 @@ def polygon_to_mask(poly, H, W):
     return m.astype(bool)
 
 # ──────────────────────────────────────────────
-# Positions valides STRICTEMENT dans la zone
-# anchor=(0,0) → coin TL du noyau = ancre de l'érosion
-# garantit que chaque pixel actif de l'extrude reste dans zone_mask
+# Positions valides (érosion, anchor coin TL)
 # ──────────────────────────────────────────────
 
 def compute_valid_positions(zone_mask, extrude_mask):
@@ -116,7 +115,7 @@ def update_occ(occ, mask, x, y):
     occ[y:y+h, x:x+w] |= mask
 
 # ──────────────────────────────────────────────
-# Placement – full extrude (strictement dans zone)
+# Placement full
 # ──────────────────────────────────────────────
 
 def place_full(plot, occ, cube, extrude_mask, zone_poly):
@@ -150,34 +149,20 @@ def place_full(plot, occ, cube, extrude_mask, zone_poly):
     return True, poly.tolist()
 
 # ──────────────────────────────────────────────
-# Placement – patch circulaire aléatoire (stratégie 2 single)
-#
-# On génère un disque de rayon r ∈ [5, 15] px (diamètre 10–30 px)
-# centré en un point aléatoire DANS la zone du plot.
-# On copie les spectres du cube source depuis la zone homologue
-# (même bbox, mêmes coordonnées relatives).
+# Placement patch circulaire (single, strat 2)
 # ──────────────────────────────────────────────
 
 def place_circle_patch(plot, occ, cube, zone_poly):
-    """
-    Génère un polygone circulaire de diamètre aléatoire (10–30 px),
-    le place dans zone_poly, puis remplit les pixels du cercle avec
-    les spectres d'une zone de même taille extraite du cube source.
-    Retourne (ok, poly_in_plot).
-    """
     _, H, W = plot.shape
     zone_mask = polygon_to_mask(zone_poly, H, W)
 
-    # Rayon aléatoire → diamètre entre 10 et 30 px
-    r = random.randint(5, 15)
-    d = 2 * r + 1  # taille de la boîte englobante
+    r = random.randint(5, 15)   # diamètre 10–30 px
+    d = 2 * r + 1
 
-    # Construire le masque circulaire local (d × d)
     circle_mask = np.zeros((d, d), dtype=np.uint8)
     cv2.circle(circle_mask, (r, r), r, 1, -1)
     circle_mask = circle_mask.astype(bool)
 
-    # Trouver les positions valides dans la zone (érosion)
     valid = compute_valid_positions(zone_mask, circle_mask)
 
     ys, xs = np.where(valid)
@@ -186,24 +171,15 @@ def place_circle_patch(plot, occ, cube, zone_poly):
     if not free:
         return False, None
 
-    # Position de dépôt dans le plot
     idx = random.choice(free)
     y_dst, x_dst = ys[idx], xs[idx]
 
-    # Zone source dans le cube extrude : on prend une zone de taille d×d
-    # à une position aléatoire dans le cube (en restant dans les limites)
     _, Hc, Wc = cube.shape
-    if Hc < d or Wc < d:
-        # Cube trop petit pour fournir une zone d×d → on tile
-        src_y, src_x = 0, 0
-    else:
-        src_y = random.randint(0, Hc - d)
-        src_x = random.randint(0, Wc - d)
+    src_y = random.randint(0, max(0, Hc - d))
+    src_x = random.randint(0, max(0, Wc - d))
 
-    # Copie spectrale pixel par pixel dans le cercle
     for b in range(plot.shape[0]):
         dst_patch = plot[b, y_dst:y_dst+d, x_dst:x_dst+d].copy()
-        # Source : on tile si nécessaire
         src_patch = np.tile(
             cube[b, src_y:src_y+min(d, Hc), src_x:src_x+min(d, Wc)],
             (d // max(1, Hc - src_y) + 1, d // max(1, Wc - src_x) + 1)
@@ -213,7 +189,6 @@ def place_circle_patch(plot, occ, cube, zone_poly):
 
     update_occ(occ, circle_mask, x_dst, y_dst)
 
-    # Polygone du cercle dans le repère du plot
     contours = find_contour_polygons(circle_mask)
     if not contours:
         return False, None
@@ -241,15 +216,16 @@ def try_place_circle_patch(plot, occ, cube, zones):
     return False, None
 
 # ──────────────────────────────────────────────
-# Pool / plot
+# Pool
 # ──────────────────────────────────────────────
 
 def get_class(name):
     return name.split("_")[0]
 
 def load_pool(root):
-    return [{"hdr": f, "class": get_class(f.stem)}
-            for f in Path(root).rglob("*.hdr")]
+    entries = [{"hdr": f, "class": get_class(f.stem)}
+               for f in Path(root).rglob("*.hdr")]
+    return entries
 
 def load_plot(p):
     cube, img = load_cube(p)
@@ -260,32 +236,121 @@ def load_plot(p):
     return cube, zones, img
 
 # ──────────────────────────────────────────────
+# Tirage équilibré
+#
+# Principe :
+#   - On regroupe les extrudes par classe.
+#   - On calcule combien de fois chaque classe doit être tirée pour
+#     que toutes les classes soient tirées exactement le même nombre
+#     de fois sur l'ensemble des MAX_PLOTS.
+#   - On construit une "queue" globale équilibrée : chaque classe
+#     contribue exactement `quota` tirages, répartis uniformément
+#     dans les plots.
+#   - La queue est mélangée aléatoirement puis consommée plot par plot.
+#
+# Détail du calcul du quota :
+#   Chaque plot tire N patches (∈ [MIN_PATCHES, MAX_PATCHES]).
+#   Sur MAX_PLOTS plots, le total de tirages est entre
+#   MAX_PLOTS*MIN_PATCHES et MAX_PLOTS*MAX_PATCHES.
+#   On veut que chaque classe soit tirée `quota` fois.
+#   quota = floor(total_tirages / nb_classes), avec
+#   total_tirages = MAX_PLOTS * avg_patches (avg = (MIN+MAX)//2).
+# ──────────────────────────────────────────────
+
+def build_balanced_queue(pool, max_plots, min_p, max_p):
+    """
+    Retourne une liste de listes :
+      queue[i] = liste des extrudes à utiliser pour le plot i.
+    Chaque classe apparaît exactement le même nombre de fois
+    dans l'ensemble de tous les plots.
+    """
+    # Regrouper par classe
+    by_class = defaultdict(list)
+    for e in pool:
+        by_class[e["class"]].append(e)
+
+    nb_classes = len(by_class)
+    if nb_classes == 0:
+        return []
+
+    # Nombre moyen de patches par plot
+    avg_patches = (min_p + max_p) // 2
+    total_slots = max_plots * avg_patches   # total de tirages sur tous les plots
+
+    # Quota par classe (identique pour toutes)
+    quota = total_slots // nb_classes
+
+    # Pour chaque classe, on construit une liste de `quota` extrudes
+    # en répétant / échantillonnant dans les extrudes disponibles
+    class_queues = {}
+    for cls, items in by_class.items():
+        if len(items) >= quota:
+            # On a assez → on tire sans remise (garder la diversité)
+            sampled = random.sample(items, quota)
+        else:
+            # Pas assez → on répète les items jusqu'à atteindre le quota
+            reps = (quota // len(items)) + 1
+            extended = (items * reps)[:quota]
+            random.shuffle(extended)
+            sampled = extended
+        class_queues[cls] = sampled
+
+    # Fusionner toutes les listes en une queue globale plate et mélangée
+    flat = []
+    for cls_list in class_queues.values():
+        flat.extend(cls_list)
+    random.shuffle(flat)
+
+    # Découper la queue globale en tranches pour chaque plot
+    # Chaque plot reçoit un nombre aléatoire de patches ∈ [min_p, max_p]
+    plots_batches = []
+    idx = 0
+    for _ in range(max_plots):
+        n = random.randint(min_p, max_p)
+        if idx + n > len(flat):
+            break
+        plots_batches.append(flat[idx:idx+n])
+        idx += n
+
+    return plots_batches
+
+# ──────────────────────────────────────────────
 # Génération
 # ──────────────────────────────────────────────
 
 def generate(plot_root, extrude_root, out_dir):
     plots = list(Path(plot_root).rglob("*.hdr"))
-    pool = load_pool(extrude_root)
-    counter = defaultdict(int)
+    raw_pool = load_pool(extrude_root)
     out_dir = Path(out_dir)
     out_dir.mkdir(exist_ok=True)
 
-    for i in range(MAX_PLOTS):
-        if len(pool) < N_EXTRUDES_PER_PLOT:
-            break
+    # ── Construire la queue équilibrée ────────────────────────────────
+    plots_batches = build_balanced_queue(raw_pool, MAX_PLOTS, MIN_PATCHES, MAX_PATCHES)
+    print(f"[INFO] {len(plots_batches)} plots planifiés "
+          f"({MIN_PATCHES}–{MAX_PATCHES} patches/plot)")
 
-        # ── Tirage de 12 extrudes ─────────────────────────────────────
-        selected = random.sample(pool, N_EXTRUDES_PER_PLOT)
+    # Vérification de l'équilibre au démarrage
+    all_entries = [e for batch in plots_batches for e in batch]
+    class_counts = defaultdict(int)
+    for e in all_entries:
+        class_counts[e["class"]] += 1
+    print("[INFO] Tirages par classe (équilibre) :")
+    for cls, cnt in sorted(class_counts.items()):
+        print(f"       {cls}: {cnt}")
+
+    counter = defaultdict(int)   # compteur de placements réels
+
+    for i, batch in enumerate(plots_batches):
+        selected = batch           # N extrudes pour ce plot (10–14)
         singles = [e for e in selected if e["class"] in SINGLE_CLASSES]
 
-        # ── Chargement du plot ────────────────────────────────────────
         plot_hdr = random.choice(plots)
         plot, zones, img = load_plot(plot_hdr)
         _, H, W = plot.shape
         occ = np.zeros((H, W), bool)
         shapes = []
 
-        # ── CAS : au moins une classe single ─────────────────────────
+        # ── CAS : au moins une classe single ──────────────────────────
         if singles:
             e = random.choice(singles)
             cube_e, _ = load_cube(e["hdr"])
@@ -295,29 +360,21 @@ def generate(plot_root, extrude_root, out_dir):
             strat = random.choice([1, 2])
 
             if strat == 1:
-                # ── Stratégie 1 : full extrude unique ─────────────────
-                # On place l'extrude en full ; si d'autres avaient été
-                # placés avant (il n'y en a pas ici car on commence),
-                # on repart d'un plot + occ vierge → garanti propre.
+                # Stratégie 1 : full unique, rien d'autre
                 ok, poly = try_place_full(plot, occ, cube_e, mask_e, zones)
                 if ok:
                     shapes = [{"label": e["class"], "points": poly,
                                 "shape_type": "polygon"}]
                     counter[e["class"]] += 1
-                    pool.remove(e)
-                # Stratégie 1 : on s'arrête là, rien d'autre placé.
 
             else:
-                # ── Stratégie 2 : patch circulaire single + 11 full ───
-                # 1) Patch circulaire du single (diamètre 10–30 px)
+                # Stratégie 2 : patch circulaire single + autres en full
                 ok, poly = try_place_circle_patch(plot, occ, cube_e, zones)
                 if ok:
                     shapes.append({"label": e["class"], "points": poly,
                                    "shape_type": "polygon"})
                     counter[e["class"]] += 1
-                    pool.remove(e)
 
-                # 2) Les 11 autres en full, dans la zone
                 others = [x for x in selected if x != e]
                 for e2 in others:
                     cube2, _ = load_cube(e2["hdr"])
@@ -328,9 +385,8 @@ def generate(plot_root, extrude_root, out_dir):
                         shapes.append({"label": e2["class"], "points": poly2,
                                        "shape_type": "polygon"})
                         counter[e2["class"]] += 1
-                        pool.remove(e2)
 
-        # ── CAS : aucune classe single → 12 full dans la zone ─────────
+        # ── CAS : aucune classe single → tous en full ─────────────────
         else:
             for e in selected:
                 cube, _ = load_cube(e["hdr"])
@@ -341,9 +397,7 @@ def generate(plot_root, extrude_root, out_dir):
                     shapes.append({"label": e["class"], "points": poly,
                                    "shape_type": "polygon"})
                     counter[e["class"]] += 1
-                    pool.remove(e)
 
-        # ── Pas de sauvegarde si rien n'a été placé ───────────────────
         if not shapes:
             continue
 
@@ -365,7 +419,13 @@ def generate(plot_root, extrude_root, out_dir):
         save_ratio_map(ratio, [s["points"] for s in shapes],
                        out_dir / f"{name}_ratio.png")
 
-        print(f"Plot {i} -> {dict(counter)}")
+        print(f"Plot {i:>4}  patches placés: {len(shapes):>2}  "
+              f"compteur global: {dict(counter)}")
+
+    # ── Résumé final ──────────────────────────────────────────────────
+    print("\n[RÉSUMÉ] Placements réels par classe :")
+    for cls, cnt in sorted(counter.items()):
+        print(f"  {cls}: {cnt}")
 
 
 if __name__ == "__main__":
