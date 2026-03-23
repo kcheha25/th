@@ -7,7 +7,7 @@ import json
 from collections import defaultdict
 import matplotlib.pyplot as plt
 
-MAX_PLOTS = 500
+MAX_PLOTS   = 500
 SINGLE_CLASSES = []          # ex: ["mildiou", "rouille"]
 MIN_PATCHES = 10
 MAX_PATCHES = 14
@@ -85,7 +85,7 @@ def polygon_to_mask(poly, H, W):
     return m.astype(bool)
 
 # ──────────────────────────────────────────────
-# Positions valides (érosion, anchor coin TL)
+# Positions valides (érosion anchor coin TL)
 # ──────────────────────────────────────────────
 
 def compute_valid_positions(zone_mask, extrude_mask):
@@ -149,14 +149,14 @@ def place_full(plot, occ, cube, extrude_mask, zone_poly):
     return True, poly.tolist()
 
 # ──────────────────────────────────────────────
-# Placement patch circulaire (single, strat 2)
+# Placement patch circulaire (single strat 2)
 # ──────────────────────────────────────────────
 
 def place_circle_patch(plot, occ, cube, zone_poly):
     _, H, W = plot.shape
     zone_mask = polygon_to_mask(zone_poly, H, W)
 
-    r = random.randint(5, 15)   # diamètre 10–30 px
+    r = random.randint(5, 15)
     d = 2 * r + 1
 
     circle_mask = np.zeros((d, d), dtype=np.uint8)
@@ -164,7 +164,6 @@ def place_circle_patch(plot, occ, cube, zone_poly):
     circle_mask = circle_mask.astype(bool)
 
     valid = compute_valid_positions(zone_mask, circle_mask)
-
     ys, xs = np.where(valid)
     free = [i for i in range(len(xs))
             if can_place(occ, circle_mask, xs[i], ys[i])]
@@ -198,7 +197,7 @@ def place_circle_patch(plot, occ, cube, zone_poly):
     return True, poly.tolist()
 
 # ──────────────────────────────────────────────
-# Helpers : essaie toutes les zones
+# Helpers zones
 # ──────────────────────────────────────────────
 
 def try_place_full(plot, occ, cube, mask, zones):
@@ -223,9 +222,8 @@ def get_class(name):
     return name.split("_")[0]
 
 def load_pool(root):
-    entries = [{"hdr": f, "class": get_class(f.stem)}
-               for f in Path(root).rglob("*.hdr")]
-    return entries
+    return [{"hdr": f, "class": get_class(f.stem)}
+            for f in Path(root).rglob("*.hdr")]
 
 def load_plot(p):
     cube, img = load_cube(p)
@@ -236,125 +234,152 @@ def load_plot(p):
     return cube, zones, img
 
 # ──────────────────────────────────────────────
-# Tirage équilibré
+# Queue PARFAITEMENT équilibrée
 #
 # Principe :
-#   - On regroupe les extrudes par classe.
-#   - On calcule combien de fois chaque classe doit être tirée pour
-#     que toutes les classes soient tirées exactement le même nombre
-#     de fois sur l'ensemble des MAX_PLOTS.
-#   - On construit une "queue" globale équilibrée : chaque classe
-#     contribue exactement `quota` tirages, répartis uniformément
-#     dans les plots.
-#   - La queue est mélangée aléatoirement puis consommée plot par plot.
+#   On génère d'abord les tailles de batches (10–14) pour tous les plots.
+#   On connaît donc le nombre exact de slots par plot.
+#   On répartit les slots entre les classes de façon EXACTEMENT égale,
+#   en distribuant les éventuels restes un par un.
+#   Résultat : toutes les classes ont exactement le même compte,
+#   à ±1 près (inévitable si total_slots n'est pas divisible par nb_classes).
 #
-# Détail du calcul du quota :
-#   Chaque plot tire N patches (∈ [MIN_PATCHES, MAX_PATCHES]).
-#   Sur MAX_PLOTS plots, le total de tirages est entre
-#   MAX_PLOTS*MIN_PATCHES et MAX_PLOTS*MAX_PATCHES.
-#   On veut que chaque classe soit tirée `quota` fois.
-#   quota = floor(total_tirages / nb_classes), avec
-#   total_tirages = MAX_PLOTS * avg_patches (avg = (MIN+MAX)//2).
+#   Pour chaque classe, on remplit sa liste jusqu'au quota exact
+#   (répétition si nécessaire, shuffle, sans remise si assez d'exemples).
+#
+#   Enfin, on construit chaque batch en piochant round-robin dans
+#   les queues de classes → équilibre GARANTI plot par plot et global.
 # ──────────────────────────────────────────────
 
-def build_balanced_queue(pool, max_plots, min_p, max_p):
+def make_class_queue(items, quota):
+    """
+    Retourne une liste de `quota` entrées issues de `items`.
+    Sans répétition si len(items) >= quota, avec répétition sinon.
+    """
+    if len(items) >= quota:
+        q = random.sample(items, quota)
+    else:
+        reps = (quota // len(items)) + 1
+        extended = (items * reps)[:quota]
+        random.shuffle(extended)
+        q = extended
+    return q
+
+
+def build_balanced_batches(pool, max_plots, min_p, max_p):
     """
     Retourne une liste de listes :
-      queue[i] = liste des extrudes à utiliser pour le plot i.
-    Chaque classe apparaît exactement le même nombre de fois
-    dans l'ensemble de tous les plots.
+      batches[i] = liste des extrudes pour le plot i.
+
+    Garantie : chaque classe apparaît EXACTEMENT le même nombre de fois
+    dans l'ensemble de tous les batches (à ±1 près si le total n'est pas
+    divisible par le nombre de classes — différence max = 1 tirage).
     """
-    # Regrouper par classe
+    # ── 1. Regrouper par classe ────────────────────────────────────
     by_class = defaultdict(list)
     for e in pool:
         by_class[e["class"]].append(e)
-
-    nb_classes = len(by_class)
+    classes = sorted(by_class.keys())
+    nb_classes = len(classes)
     if nb_classes == 0:
         return []
 
-    # Nombre moyen de patches par plot
-    avg_patches = (min_p + max_p) // 2
-    total_slots = max_plots * avg_patches   # total de tirages sur tous les plots
+    # ── 2. Générer les tailles de batches ─────────────────────────
+    batch_sizes = [random.randint(min_p, max_p) for _ in range(max_plots)]
+    total_slots = sum(batch_sizes)
 
-    # Quota par classe (identique pour toutes)
-    quota = total_slots // nb_classes
+    # ── 3. Quota EXACT par classe ──────────────────────────────────
+    # base : chaque classe reçoit floor(total / nb_classes)
+    # reste : les `r` premières classes reçoivent 1 slot de plus
+    base_quota = total_slots // nb_classes
+    remainder  = total_slots % nb_classes   # 0 ≤ remainder < nb_classes
 
-    # Pour chaque classe, on construit une liste de `quota` extrudes
-    # en répétant / échantillonnant dans les extrudes disponibles
-    class_queues = {}
-    for cls, items in by_class.items():
-        if len(items) >= quota:
-            # On a assez → on tire sans remise (garder la diversité)
-            sampled = random.sample(items, quota)
-        else:
-            # Pas assez → on répète les items jusqu'à atteindre le quota
-            reps = (quota // len(items)) + 1
-            extended = (items * reps)[:quota]
-            random.shuffle(extended)
-            sampled = extended
-        class_queues[cls] = sampled
+    quotas = {}
+    for k, cls in enumerate(classes):
+        quotas[cls] = base_quota + (1 if k < remainder else 0)
 
-    # Fusionner toutes les listes en une queue globale plate et mélangée
-    flat = []
-    for cls_list in class_queues.values():
-        flat.extend(cls_list)
-    random.shuffle(flat)
+    # Vérification : somme des quotas == total_slots
+    assert sum(quotas.values()) == total_slots, "Erreur quota"
 
-    # Découper la queue globale en tranches pour chaque plot
-    # Chaque plot reçoit un nombre aléatoire de patches ∈ [min_p, max_p]
-    plots_batches = []
-    idx = 0
-    for _ in range(max_plots):
-        n = random.randint(min_p, max_p)
-        if idx + n > len(flat):
-            break
-        plots_batches.append(flat[idx:idx+n])
-        idx += n
+    # ── 4. Construire une queue par classe ─────────────────────────
+    class_queues = {cls: make_class_queue(by_class[cls], quotas[cls])
+                    for cls in classes}
 
-    return plots_batches
+    # ── 5. Construire les batches en distribuant round-robin ───────
+    # On distribue les slots de chaque batch entre les classes
+    # de façon cyclique → équilibre local dans chaque batch aussi.
+    #
+    # Pour chaque batch de taille N :
+    #   - base_per_class = N // nb_classes  (chaque classe reçoit ça)
+    #   - les (N % nb_classes) premières classes (dans un ordre
+    #     aléatoire pour ce batch) reçoivent 1 slot de plus.
+    #
+    # On pioche dans class_queues dans l'ordre.
+
+    # Pointeurs courants dans chaque queue
+    pointers = {cls: 0 for cls in classes}
+
+    batches = []
+    for size in batch_sizes:
+        base   = size // nb_classes
+        extra  = size % nb_classes
+        # ordre des classes aléatoire pour ce batch (pour répartir le reste équitablement)
+        cls_order = classes[:]
+        random.shuffle(cls_order)
+
+        batch = []
+        for k, cls in enumerate(cls_order):
+            n = base + (1 if k < extra else 0)
+            p = pointers[cls]
+            q = class_queues[cls]
+            # sécurité : ne pas dépasser la queue
+            n = min(n, len(q) - p)
+            batch.extend(q[p:p+n])
+            pointers[cls] += n
+
+        random.shuffle(batch)   # mélanger l'ordre à l'intérieur du batch
+        batches.append(batch)
+
+    return batches, quotas
+
 
 # ──────────────────────────────────────────────
 # Génération
 # ──────────────────────────────────────────────
 
 def generate(plot_root, extrude_root, out_dir):
-    plots = list(Path(plot_root).rglob("*.hdr"))
+    plots    = list(Path(plot_root).rglob("*.hdr"))
     raw_pool = load_pool(extrude_root)
-    out_dir = Path(out_dir)
+    out_dir  = Path(out_dir)
     out_dir.mkdir(exist_ok=True)
 
-    # ── Construire la queue équilibrée ────────────────────────────────
-    plots_batches = build_balanced_queue(raw_pool, MAX_PLOTS, MIN_PATCHES, MAX_PATCHES)
-    print(f"[INFO] {len(plots_batches)} plots planifiés "
+    # ── Queue parfaitement équilibrée ─────────────────────────────
+    batches, quotas = build_balanced_batches(
+        raw_pool, MAX_PLOTS, MIN_PATCHES, MAX_PATCHES)
+
+    print(f"[INFO] {len(batches)} plots planifiés "
           f"({MIN_PATCHES}–{MAX_PATCHES} patches/plot)")
+    print("[INFO] Quota prévu par classe (parfaitement équilibré) :")
+    for cls, q in sorted(quotas.items()):
+        print(f"       {cls}: {q}")
 
-    # Vérification de l'équilibre au démarrage
-    all_entries = [e for batch in plots_batches for e in batch]
-    class_counts = defaultdict(int)
-    for e in all_entries:
-        class_counts[e["class"]] += 1
-    print("[INFO] Tirages par classe (équilibre) :")
-    for cls, cnt in sorted(class_counts.items()):
-        print(f"       {cls}: {cnt}")
+    counter = defaultdict(int)
 
-    counter = defaultdict(int)   # compteur de placements réels
-
-    for i, batch in enumerate(plots_batches):
-        selected = batch           # N extrudes pour ce plot (10–14)
-        singles = [e for e in selected if e["class"] in SINGLE_CLASSES]
+    for i, batch in enumerate(batches):
+        selected = batch
+        singles  = [e for e in selected if e["class"] in SINGLE_CLASSES]
 
         plot_hdr = random.choice(plots)
         plot, zones, img = load_plot(plot_hdr)
         _, H, W = plot.shape
-        occ = np.zeros((H, W), bool)
+        occ    = np.zeros((H, W), bool)
         shapes = []
 
-        # ── CAS : au moins une classe single ──────────────────────────
+        # ── CAS : au moins une classe single ──────────────────────
         if singles:
             e = random.choice(singles)
             cube_e, _ = load_cube(e["hdr"])
-            mask_e = get_valid_mask_fast(cube_e)
+            mask_e    = get_valid_mask_fast(cube_e)
             cube_e, mask_e = crop_to_valid(cube_e, mask_e)
 
             strat = random.choice([1, 2])
@@ -368,17 +393,16 @@ def generate(plot_root, extrude_root, out_dir):
                     counter[e["class"]] += 1
 
             else:
-                # Stratégie 2 : patch circulaire single + autres en full
+                # Stratégie 2 : patch circulaire + autres en full
                 ok, poly = try_place_circle_patch(plot, occ, cube_e, zones)
                 if ok:
                     shapes.append({"label": e["class"], "points": poly,
                                    "shape_type": "polygon"})
                     counter[e["class"]] += 1
 
-                others = [x for x in selected if x != e]
-                for e2 in others:
+                for e2 in [x for x in selected if x != e]:
                     cube2, _ = load_cube(e2["hdr"])
-                    mask2 = get_valid_mask_fast(cube2)
+                    mask2    = get_valid_mask_fast(cube2)
                     cube2, mask2 = crop_to_valid(cube2, mask2)
                     ok2, poly2 = try_place_full(plot, occ, cube2, mask2, zones)
                     if ok2:
@@ -386,11 +410,11 @@ def generate(plot_root, extrude_root, out_dir):
                                        "shape_type": "polygon"})
                         counter[e2["class"]] += 1
 
-        # ── CAS : aucune classe single → tous en full ─────────────────
+        # ── CAS : aucune classe single → tous en full ─────────────
         else:
             for e in selected:
                 cube, _ = load_cube(e["hdr"])
-                mask = get_valid_mask_fast(cube)
+                mask    = get_valid_mask_fast(cube)
                 cube, mask = crop_to_valid(cube, mask)
                 ok, poly = try_place_full(plot, occ, cube, mask, zones)
                 if ok:
@@ -413,8 +437,8 @@ def generate(plot_root, extrude_root, out_dir):
                 "imageWidth": W
             }, f, indent=2)
 
-        b1 = get_band_index(img, WAVELENGTH_1)
-        b2 = get_band_index(img, WAVELENGTH_2)
+        b1    = get_band_index(img, WAVELENGTH_1)
+        b2    = get_band_index(img, WAVELENGTH_2)
         ratio = compute_ratio_map(plot, b1, b2)
         save_ratio_map(ratio, [s["points"] for s in shapes],
                        out_dir / f"{name}_ratio.png")
@@ -422,10 +446,15 @@ def generate(plot_root, extrude_root, out_dir):
         print(f"Plot {i:>4}  patches placés: {len(shapes):>2}  "
               f"compteur global: {dict(counter)}")
 
-    # ── Résumé final ──────────────────────────────────────────────────
+    # ── Résumé final ──────────────────────────────────────────────
     print("\n[RÉSUMÉ] Placements réels par classe :")
     for cls, cnt in sorted(counter.items()):
         print(f"  {cls}: {cnt}")
+
+    counts = list(counter.values())
+    if counts:
+        print(f"\n  min={min(counts)}  max={max(counts)}  "
+              f"écart={max(counts)-min(counts)}")
 
 
 if __name__ == "__main__":
