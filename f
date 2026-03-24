@@ -578,14 +578,27 @@ def assign_shapes_to_plots(plots, extrudes, trous):
     return plots
 
 
+def get_classes_with_overlapping_trou(plot):
+    trou_union = unary_union(plot["trous"]) if plot["trous"] else None
+    if trou_union is None:
+        return set()
+
+    classes = set()
+    for ext in plot["extrudes"]:
+        if ext["polygon"].intersects(trou_union):
+            classes.add(ext["label"])
+    return classes
+
+
 def polygon_to_relative(polygon, x0, y0):
     return [(x - x0, y - y0) for x, y in polygon.exterior.coords[:-1]]
 
 
-def build_output_json(plot, target_classes, original_json_data):
+def build_output_json(plot, original_json_data):
     x0, y0, x1, y1 = plot["rect"]
 
-    trou_union = unary_union(plot["trous"]) if plot["trous"] else None
+    trou_union     = unary_union(plot["trous"]) if plot["trous"] else None
+    target_classes = get_classes_with_overlapping_trou(plot)
 
     shapes_out = []
 
@@ -676,7 +689,7 @@ def visualize_ratio(cube_BHW, wavelengths, original_json_data):
     plt.show()
 
 
-def process_cubes(cube_folders, json_paths, target_classes, output_dir, visualize=True):
+def process_cubes(cube_folders, json_paths, output_dir, visualize=True):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -688,7 +701,6 @@ def process_cubes(cube_folders, json_paths, target_classes, output_dir, visualiz
         print(f"\n── Cube: {cube_name}")
 
         cube_BHW, wavelengths = load_cube(cube_folder)
-        B, H, W = cube_BHW.shape
 
         plots, extrudes, trous, original_json_data = parse_labelme(json_path)
         plots = assign_shapes_to_plots(plots, extrudes, trous)
@@ -706,28 +718,26 @@ def process_cubes(cube_folders, json_paths, target_classes, output_dir, visualiz
             x0i, y0i = int(x0), int(y0)
             x1i, y1i = int(x1), int(y1)
 
-            has_target = any(e["label"] in target_classes for e in plot["extrudes"])
-            if not has_target:
-                print(f"   Plot {i}: aucune classe cible → ignoré")
+            target_classes = get_classes_with_overlapping_trou(plot)
+            if not target_classes:
+                print(f"   Plot {i}: aucun trou superposé → ignoré")
                 continue
 
-            crop = cube_BHW[:, y0i:y1i, x0i:x1i]
-
-            json_out  = build_output_json(plot, target_classes, original_json_data)
+            crop      = cube_BHW[:, y0i:y1i, x0i:x1i]
+            json_out  = build_output_json(plot, original_json_data)
             plot_id   = f"plot_{i:03d}_{x0i}_{y0i}"
             json_file = cube_out_dir / f"{plot_id}.json"
 
             with open(json_file, "w") as f:
                 json.dump(json_out, f, indent=2)
 
-            print(f"   Plot {i} ({x0i},{y0i})→({x1i},{y1i}) | crop {crop.shape} | {len(json_out['shapes'])} polygones → {json_file.name}")
+            print(f"   Plot {i} ({x0i},{y0i})→({x1i},{y1i}) | classes: {target_classes} | {len(json_out['shapes'])} polygones → {json_file.name}")
 
 
 if __name__ == "__main__":
     process_cubes(
-        cube_folders   = ["data/cube1", "data/cube2"],
-        json_paths     = ["data/cube1.json", "data/cube2.json"],
-        target_classes = ["extrude_A", "extrude_B"],
-        output_dir     = "output/crops",
-        visualize      = True,
+        cube_folders = ["data/cube1", "data/cube2"],
+        json_paths   = ["data/cube1.json", "data/cube2.json"],
+        output_dir   = "output/crops",
+        visualize    = True,
     )
