@@ -743,10 +743,21 @@ if __name__ == "__main__":
     )
 
 
+import json
+import numpy as np
+import cv2
+from pathlib import Path
+from specarray import SpecArray
+from shapely.geometry import Polygon, MultiPolygon
+from shapely.ops import unary_union
+
+DATA_ROOT   = Path("data_cubes")
+LABELME_DIR = Path("labelme")
+OUTPUT_DIR  = Path("extrudes_eroded")
+
 CLASSES_A_IGNORER = ["trou", "plots"]
-json_files    = list(LABELME_DIR.glob("*.json"))
-class_counter = {}
-kernel        = np.ones((3, 3), np.uint8)
+json_files        = list(LABELME_DIR.glob("*.json"))
+kernel            = np.ones((3, 3), np.uint8)
 
 for json_file in json_files:
     with open(json_file) as f:
@@ -767,6 +778,8 @@ for json_file in json_files:
         if s["label"] == "trou" and len(s["points"]) >= 4
     ]
     trou_union = unary_union(trous) if trous else None
+
+    class_counter = {}  # reset par cube
 
     for shape in data["shapes"]:
         label = shape["label"]
