@@ -876,8 +876,8 @@ from scipy.ndimage import rotate
 
 
 def transform_cube_spatial(cube, min_angle=0, max_angle=360):
-    B, H, W = cube.shape
-    angle   = random.uniform(min_angle, max_angle)
+    B, H, W   = cube.shape
+    angle     = random.uniform(min_angle, max_angle)
     operation = f"rot_{angle:.1f}°"
 
     rotated_bands = []
@@ -893,11 +893,10 @@ def transform_cube_spatial(cube, min_angle=0, max_angle=360):
         h, w = band.shape
         transformed_cube[b, :h, :w] = band
 
-    H_new, W_new = max_h, max_w
-    return transformed_cube, operation, H_new, W_new, angle
+    return transformed_cube, operation, max_h, max_w, angle
 
 
-def transform_points_rotation(points, angle, H, W, H_new, W_new):
+def transform_points_rotation(points, angle, H, W):
     rad    = np.deg2rad(angle)
     cx, cy = W / 2, H / 2
     transformed = []
@@ -909,11 +908,19 @@ def transform_points_rotation(points, angle, H, W, H_new, W_new):
 
 
 def find_matching_json(label, H, W, json_dir):
-    for jpath in Path(json_dir).rglob(f"{label}_*.json"):
+    matches = []
+    for jpath in Path(json_dir).rglob("*.json"):
+        if not jpath.stem.startswith(f"{label}_"):
+            continue
         with open(jpath) as f:
             data = json.load(f)
         if data.get("imageHeight") == H and data.get("imageWidth") == W:
-            return jpath, data
+            matches.append((jpath, data))
+    if len(matches) == 1:
+        return matches[0]
+    elif len(matches) > 1:
+        print(f"   ⚠ {len(matches)} JSON trouvés pour {label} ({H}x{W}) → premier utilisé")
+        return matches[0]
     return None, None
 
 
@@ -954,7 +961,7 @@ def augment_existing_cubes(cube_paths, json_dir, output_dir, visualize=True, min
             transformed_cube.astype(np.float32),
             force=True, interleave="bil", metadata=meta
         )
-        print(f"✔ {cube_path.name} transformé ({operation}) → {save_path.name}")
+        print(f"✔ {cube_path.name} → {save_path.name}")
 
         label                = cube_path.stem.split("_")[0]
         json_path, json_data = find_matching_json(label, H, W, json_dir)
@@ -965,7 +972,7 @@ def augment_existing_cubes(cube_paths, json_dir, output_dir, visualize=True, min
 
         shapes_out = []
         for shape in json_data["shapes"]:
-            new_pts = transform_points_rotation(shape["points"], angle, H, W, H_new, W_new)
+            new_pts = transform_points_rotation(shape["points"], angle, H, W)
             shapes_out.append({
                 "label"     : "trou",
                 "points"    : new_pts,
@@ -992,14 +999,14 @@ def augment_existing_cubes(cube_paths, json_dir, output_dir, visualize=True, min
             }
         }
 
-        json_out_path = output_dir / f"{save_path.stem}.json"
+        json_out_path = save_path.parent / f"{save_path.stem}.json"
         with open(json_out_path, "w") as f:
             json.dump(json_out, f, indent=2)
         print(f"   ↳ JSON trous → {json_out_path.name} ({len(shapes_out)} trou(s))")
 
 
 if __name__ == "__main__":
-    cube_paths = list(Path("extrudes_eroded").rglob("*.hdr"))
+    cube_paths = list(Path("aug_data").rglob("*.hdr"))
     augment_existing_cubes(
         cube_paths = cube_paths,
         json_dir   = "extrudes_eroded",
