@@ -741,3 +741,107 @@ if __name__ == "__main__":
         output_dir   = "output/crops",
         visualize    = True,
     )
+
+
+import json
+import numpy as np
+import cv2
+from pathlib import Path
+from specarray import SpecArray
+from shapely.geometry import Polygon, MultiPolygon
+from shapely.ops import unary_union
+
+DATA_ROOT   = Path("data_cubes")
+LABELME_DIR = Path("labelme")
+OUTPUT_DIR  = Path("extrudes_eroded")
+
+CLASSES_A_IGNORER = ["trou", "plots"]
+json_files    = list(LABELME_DIR.glob("*.json"))
+class_counter = {}
+kernel        = np.ones((3, 3), np.uint8)
+
+for json_file in json_files:
+    with open(json_file) as f:
+        data = json.load(f)
+
+    base     = json_file.stem
+    cube_dir = DATA_ROOT / base
+    if not cube_dir.exists():
+        continue
+
+    spec = SpecArray.from_folder(cube_dir)
+    cube = np.array(spec.spectral_albedo)
+    H, B, W = cube.shape
+
+    trous      = [Polygon(s["points"]) for s in data["shapes"] if s["label"] == "trou"]
+    trou_union = unary_union(trous) if trous else None
+
+    for shape in data["shapes"]:
+        label = shape["label"]
+        if label in CLASSES_A_IGNORER:
+            continue
+
+        pts         = np.array(shape["points"], dtype=np.int32)
+        ext_polygon = Polygon(shape["points"])
+
+        mask        = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(mask, [pts], 1)
+        mask_eroded = cv2.erode(mask, kernel, iterations=1)
+        if mask_eroded.sum() == 0:
+            continue
+
+        ys, xs       = np.where(mask_eroded > 0)
+        y_min, y_max = ys.min(), ys.max()
+        x_min, x_max = xs.min(), xs.max()
+
+        if label not in class_counter:
+            class_counter[label] = 0
+        idx = class_counter[label]
+        class_counter[label] += 1
+
+        if trou_union is None or not ext_polygon.intersects(trou_union):
+            continue
+
+        shapes_out = []
+        for trou in trous:
+            if not ext_polygon.intersects(trou):
+                continue
+            geom  = trou.intersection(ext_polygon)
+            if geom.is_empty:
+                continue
+            parts = geom.geoms if isinstance(geom, MultiPolygon) else [geom]
+            for part in parts:
+                if part.is_empty or part.area < 1:
+                    continue
+                rel_pts = [
+                    [round(x - x_min, 2), round(y - y_min, 2)]
+                    for x, y in part.exterior.coords[:-1]
+                ]
+                shapes_out.append({
+                    "label"     : "trou",
+                    "points"    : rel_pts,
+                    "shape_type": "polygon",
+                    "flags"     : {},
+                    "group_id"  : None,
+                })
+
+        if not shapes_out:
+            continue
+
+        json_out = {
+            "version"    : data.get("version", "5.0.1"),
+            "flags"      : {},
+            "shapes"     : shapes_out,
+            "imagePath"  : f"{label}_{idx}.png",
+            "imageData"  : None,
+            "imageHeight": int(y_max - y_min + 1),
+            "imageWidth" : int(x_max - x_min + 1),
+        }
+
+        out_dir       = OUTPUT_DIR / f"{label}_{idx}"
+        json_out_path = out_dir / f"{label}_{idx}.json"
+        with open(json_out_path, "w") as f:
+            json.dump(json_out, f, indent=2)
+        print(f"   → {len(shapes_out)} trou(s) → {json_out_path.name}")
+
+print("JSON trous sauvegardés.")
