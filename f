@@ -838,15 +838,23 @@ for json_file in json_files:
         if not shapes_out:
             continue
 
-        json_out = {
-            "version"    : data.get("version", "5.0.1"),
-            "flags"      : {},
-            "shapes"     : shapes_out,
-            "imagePath"  : f"{label}_{idx}.png",
-            "imageData"  : None,
-            "imageHeight": int(y_max - y_min + 1),
-            "imageWidth" : int(x_max - x_min + 1),
+    json_out = {
+        "version"    : data.get("version", "5.0.1"),
+        "flags"      : {},
+        "shapes"     : shapes_out,
+        "imagePath"  : f"{label}_{idx}.png",
+        "imageData"  : None,
+        "imageHeight": int(y_max - y_min + 1),
+        "imageWidth" : int(x_max - x_min + 1),
+        "extrude_info": {
+            "x_min"  : int(x_min),
+            "y_min"  : int(y_min),
+            "x_max"  : int(x_max),
+            "y_max"  : int(y_max),
+            "height" : int(y_max - y_min + 1),
+            "width"  : int(x_max - x_min + 1),
         }
+    }
 
         out_dir       = OUTPUT_DIR / f"{label}_{idx}"
         json_out_path = out_dir / f"{label}_{idx}.json"
