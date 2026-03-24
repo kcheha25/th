@@ -513,62 +513,221 @@ if __name__ == "__main__":
 
 
 
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.patches import Polygon as MplPolygon
-from matplotlib.collections import PatchCollection
+from shapely.geometry import Polygon, MultiPolygon
+from shapely.ops import unary_union
+from pathlib import Path
+from spectral import envi
 
-wl = np.array(wavelengths)
-idx_996  = np.argmin(np.abs(wl - 996))
-idx_1197 = np.argmin(np.abs(wl - 1197))
 
-band_996  = cube_BHW[idx_996]
-band_1197 = cube_BHW[idx_1197]
+def load_cube(cube_folder):
+    spec        = SpecArray.from_folder(str(cube_folder))
+    cube_BHW    = np.array(spec.spectral_albedo).transpose(1, 0, 2)
+    wavelengths = np.array(spec.wavelengths)
+    return cube_BHW, wavelengths
 
-ratio = np.where(band_1197 > 1e-6, band_996 / band_1197, np.nan)
 
-fig, ax = plt.subplots(figsize=(14, 10))
-im = ax.imshow(ratio, cmap="RdYlGn", interpolation="nearest")
-plt.colorbar(im, ax=ax, label="Ratio 996/1197")
-ax.set_title("Ratio bandes 996nm / 1197nm avec contours annotations")
+def parse_labelme(json_path):
+    with open(json_path) as f:
+        data = json.load(f)
 
-colors = {"plot": "blue", "trou": "red"}
-default_color = "yellow"
+    plots, extrudes, trous = [], [], []
 
-for shape in original_json_data["shapes"]:
-    label = shape["label"]
-    pts   = np.array(shape["points"])
+    for shape in data["shapes"]:
+        label = shape["label"]
+        pts   = shape["points"]
 
-    if label == "plot":
-        x0, y0 = pts[:,0].min(), pts[:,1].min()
-        x1, y1 = pts[:,0].max(), pts[:,1].max()
-        rect = mpatches.Rectangle(
-            (x0, y0), x1 - x0, y1 - y0,
-            linewidth=2, edgecolor="blue", facecolor="none", label="plot"
-        )
-        ax.add_patch(rect)
-        ax.text(x0 + 2, y0 + 12, "plot", color="blue", fontsize=7)
+        if label == "plot":
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            plots.append({
+                "label" : label,
+                "rect"  : (min(xs), min(ys), max(xs), max(ys)),
+                "shape" : shape,
+            })
+        elif label == "trou":
+            trous.append(Polygon(pts))
+        else:
+            extrudes.append({
+                "label"   : label,
+                "polygon" : Polygon(pts),
+                "shape"   : shape,
+            })
 
-    elif label == "trou":
-        poly = MplPolygon(pts, closed=True, linewidth=1.5,
-                          edgecolor="red", facecolor="none")
-        ax.add_patch(poly)
+    return plots, extrudes, trous, data
 
-    else:
-        color = default_color
-        poly = MplPolygon(pts, closed=True, linewidth=1.5,
-                          edgecolor=color, facecolor="none")
-        ax.add_patch(poly)
-        cx, cy = pts[:,0].mean(), pts[:,1].mean()
-        ax.text(cx, cy, label, color=color, fontsize=6, ha="center")
 
-legend_elements = [
-    mpatches.Patch(edgecolor="blue",   facecolor="none", label="plot"),
-    mpatches.Patch(edgecolor="red",    facecolor="none", label="trou"),
-    mpatches.Patch(edgecolor="yellow", facecolor="none", label="extrude"),
-]
-ax.legend(handles=legend_elements, loc="upper right", fontsize=8)
+def assign_shapes_to_plots(plots, extrudes, trous):
+    for plot in plots:
+        x0, y0, x1, y1 = plot["rect"]
+        plot_box = Polygon([(x0,y0),(x1,y0),(x1,y1),(x0,y1)])
 
-plt.tight_layout()
-plt.show()
+        plot["extrudes"] = [
+            e for e in extrudes
+            if plot_box.contains(e["polygon"].centroid)
+        ]
+        plot["trous"] = [
+            t for t in trous
+            if plot_box.contains(t.centroid)
+        ]
+
+    return plots
+
+
+def polygon_to_relative(polygon, x0, y0):
+    return [(x - x0, y - y0) for x, y in polygon.exterior.coords[:-1]]
+
+
+def build_output_json(plot, target_classes, original_json_data):
+    x0, y0, x1, y1 = plot["rect"]
+
+    trou_union = unary_union(plot["trous"]) if plot["trous"] else None
+
+    shapes_out = []
+
+    for ext in plot["extrudes"]:
+        if ext["label"] not in target_classes:
+            continue
+
+        geom = ext["polygon"]
+
+        if trou_union is not None:
+            geom = geom.difference(trou_union)
+
+        if geom.is_empty:
+            continue
+
+        parts = geom.geoms if isinstance(geom, MultiPolygon) else [geom]
+
+        for part in parts:
+            if part.is_empty or part.area < 1:
+                continue
+            rel_pts = polygon_to_relative(part, x0, y0)
+            shapes_out.append({
+                "label"     : ext["label"],
+                "points"    : [[round(x, 2), round(y, 2)] for x, y in rel_pts],
+                "shape_type": "polygon",
+                "flags"     : {},
+                "group_id"  : None,
+            })
+
+    return {
+        "version"    : original_json_data.get("version", "5.0.1"),
+        "flags"      : {},
+        "shapes"     : shapes_out,
+        "imagePath"  : f"plot_{int(x0)}_{int(y0)}.png",
+        "imageData"  : None,
+        "imageHeight": int(y1 - y0),
+        "imageWidth" : int(x1 - x0),
+    }
+
+
+def visualize_ratio(cube_BHW, wavelengths, original_json_data):
+    wl       = np.array(wavelengths)
+    idx_996  = np.argmin(np.abs(wl - 996))
+    idx_1197 = np.argmin(np.abs(wl - 1197))
+
+    band_996  = cube_BHW[idx_996]
+    band_1197 = cube_BHW[idx_1197]
+    ratio     = np.where(band_1197 > 1e-6, band_996 / band_1197, np.nan)
+
+    fig, ax = plt.subplots(figsize=(14, 10))
+    im = ax.imshow(ratio, cmap="RdYlGn", interpolation="nearest")
+    plt.colorbar(im, ax=ax, label="Ratio 996/1197")
+    ax.set_title("Ratio bandes 996nm / 1197nm avec contours annotations")
+
+    for shape in original_json_data["shapes"]:
+        label = shape["label"]
+        pts   = np.array(shape["points"])
+
+        if label == "plot":
+            x0, y0 = pts[:,0].min(), pts[:,1].min()
+            x1, y1 = pts[:,0].max(), pts[:,1].max()
+            rect = mpatches.Rectangle(
+                (x0, y0), x1 - x0, y1 - y0,
+                linewidth=2, edgecolor="blue", facecolor="none"
+            )
+            ax.add_patch(rect)
+            ax.text(x0 + 2, y0 + 12, "plot", color="blue", fontsize=7)
+
+        elif label == "trou":
+            poly = MplPolygon(pts, closed=True, linewidth=1.5,
+                              edgecolor="red", facecolor="none")
+            ax.add_patch(poly)
+
+        else:
+            poly = MplPolygon(pts, closed=True, linewidth=1.5,
+                              edgecolor="yellow", facecolor="none")
+            ax.add_patch(poly)
+            cx, cy = pts[:,0].mean(), pts[:,1].mean()
+            ax.text(cx, cy, label, color="yellow", fontsize=6, ha="center")
+
+    legend_elements = [
+        mpatches.Patch(edgecolor="blue",   facecolor="none", label="plot"),
+        mpatches.Patch(edgecolor="red",    facecolor="none", label="trou"),
+        mpatches.Patch(edgecolor="yellow", facecolor="none", label="extrude"),
+    ]
+    ax.legend(handles=legend_elements, loc="upper right", fontsize=8)
+    plt.tight_layout()
+    plt.show()
+
+
+def process_cubes(cube_folders, json_paths, target_classes, output_dir, visualize=True):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for cube_folder, json_path in zip(cube_folders, json_paths):
+        cube_folder = Path(cube_folder)
+        json_path   = Path(json_path)
+        cube_name   = cube_folder.stem
+
+        print(f"\n── Cube: {cube_name}")
+
+        cube_BHW, wavelengths = load_cube(cube_folder)
+        B, H, W = cube_BHW.shape
+
+        plots, extrudes, trous, original_json_data = parse_labelme(json_path)
+        plots = assign_shapes_to_plots(plots, extrudes, trous)
+
+        print(f"   {len(plots)} plots | {len(extrudes)} extrudes | {len(trous)} trous")
+
+        if visualize:
+            visualize_ratio(cube_BHW, wavelengths, original_json_data)
+
+        cube_out_dir = output_dir / cube_name
+        cube_out_dir.mkdir(exist_ok=True)
+
+        for i, plot in enumerate(plots):
+            x0, y0, x1, y1 = plot["rect"]
+            x0i, y0i = int(x0), int(y0)
+            x1i, y1i = int(x1), int(y1)
+
+            has_target = any(e["label"] in target_classes for e in plot["extrudes"])
+            if not has_target:
+                print(f"   Plot {i}: aucune classe cible → ignoré")
+                continue
+
+            crop = cube_BHW[:, y0i:y1i, x0i:x1i]
+
+            json_out  = build_output_json(plot, target_classes, original_json_data)
+            plot_id   = f"plot_{i:03d}_{x0i}_{y0i}"
+            json_file = cube_out_dir / f"{plot_id}.json"
+
+            with open(json_file, "w") as f:
+                json.dump(json_out, f, indent=2)
+
+            print(f"   Plot {i} ({x0i},{y0i})→({x1i},{y1i}) | crop {crop.shape} | {len(json_out['shapes'])} polygones → {json_file.name}")
+
+
+if __name__ == "__main__":
+    process_cubes(
+        cube_folders   = ["data/cube1", "data/cube2"],
+        json_paths     = ["data/cube1.json", "data/cube2.json"],
+        target_classes = ["extrude_A", "extrude_B"],
+        output_dir     = "output/crops",
+        visualize      = True,
+    )
