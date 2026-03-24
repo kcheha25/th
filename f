@@ -877,55 +877,44 @@ from scipy.ndimage import rotate
 
 def transform_cube_spatial(cube, min_angle=0, max_angle=360):
     B, H, W = cube.shape
-    operation_type = random.choice(["rotate", "flip_h", "flip_v"])
+    angle   = random.uniform(min_angle, max_angle)
+    operation = f"rot_{angle:.1f}°"
 
-    if operation_type == "rotate":
-        angle     = random.uniform(min_angle, max_angle)
-        operation = f"rot_{angle:.1f}deg"
-        rotated_bands = [
-            rotate(cube[b], angle, reshape=True, order=1, mode='constant', cval=0)
-            for b in range(B)
-        ]
-        H_new, W_new     = rotated_bands[0].shape
-        transformed_cube = np.stack(rotated_bands, axis=0)
+    rotated_bands = []
+    for b in range(B):
+        rotated_band = rotate(cube[b], angle, reshape=True, order=0, mode='constant', cval=0)
+        rotated_bands.append(rotated_band)
 
-    elif operation_type == "flip_h":
-        transformed_cube = np.flip(cube, axis=2).copy()
-        operation        = "flip_h"
-        H_new, W_new     = H, W
+    max_h = max(band.shape[0] for band in rotated_bands)
+    max_w = max(band.shape[1] for band in rotated_bands)
 
-    elif operation_type == "flip_v":
-        transformed_cube = np.flip(cube, axis=1).copy()
-        operation        = "flip_v"
-        H_new, W_new     = H, W
+    transformed_cube = np.zeros((B, max_h, max_w), dtype=cube.dtype)
+    for b, band in enumerate(rotated_bands):
+        h, w = band.shape
+        transformed_cube[b, :h, :w] = band
 
-    return transformed_cube, operation, H_new, W_new
+    H_new, W_new = max_h, max_w
+    return transformed_cube, operation, H_new, W_new, angle
 
 
-def find_matching_json(cube_H, cube_W, label, json_dir):
-    candidates = list(Path(json_dir).rglob(f"{label}_*.json"))
-    for jpath in candidates:
-        with open(jpath) as f:
-            data = json.load(f)
-        if data.get("imageHeight") == cube_H and data.get("imageWidth") == cube_W:
-            return jpath, data
-    return None, None
-
-
-def transform_points(points, operation, H, W, angle=None):
+def transform_points_rotation(points, angle, H, W, H_new, W_new):
+    rad    = np.deg2rad(angle)
+    cx, cy = W / 2, H / 2
     transformed = []
     for x, y in points:
-        if operation == "flip_h":
-            x_new, y_new = W - 1 - x, y
-        elif operation == "flip_v":
-            x_new, y_new = x, H - 1 - y
-        elif operation.startswith("rot_"):
-            rad    = np.deg2rad(angle)
-            cx, cy = W / 2, H / 2
-            x_new  = cx + (x - cx) * np.cos(rad) - (y - cy) * np.sin(rad)
-            y_new  = cy + (x - cx) * np.sin(rad) + (y - cy) * np.cos(rad)
+        x_new = cx + (x - cx) * np.cos(rad) - (y - cy) * np.sin(rad)
+        y_new = cy + (x - cx) * np.sin(rad) + (y - cy) * np.cos(rad)
         transformed.append([round(x_new, 2), round(y_new, 2)])
     return transformed
+
+
+def find_matching_json(label, H, W, json_dir):
+    for jpath in Path(json_dir).rglob(f"{label}_*.json"):
+        with open(jpath) as f:
+            data = json.load(f)
+        if data.get("imageHeight") == H and data.get("imageWidth") == W:
+            return jpath, data
+    return None, None
 
 
 def augment_existing_cubes(cube_paths, json_dir, output_dir, visualize=True, min_angle=0, max_angle=360):
@@ -935,21 +924,20 @@ def augment_existing_cubes(cube_paths, json_dir, output_dir, visualize=True, min
     for cube_path in cube_paths:
         cube_path = Path(cube_path)
         hdr_img   = envi.open(str(cube_path))
-        cube      = np.array(hdr_img.load(), dtype=np.float32).transpose(2, 0, 1)
-        B, H, W   = cube.shape
+        cube      = np.array(hdr_img.load(), dtype=np.float32)
+        H, B, W   = cube.shape
+        cube_BHW  = cube.transpose(1, 0, 2)
 
-        angle = None
-        transformed_cube, operation, H_new, W_new = transform_cube_spatial(cube, min_angle, max_angle)
-        if operation.startswith("rot_"):
-            angle = float(operation.replace("rot_", "").replace("deg", ""))
+        transformed_cube, operation, H_new, W_new, angle = transform_cube_spatial(cube_BHW, min_angle, max_angle)
 
         if visualize:
-            fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-            axes[0].imshow(cube.mean(axis=0), cmap="gray")
-            axes[0].set_title("Avant")
-            axes[1].imshow(transformed_cube.mean(axis=0), cmap="gray")
-            axes[1].set_title(f"Après {operation}")
-            plt.tight_layout()
+            plt.figure(figsize=(8, 4))
+            plt.subplot(1, 2, 1)
+            plt.imshow(np.mean(cube_BHW, axis=0), cmap="gray")
+            plt.title("Avant")
+            plt.subplot(1, 2, 2)
+            plt.imshow(np.mean(transformed_cube, axis=0), cmap="gray")
+            plt.title(f"Après {operation}")
             plt.show()
 
         meta            = hdr_img.metadata.copy()
@@ -957,17 +945,19 @@ def augment_existing_cubes(cube_paths, json_dir, output_dir, visualize=True, min
         meta['samples'] = int(W_new)
         meta['bands']   = int(transformed_cube.shape[0])
 
-        new_name  = f"{cube_path.stem}_{operation}{cube_path.suffix}"
+        safe_op   = operation.replace('.', '_').replace('°', '')
+        new_name  = f"{cube_path.stem}_{safe_op}{cube_path.suffix}"
         save_path = output_dir / new_name
+
         envi.save_image(
             str(save_path),
-            transformed_cube.transpose(1, 2, 0).astype(np.float32),
+            transformed_cube.astype(np.float32),
             force=True, interleave="bil", metadata=meta
         )
-        print(f"✔ {cube_path.name} → {new_name}")
+        print(f"✔ {cube_path.name} transformé ({operation}) → {save_path.name}")
 
         label                = cube_path.stem.split("_")[0]
-        json_path, json_data = find_matching_json(H, W, label, json_dir)
+        json_path, json_data = find_matching_json(label, H, W, json_dir)
 
         if json_data is None:
             print(f"   ↳ aucun JSON trou trouvé pour {label} ({H}x{W})")
@@ -975,7 +965,7 @@ def augment_existing_cubes(cube_paths, json_dir, output_dir, visualize=True, min
 
         shapes_out = []
         for shape in json_data["shapes"]:
-            new_pts = transform_points(shape["points"], operation, H, W, angle)
+            new_pts = transform_points_rotation(shape["points"], angle, H, W, H_new, W_new)
             shapes_out.append({
                 "label"     : "trou",
                 "points"    : new_pts,
@@ -1013,6 +1003,6 @@ if __name__ == "__main__":
     augment_existing_cubes(
         cube_paths = cube_paths,
         json_dir   = "extrudes_eroded",
-        output_dir = "extrudes_augmented",
+        output_dir = "aug_data",
         visualize  = False,
     )
