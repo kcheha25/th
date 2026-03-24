@@ -743,18 +743,6 @@ if __name__ == "__main__":
     )
 
 
-import json
-import numpy as np
-import cv2
-from pathlib import Path
-from specarray import SpecArray
-from shapely.geometry import Polygon, MultiPolygon
-from shapely.ops import unary_union
-
-DATA_ROOT   = Path("data_cubes")
-LABELME_DIR = Path("labelme")
-OUTPUT_DIR  = Path("extrudes_eroded")
-
 CLASSES_A_IGNORER = ["trou", "plots"]
 json_files    = list(LABELME_DIR.glob("*.json"))
 class_counter = {}
@@ -773,12 +761,18 @@ for json_file in json_files:
     cube = np.array(spec.spectral_albedo)
     H, B, W = cube.shape
 
-    trous      = [Polygon(s["points"]) for s in data["shapes"] if s["label"] == "trou"]
+    trous = [
+        Polygon(s["points"])
+        for s in data["shapes"]
+        if s["label"] == "trou" and len(s["points"]) >= 4
+    ]
     trou_union = unary_union(trous) if trous else None
 
     for shape in data["shapes"]:
         label = shape["label"]
         if label in CLASSES_A_IGNORER:
+            continue
+        if len(shape["points"]) < 4:
             continue
 
         pts         = np.array(shape["points"], dtype=np.int32)
@@ -806,16 +800,19 @@ for json_file in json_files:
         for trou in trous:
             if not ext_polygon.intersects(trou):
                 continue
-            geom  = trou.intersection(ext_polygon)
+            geom = trou.intersection(ext_polygon)
             if geom.is_empty:
                 continue
             parts = geom.geoms if isinstance(geom, MultiPolygon) else [geom]
             for part in parts:
                 if part.is_empty or part.area < 1:
                     continue
+                coords = list(part.exterior.coords[:-1])
+                if len(coords) < 3:
+                    continue
                 rel_pts = [
                     [round(x - x_min, 2), round(y - y_min, 2)]
-                    for x, y in part.exterior.coords[:-1]
+                    for x, y in coords
                 ]
                 shapes_out.append({
                     "label"     : "trou",
