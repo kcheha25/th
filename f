@@ -509,3 +509,66 @@ def generate(plot_root, extrude_root, out_dir):
 
 if __name__ == "__main__":
     generate("plots_zone_to_add", "aug_after_rot_flip", "output")
+
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.collections import PatchCollection
+
+wl = np.array(wavelengths)
+idx_996  = np.argmin(np.abs(wl - 996))
+idx_1197 = np.argmin(np.abs(wl - 1197))
+
+band_996  = cube_BHW[idx_996]
+band_1197 = cube_BHW[idx_1197]
+
+ratio = np.where(band_1197 > 1e-6, band_996 / band_1197, np.nan)
+
+fig, ax = plt.subplots(figsize=(14, 10))
+im = ax.imshow(ratio, cmap="RdYlGn", interpolation="nearest")
+plt.colorbar(im, ax=ax, label="Ratio 996/1197")
+ax.set_title("Ratio bandes 996nm / 1197nm avec contours annotations")
+
+colors = {"plot": "blue", "trou": "red"}
+default_color = "yellow"
+
+for shape in original_json_data["shapes"]:
+    label = shape["label"]
+    pts   = np.array(shape["points"])
+
+    if label == "plot":
+        x0, y0 = pts[:,0].min(), pts[:,1].min()
+        x1, y1 = pts[:,0].max(), pts[:,1].max()
+        rect = mpatches.Rectangle(
+            (x0, y0), x1 - x0, y1 - y0,
+            linewidth=2, edgecolor="blue", facecolor="none", label="plot"
+        )
+        ax.add_patch(rect)
+        ax.text(x0 + 2, y0 + 12, "plot", color="blue", fontsize=7)
+
+    elif label == "trou":
+        poly = MplPolygon(pts, closed=True, linewidth=1.5,
+                          edgecolor="red", facecolor="none")
+        ax.add_patch(poly)
+
+    else:
+        color = default_color
+        poly = MplPolygon(pts, closed=True, linewidth=1.5,
+                          edgecolor=color, facecolor="none")
+        ax.add_patch(poly)
+        cx, cy = pts[:,0].mean(), pts[:,1].mean()
+        ax.text(cx, cy, label, color=color, fontsize=6, ha="center")
+
+legend_elements = [
+    mpatches.Patch(edgecolor="blue",   facecolor="none", label="plot"),
+    mpatches.Patch(edgecolor="red",    facecolor="none", label="trou"),
+    mpatches.Patch(edgecolor="yellow", facecolor="none", label="extrude"),
+]
+ax.legend(handles=legend_elements, loc="upper right", fontsize=8)
+
+plt.tight_layout()
+plt.show()
