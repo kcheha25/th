@@ -1013,3 +1013,40 @@ if __name__ == "__main__":
         output_dir = "aug_data",
         visualize  = False,
     )
+
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import Polygon as MplPolygon
+import numpy as np
+import json
+from pathlib import Path
+from spectral import envi
+
+
+def verify_trou_annotations(hdr_path, json_path):
+    hdr_img  = envi.open(str(hdr_path))
+    cube     = np.array(hdr_img.load(), dtype=np.float32)  # (B, H, W)
+    mean_img = cube.mean(axis=0)  # (H, W)
+
+    with open(json_path) as f:
+        data = json.load(f)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(mean_img, cmap="gray")
+    ax.set_title(f"{Path(hdr_path).stem}")
+
+    for shape in data["shapes"]:
+        pts  = np.array(shape["points"])
+        poly = MplPolygon(pts, closed=True, linewidth=2, edgecolor="red", facecolor="red", alpha=0.3)
+        ax.add_patch(poly)
+        cx, cy = pts[:,0].mean(), pts[:,1].mean()
+        ax.text(cx, cy, "trou", color="white", fontsize=8, ha="center")
+
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    hdr_path  = "aug_data/A1/A1_cube0_aug_0.hdr"
+    json_path = "aug_data/A1/A1_cube0_aug_0.json"
+    verify_trou_annotations(hdr_path, json_path)
