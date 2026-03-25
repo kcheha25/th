@@ -1,0 +1,576 @@
+import numpy as np
+import random
+from pathlib import Path
+import spectral.io.envi as envi
+import cv2
+import json
+from collections import defaultdict
+
+SINGLE_CLASSES = []
+MIN_PATCHES    = 10
+MAX_PATCHES    = 14
+WAVELENGTH_1   = 996
+WAVELENGTH_2   = 1197
+
+
+def load_cube(hdr_path):
+    img = envi.open(str(hdr_path))
+    return np.array(img.load(), dtype=np.float32), img
+
+
+def save_envi_cube(cube, path):
+    envi.save_image(str(path) + ".hdr", cube, dtype=np.float32,
+                    interleave="bsq", force=True)
+
+
+def get_band_index(img, wavelength):
+    wl = np.array(img.metadata["wavelength"], dtype=float)
+    return np.argmin(np.abs(wl - wavelength))
+
+
+def compute_ratio_map(cube, b1, b2):
+    band1 = cube[b1]
+    band2 = cube[b2]
+    ratio = np.zeros_like(band1)
+    valid = band2 > 1e-6
+    ratio[valid] = band1[valid] / band2[valid]
+    return ratio
+
+
+def _ratio_to_bgr(ratio):
+    r = ratio.copy()
+    rmin, rmax = r.min(), r.max()
+    if rmax - rmin > 1e-8:
+        r = (r - rmin) / (rmax - rmin)
+    else:
+        r = np.zeros_like(r)
+    u8 = (r * 255).astype(np.uint8)
+    return cv2.applyColorMap(u8, cv2.COLORMAP_VIRIDIS)
+
+
+def save_ratio_plain(ratio, out_path):
+    cv2.imwrite(str(out_path), _ratio_to_bgr(ratio))
+
+
+def save_ratio_with_contours(ratio, polygons, trou_polygons, out_path):
+    bgr = _ratio_to_bgr(ratio).copy()
+    for poly in polygons:
+        if poly is None or len(poly) < 3:
+            continue
+        pts = np.array(poly, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(bgr, [pts], isClosed=True, color=(0, 0, 255), thickness=2)
+    for poly in trou_polygons:
+        if poly is None or len(poly) < 3:
+            continue
+        pts = np.array(poly, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(bgr, [pts], isClosed=True, color=(0, 255, 255), thickness=2)
+    cv2.imwrite(str(out_path), bgr)
+
+
+def get_valid_mask_fast(cube):
+    return cube.var(axis=0) > 1e-6
+
+
+def crop_to_valid(cube, mask):
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return cube, mask
+    return (cube[:, rows[0]:rows[-1]+1, cols[0]:cols[-1]+1],
+            mask[rows[0]:rows[-1]+1, cols[0]:cols[-1]+1])
+
+
+def find_contour_polygons(mask):
+    mask_u8 = mask.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    polys = []
+    for c in contours:
+        pts = c.reshape(-1, 2).tolist()
+        if len(pts) >= 3:
+            polys.append(pts)
+    return polys
+
+
+def polygon_to_mask(poly, H, W):
+    m = np.zeros((H, W), dtype=np.uint8)
+    cv2.fillPoly(m, [np.array(poly, dtype=np.int32)], 1)
+    return m.astype(bool)
+
+
+def compute_valid_positions(zone_mask, extrude_mask):
+    kernel = extrude_mask.astype(np.uint8)
+    valid = cv2.erode(
+        zone_mask.astype(np.uint8) * 255,
+        kernel,
+        anchor=(0, 0),
+        borderType=cv2.BORDER_CONSTANT,
+        borderValue=0
+    ).astype(bool)
+    return valid
+
+
+def zone_bbox(zone_poly, H, W):
+    zone_mask = polygon_to_mask(zone_poly, H, W)
+    rows = np.where(zone_mask.any(axis=1))[0]
+    cols = np.where(zone_mask.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return 0, H, 0, W
+    return rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+
+
+def _crop_extrude(cube, mask, th, tw):
+    eh, ew = mask.shape
+    th = min(th, eh)
+    tw = min(tw, ew)
+    if eh == th and ew == tw:
+        return cube, mask
+    best = None
+    for _ in range(20):
+        r0 = random.randint(0, eh - th) if eh > th else 0
+        c0 = random.randint(0, ew - tw) if ew > tw else 0
+        if mask[r0:r0+th, c0:c0+tw].any():
+            best = (r0, c0)
+            break
+    if best is None:
+        ys, xs = np.where(mask)
+        cy, cx = int(ys.mean()), int(xs.mean())
+        r0 = max(0, min(cy - th // 2, eh - th))
+        c0 = max(0, min(cx - tw // 2, ew - tw))
+        best = (r0, c0)
+    r0, c0 = best
+    return cube[:, r0:r0+th, c0:c0+tw], mask[r0:r0+th, c0:c0+tw]
+
+
+def fit_extrude_to_zone(cube, mask, zone_mask, zone_poly, H, W):
+    rmin, rmax, cmin, cmax = zone_bbox(zone_poly, H, W)
+    zone_h = rmax - rmin
+    zone_w  = cmax - cmin
+    cube, mask = _crop_extrude(cube, mask, zone_h, zone_w)
+    scale = 1.0
+    for _ in range(15):
+        if compute_valid_positions(zone_mask, mask).any():
+            break
+        scale *= 0.90
+        eh, ew = mask.shape
+        cube, mask = _crop_extrude(cube, mask,
+                                   max(1, int(eh * scale)),
+                                   max(1, int(ew * scale)))
+    return cube, mask
+
+
+def clip_extrude_to_zone(cube, extrude_mask, zone_poly, H, W, x, y):
+    zone_mask  = polygon_to_mask(zone_poly, H, W)
+    h, w       = extrude_mask.shape
+    zone_crop  = zone_mask[y:y+h, x:x+w]
+    clipped    = extrude_mask & zone_crop
+    return cube, clipped
+
+
+def can_place(occ, mask, x, y):
+    h, w = mask.shape
+    H, W = occ.shape
+    if y + h > H or x + w > W:
+        return False
+    return not (occ[y:y+h, x:x+w] & mask).any()
+
+
+def update_occ(occ, mask, x, y):
+    h, w = mask.shape
+    occ[y:y+h, x:x+w] |= mask
+
+
+def load_trou_json(hdr_path):
+    json_path = Path(hdr_path).with_suffix(".json")
+    if not json_path.exists():
+        return []
+    with open(json_path) as f:
+        data = json.load(f)
+    return [s["points"] for s in data["shapes"] if s["label"] == "trou"]
+
+
+def translate_points(points, x_offset, y_offset):
+    return [
+        [round(p[0] + x_offset, 2), round(p[1] + y_offset, 2)]
+        for p in points
+    ]
+
+
+def place_full(plot, occ, cube, extrude_mask, zone_poly, hdr_path=None, all_plots=None):
+    _, H, W   = plot.shape
+    zone_mask = polygon_to_mask(zone_poly, H, W)
+
+    ys_e, xs_e = np.where(extrude_mask)
+    ext_h      = int(ys_e.max() - ys_e.min() + 1)
+    ext_w      = int(xs_e.max() - xs_e.min() + 1)
+
+    rmin, rmax, cmin, cmax = zone_bbox(zone_poly, H, W)
+    zone_h = rmax - rmin
+    zone_w  = cmax - cmin
+
+    if ext_h <= zone_h and ext_w <= zone_w:
+        cube, extrude_mask = fit_extrude_to_zone(
+            cube, extrude_mask, zone_mask, zone_poly, H, W)
+        valid = compute_valid_positions(zone_mask, extrude_mask)
+        ys, xs = np.where(valid)
+        free   = [i for i in range(len(xs))
+                  if can_place(occ, extrude_mask, xs[i], ys[i])]
+        if not free:
+            return False, None, []
+        idx  = random.choice(free)
+        y, x = ys[idx], xs[idx]
+
+    else:
+        best_plot_data = None
+
+        if all_plots is not None:
+            candidates = []
+            for p in all_plots:
+                p_cube, p_img = load_cube(p)
+                with open(p.with_suffix(".json")) as f:
+                    p_data = json.load(f)
+                p_zones = [s["points"] for s in p_data["shapes"]
+                           if s["label"] == "zone_placement"]
+                if not p_zones:
+                    continue
+                _, pH, pW = p_cube.shape
+                for z in p_zones:
+                    pr0, pr1, pc0, pc1 = zone_bbox(z, pH, pW)
+                    if (pr1 - pr0) >= ext_h and (pc1 - pc0) >= ext_w:
+                        candidates.append((p_cube, p_zones, p_img, pH, pW))
+                        break
+            if candidates:
+                best_plot_data = random.choice(candidates)
+
+        if best_plot_data is not None:
+            p_cube, p_zones, p_img, pH, pW = best_plot_data
+            zone_poly  = random.choice(p_zones)
+            zone_mask  = polygon_to_mask(zone_poly, pH, pW)
+            cube, extrude_mask = fit_extrude_to_zone(
+                cube, extrude_mask, zone_mask, zone_poly, pH, pW)
+            valid = compute_valid_positions(zone_mask, extrude_mask)
+            ys, xs = np.where(valid)
+            free   = [i for i in range(len(xs))
+                      if can_place(occ, extrude_mask, xs[i], ys[i])]
+            if not free:
+                return False, None, []
+            idx  = random.choice(free)
+            y, x = ys[idx], xs[idx]
+            H, W = pH, pW
+            plot = p_cube
+
+        else:
+            valid = compute_valid_positions(zone_mask, extrude_mask)
+            if not valid.any():
+                y, x = rmin, cmin
+            else:
+                ys, xs = np.where(valid)
+                free   = [i for i in range(len(xs))
+                          if can_place(occ, extrude_mask, xs[i], ys[i])]
+                y, x   = (rmin, cmin) if not free else (ys[random.choice(free)], xs[random.choice(free)])
+            cube, extrude_mask = clip_extrude_to_zone(
+                cube, extrude_mask, zone_poly, H, W, x, y)
+            if not extrude_mask.any():
+                return False, None, []
+
+    h, w = extrude_mask.shape
+    if y + h > plot.shape[1] or x + w > plot.shape[2]:
+        return False, None, []
+
+    for b in range(plot.shape[0]):
+        patch = plot[b, y:y+h, x:x+w].copy()
+        patch[extrude_mask] = cube[b][extrude_mask]
+        plot[b, y:y+h, x:x+w] = patch
+    update_occ(occ, extrude_mask, x, y)
+
+    contours = find_contour_polygons(extrude_mask)
+    if not contours:
+        return False, None, []
+    poly = np.array(contours[0])
+    poly[:, 0] += x
+    poly[:, 1] += y
+
+    trou_shapes = []
+    if hdr_path is not None:
+        for trou_pts in load_trou_json(hdr_path):
+            translated = translate_points(trou_pts, x, y)
+            trou_shapes.append({
+                "label"     : "trou",
+                "points"    : translated,
+                "shape_type": "polygon",
+                "flags"     : {},
+                "group_id"  : None,
+            })
+
+    return True, poly.tolist(), trou_shapes
+
+
+def place_circle_patch(plot, occ, cube, zone_poly, hdr_path=None):
+    _, H, W   = plot.shape
+    zone_mask = polygon_to_mask(zone_poly, H, W)
+
+    _, Hc, Wc      = cube.shape
+    src_active     = cube.var(axis=0) > 1e-6
+    active_pixels  = int(src_active.sum())
+
+    r_start = random.randint(5, 15)
+    circle_mask = None
+    valid       = None
+    for r in range(r_start, 0, -1):
+        d  = 2 * r + 1
+        cm = np.zeros((d, d), dtype=np.uint8)
+        cv2.circle(cm, (r, r), r, 1, -1)
+        cm = cm.astype(bool)
+        circle_pixels = int(cm.sum())
+        if circle_pixels > active_pixels:
+            continue
+        v = compute_valid_positions(zone_mask, cm)
+        if v.any():
+            circle_mask = cm
+            valid       = v
+            break
+
+    if circle_mask is None or valid is None:
+        return False, None, []
+
+    d    = circle_mask.shape[0]
+    ys, xs = np.where(valid)
+    free = [i for i in range(len(xs)) if can_place(occ, circle_mask, xs[i], ys[i])]
+    if not free:
+        return False, None, []
+
+    idx       = random.choice(free)
+    y_dst, x_dst = ys[idx], xs[idx]
+
+    src_y = random.randint(0, max(0, Hc - d))
+    src_x = random.randint(0, max(0, Wc - d))
+
+    for b in range(plot.shape[0]):
+        dst_patch = plot[b, y_dst:y_dst+d, x_dst:x_dst+d].copy()
+        src_patch = np.tile(
+            cube[b, src_y:src_y+min(d, Hc), src_x:src_x+min(d, Wc)],
+            (d // max(1, Hc - src_y) + 1, d // max(1, Wc - src_x) + 1)
+        )[:d, :d]
+        dst_patch[circle_mask] = src_patch[circle_mask]
+        plot[b, y_dst:y_dst+d, x_dst:x_dst+d] = dst_patch
+
+    update_occ(occ, circle_mask, x_dst, y_dst)
+
+    contours = find_contour_polygons(circle_mask)
+    if not contours:
+        return False, None, []
+    poly = np.array(contours[0])
+    poly[:, 0] += x_dst
+    poly[:, 1] += y_dst
+
+    trou_shapes = []
+    if hdr_path is not None:
+        for trou_pts in load_trou_json(hdr_path):
+            translated = translate_points(trou_pts, x_dst, y_dst)
+            trou_shapes.append({
+                "label"     : "trou",
+                "points"    : translated,
+                "shape_type": "polygon",
+                "flags"     : {},
+                "group_id"  : None,
+            })
+
+    return True, poly.tolist(), trou_shapes
+
+
+def try_place_full(plot, occ, cube, mask, zones, hdr_path=None, all_plots=None):
+    for z in zones:
+        ok, poly, trous = place_full(plot, occ, cube, mask, z, hdr_path, all_plots)
+        if ok:
+            return True, poly, trous
+    return False, None, []
+
+
+def try_place_circle_patch(plot, occ, cube, zones, hdr_path=None):
+    for z in zones:
+        ok, poly, trous = place_circle_patch(plot, occ, cube, z, hdr_path)
+        if ok:
+            return True, poly, trous
+    return False, None, []
+
+
+def get_class(name):
+    return name.split("_")[0]
+
+
+def load_pool(root):
+    return [{"hdr": f, "class": get_class(f.stem)}
+            for f in Path(root).rglob("*.hdr")]
+
+
+def load_plot(p):
+    cube, img = load_cube(p)
+    with open(p.with_suffix(".json")) as f:
+        data = json.load(f)
+    zones = [s["points"] for s in data["shapes"] if s["label"] == "zone_placement"]
+    return cube, zones, img
+
+
+def build_batches_exhaust_extrudes(pool, min_p, max_p):
+    by_class = defaultdict(list)
+    for e in pool:
+        by_class[e["class"]].append(e)
+    classes    = sorted(by_class.keys())
+    nb_classes = len(classes)
+    if nb_classes == 0:
+        return [], {}
+
+    class_queues = {}
+    for cls in classes:
+        q = by_class[cls][:]
+        random.shuffle(q)
+        class_queues[cls] = q
+
+    max_len      = max(len(v) for v in class_queues.values())
+    global_queue = []
+    for r in range(max_len):
+        cls_order = classes[:]
+        random.shuffle(cls_order)
+        for cls in cls_order:
+            if r < len(class_queues[cls]):
+                global_queue.append(class_queues[cls][r])
+
+    batches = []
+    pos     = 0
+    while pos < len(global_queue):
+        size  = random.randint(min_p, max_p)
+        size  = min(size, len(global_queue) - pos)
+        batch = global_queue[pos:pos + size]
+        random.shuffle(batch)
+        batches.append(batch)
+        pos += size
+
+    quotas = {cls: len(by_class[cls]) for cls in classes}
+    total  = sum(quotas.values())
+    print(f"[INFO] {total} extrudes → {len(batches)} plots à générer")
+    print("[INFO] Quota par classe :")
+    for cls, q in sorted(quotas.items()):
+        print(f"       {cls}: {q}")
+
+    return batches, quotas
+
+
+def save_labelme_json(path, shapes, image_name, H, W):
+    labelme_shapes = [
+        {
+            "label":       s["label"],
+            "points":      s["points"],
+            "group_id":    None,
+            "description": "",
+            "shape_type":  s["shape_type"],
+            "flags":       {},
+            "mask":        None,
+        }
+        for s in shapes
+    ]
+    with open(path, "w") as f:
+        json.dump({
+            "version":     "5.4.1",
+            "flags":       {},
+            "shapes":      labelme_shapes,
+            "imagePath":   image_name,
+            "imageData":   None,
+            "imageHeight": H,
+            "imageWidth":  W,
+        }, f, indent=2)
+
+
+def generate(plot_root, extrude_root, out_dir):
+    plots    = list(Path(plot_root).rglob("*.hdr"))
+    raw_pool = load_pool(extrude_root)
+    out_dir  = Path(out_dir)
+    out_dir.mkdir(exist_ok=True)
+
+    batches, quotas = build_batches_exhaust_extrudes(raw_pool, MIN_PATCHES, MAX_PATCHES)
+    counter = defaultdict(int)
+
+    for i, batch in enumerate(batches):
+        selected = batch
+        singles  = [e for e in selected if e["class"] in SINGLE_CLASSES]
+
+        plot_hdr         = random.choice(plots)
+        plot, zones, img = load_plot(plot_hdr)
+        _, H, W = plot.shape
+        occ    = np.zeros((H, W), bool)
+        shapes = []
+
+        if singles:
+            e = random.choice(singles)
+            cube_e, _ = load_cube(e["hdr"])
+            mask_e    = get_valid_mask_fast(cube_e)
+            cube_e, mask_e = crop_to_valid(cube_e, mask_e)
+            strat = random.choice([1, 2])
+
+            if strat == 1:
+                ok, poly, trous = try_place_full(
+                    plot, occ, cube_e, mask_e, zones,
+                    hdr_path=e["hdr"], all_plots=plots)
+                if ok:
+                    shapes = [{"label": e["class"], "points": poly, "shape_type": "polygon"}]
+                    shapes.extend(trous)
+                    counter[e["class"]] += 1
+            else:
+                ok, poly, trous = try_place_circle_patch(
+                    plot, occ, cube_e, zones, hdr_path=e["hdr"])
+                if ok:
+                    shapes.append({"label": e["class"], "points": poly, "shape_type": "polygon"})
+                    shapes.extend(trous)
+                    counter[e["class"]] += 1
+                for e2 in [x for x in selected if x != e]:
+                    cube2, _ = load_cube(e2["hdr"])
+                    mask2    = get_valid_mask_fast(cube2)
+                    cube2, mask2 = crop_to_valid(cube2, mask2)
+                    ok2, poly2, trous2 = try_place_full(
+                        plot, occ, cube2, mask2, zones,
+                        hdr_path=e2["hdr"], all_plots=plots)
+                    if ok2:
+                        shapes.append({"label": e2["class"], "points": poly2, "shape_type": "polygon"})
+                        shapes.extend(trous2)
+                        counter[e2["class"]] += 1
+        else:
+            for e in selected:
+                cube, _ = load_cube(e["hdr"])
+                mask    = get_valid_mask_fast(cube)
+                cube, mask = crop_to_valid(cube, mask)
+                ok, poly, trous = try_place_full(
+                    plot, occ, cube, mask, zones,
+                    hdr_path=e["hdr"], all_plots=plots)
+                if ok:
+                    shapes.append({"label": e["class"], "points": poly, "shape_type": "polygon"})
+                    shapes.extend(trous)
+                    counter[e["class"]] += 1
+
+        if not shapes:
+            continue
+
+        name  = f"aug_{i}"
+        save_envi_cube(plot, out_dir / name)
+
+        b1    = get_band_index(img, WAVELENGTH_1)
+        b2    = get_band_index(img, WAVELENGTH_2)
+        ratio = compute_ratio_map(plot, b1, b2)
+
+        extrude_polys = [s["points"] for s in shapes if s["label"] != "trou"]
+        trou_polys    = [s["points"] for s in shapes if s["label"] == "trou"]
+
+        save_ratio_plain(ratio, out_dir / f"{name}.png")
+        save_ratio_with_contours(ratio, extrude_polys, trou_polys, out_dir / f"{name}_ratio.png")
+        save_labelme_json(out_dir / f"{name}.json", shapes, f"{name}.png", H, W)
+
+        print(f"Plot {i:>4}  [{plot_hdr.stem}]  patches: {len(extrude_polys):>2}  "
+              f"trous: {len(trou_polys):>2}  {dict(counter)}")
+
+    print("\n[RESUME] Placements reels par classe :")
+    for cls, cnt in sorted(counter.items()):
+        print(f"  {cls}: {cnt}")
+    counts = list(counter.values())
+    if counts:
+        print(f"  min={min(counts)}  max={max(counts)}  ecart={max(counts) - min(counts)}")
+
+
+if __name__ == "__main__":
+    generate("plots_zone_to_add", "aug_after_rot_flip", "output")
