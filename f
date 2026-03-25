@@ -1050,3 +1050,28 @@ if __name__ == "__main__":
     hdr_path  = "aug_data/A1/A1_cube0_aug_0.hdr"
     json_path = "aug_data/A1/A1_cube0_aug_0.json"
     verify_trou_annotations(hdr_path, json_path)
+
+def transform_cube_spatial(cube, min_angle=0, max_angle=360):
+    B, H, W   = cube.shape
+    angle     = random.uniform(min_angle, max_angle)
+    operation = f"rot_{angle:.1f}°"
+
+    rotated_bands = []
+    for b in range(B):
+        rotated_band = rotate(cube[b], angle, reshape=False, order=0, mode='constant', cval=0)
+        rotated_bands.append(rotated_band)
+
+    transformed_cube = np.stack(rotated_bands, axis=0)
+
+    return transformed_cube, operation, H, W, angle
+
+
+def transform_points_rotation(points, angle, H, W):
+    rad    = np.deg2rad(-angle)
+    cx, cy = W / 2, H / 2
+    transformed = []
+    for x, y in points:
+        x_new = cx + (x - cx) * np.cos(rad) - (y - cy) * np.sin(rad)
+        y_new = cy + (x - cx) * np.sin(rad) + (y - cy) * np.cos(rad)
+        transformed.append([round(x_new, 2), round(y_new, 2)])
+    return transformed
