@@ -14,6 +14,7 @@ MAX_PATCHES    = 14
 WAVELENGTH_1   = 996
 WAVELENGTH_2   = 1197
 NULL_THRESHOLD = 1e-6  # Seuil pour considérer un pixel comme nul
+BLEND_WIDTH    = 2     # Largeur du blending en pixels
 
 
 def load_cube(hdr_path):
@@ -90,7 +91,6 @@ def find_contour_polygons(mask):
     for c in contours:
         pts = c.reshape(-1, 2).tolist()
         if len(pts) >= 3:
-            # Garder en float pour la cohérence avec le reste du code
             polys.append(pts)
     return polys
 
@@ -119,7 +119,6 @@ def zone_bbox(zone_poly, H, W):
     cols = np.where(zone_mask.any(axis=0))[0]
     if len(rows) == 0 or len(cols) == 0:
         return 0, H, 0, W
-    # Convertir en Python int pour éviter les problèmes numpy
     return int(rows[0]), int(rows[-1] + 1), int(cols[0]), int(cols[-1] + 1)
 
 
@@ -252,11 +251,144 @@ def detect_null_pixels_in_region(cube_region, mask):
     Détecte les pixels nuls dans la région de l'extrude à copier.
     Retourne un masque des pixels nuls à l'intérieur de la zone d'extrude.
     """
-    # Vérifier si des pixels sont nuls sur toutes les bandes ou en dessous du seuil
-    # On considère qu'un pixel est nul si sa valeur moyenne sur toutes les bandes est inférieure au seuil
     mean_spectrum = np.mean(cube_region, axis=0)
     null_mask = (mean_spectrum < NULL_THRESHOLD) & mask
     return null_mask
+
+
+def get_boundary_mask(mask, blend_width):
+    """
+    Crée un masque des pixels situés à la bordure de l'objet.
+    Retourne un masque binaire des pixels à blend.
+    """
+    # Dilater le masque
+    kernel = np.ones((blend_width*2+1, blend_width*2+1), np.uint8)
+    dilated = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+    
+    # La bordure est la zone dilatée moins le masque original
+    boundary = dilated & ~mask
+    
+    # Pour obtenir une bordure plus fine, on peut aussi utiliser erosion
+    if blend_width > 1:
+        kernel_erode = np.ones((blend_width, blend_width), np.uint8)
+        eroded = cv2.erode(mask.astype(np.uint8), kernel_erode, iterations=1).astype(bool)
+        # La bordure interne (entre le masque original et l'érodé)
+        internal_boundary = mask & ~eroded
+        boundary = boundary | internal_boundary
+    
+    return boundary
+
+
+def apply_blending(plot, mask, x, y, h, w, blend_width):
+    """
+    Applique un blending sur les bords de l'extrude en mélangeant avec le fond.
+    """
+    if blend_width <= 0:
+        return
+    
+    # Créer le masque de bordure
+    boundary_mask = get_boundary_mask(mask, blend_width)
+    
+    if not boundary_mask.any():
+        return
+    
+    # Pour chaque bande spectrale
+    for b in range(plot.shape[0]):
+        # Extraire la région de l'image
+        region = plot[b, y:y+h, x:x+w]
+        
+        # Créer une copie pour le blending
+        blended_region = region.copy()
+        
+        # Pour chaque pixel de la bordure, mélanger avec les pixels voisins du fond
+        boundary_pixels = np.where(boundary_mask)
+        
+        for i in range(len(boundary_pixels[0])):
+            py, px = boundary_pixels[0][i], boundary_pixels[1][i]
+            
+            # Récupérer la valeur du pixel
+            current_val = region[py, px]
+            
+            # Récupérer les valeurs des pixels du fond (à l'extérieur de l'extrude)
+            # autour du pixel courant
+            neighbors = []
+            for dy in range(-blend_width, blend_width + 1):
+                for dx in range(-blend_width, blend_width + 1):
+                    ny, nx = py + dy, px + dx
+                    if 0 <= ny < h and 0 <= nx < w:
+                        # Vérifier si ce voisin n'est pas dans l'extrude
+                        if not mask[ny, nx]:
+                            neighbors.append(region[ny, nx])
+            
+            if neighbors:
+                # Calculer la moyenne des pixels du fond voisins
+                bg_mean = np.mean(neighbors)
+                # Mélanger avec le pixel original
+                # Plus on est proche du bord, plus le poids du fond est élevé
+                dist_to_boundary = min(abs(py - boundary_pixels[0][i]), 
+                                      abs(px - boundary_pixels[1][i]))
+                alpha = min(1.0, dist_to_boundary / blend_width)
+                blended_region[py, px] = current_val * (1 - alpha) + bg_mean * alpha
+        
+        # Appliquer le blending
+        plot[b, y:y+h, x:x+w] = blended_region
+
+
+def apply_smooth_blending(plot, mask, x, y, h, w, blend_width):
+    """
+    Applique un blending plus sophistiqué avec dégradé gaussien.
+    """
+    if blend_width <= 0:
+        return
+    
+    # Créer une carte de distance depuis la bordure
+    dist_transform = cv2.distanceTransform(
+        (~mask).astype(np.uint8), 
+        cv2.DIST_L2, 
+        cv2.DIST_MASK_PRECISE
+    )
+    
+    # Normaliser la distance
+    max_dist = blend_width
+    alpha_map = np.clip(dist_transform / max_dist, 0, 1)
+    alpha_map = alpha_map ** 2  # Courbe exponentielle pour une transition plus douce
+    
+    # Inverser pour que l'intérieur soit à 1 et l'extérieur à 0
+    alpha_map = 1 - np.clip(alpha_map, 0, 1)
+    
+    # Appliquer uniquement sur la zone de l'extrude
+    alpha_map = alpha_map * mask.astype(float)
+    
+    # Pour chaque bande spectrale
+    for b in range(plot.shape[0]):
+        region = plot[b, y:y+h, x:x+w]
+        
+        # Créer une version originale de la région (sans modification)
+        original_region = region.copy()
+        
+        # Appliquer le blending
+        for i in range(blend_width + 1):
+            # Les pixels à une certaine distance de la bordure
+            boundary_pixels = (alpha_map > 0) & (alpha_map <= (i+1)/blend_width) & (alpha_map > i/blend_width)
+            
+            if boundary_pixels.any():
+                # Pour ces pixels, mélanger avec les pixels voisins du fond
+                for py, px in zip(*np.where(boundary_pixels)):
+                    # Trouver des pixels du fond dans le voisinage
+                    neighbors = []
+                    for dy in range(-blend_width, blend_width + 1):
+                        for dx in range(-blend_width, blend_width + 1):
+                            ny, nx = py + dy, px + dx
+                            if 0 <= ny < h and 0 <= nx < w and not mask[ny, nx]:
+                                neighbors.append(original_region[ny, nx])
+                    
+                    if neighbors:
+                        bg_mean = np.mean(neighbors)
+                        # Poids proportionnel à la distance
+                        alpha = alpha_map[py, px]
+                        region[py, px] = original_region[py, px] * (1 - alpha) + bg_mean * alpha
+        
+        plot[b, y:y+h, x:x+w] = region
 
 
 def place_full(plot, occ, cube, extrude_mask, zone_poly, hdr_path=None, all_plots=None):
@@ -359,9 +491,14 @@ def place_full(plot, occ, cube, extrude_mask, zone_poly, hdr_path=None, all_plot
             patch = plot[b, y:y+h, x:x+w].copy()
             patch[valid_pixels_mask] = cube[b][valid_pixels_mask]
             plot[b, y:y+h, x:x+w] = patch
+        
+        # Appliquer le blending sur les bords de l'extrude
+        # Utiliser la version simple ou la version smooth, au choix
+        apply_blending(plot, valid_pixels_mask, x, y, h, w, BLEND_WIDTH)
+        # Alternative plus sophistiquée:
+        # apply_smooth_blending(plot, valid_pixels_mask, x, y, h, w, BLEND_WIDTH)
     
     # Mettre à jour l'occupation avec tous les pixels de l'extrude (même les trous)
-    # pour éviter de superposer d'autres extrudes
     update_occ(occ, extrude_mask, x, y)
 
     # Créer le polygone principal de l'extrude
@@ -371,7 +508,6 @@ def place_full(plot, occ, cube, extrude_mask, zone_poly, hdr_path=None, all_plot
     poly = np.array(contours[0])
     poly[:, 0] += x
     poly[:, 1] += y
-    # Convertir en float pour JSON
     poly = [[float(p[0]), float(p[1])] for p in poly]
 
     trou_shapes = []
@@ -388,7 +524,6 @@ def place_full(plot, occ, cube, extrude_mask, zone_poly, hdr_path=None, all_plot
         trou_contours = find_contour_polygons(trou_mask)
         for contour in trou_contours:
             if len(contour) >= 3:
-                # Convertir en coordonnées absolues avec des floats
                 abs_contour = [[float(p[0] + x), float(p[1] + y)] for p in contour]
                 trou_shapes.append({
                     "label": "trou",
@@ -462,6 +597,11 @@ def place_circle_patch(plot, occ, cube, zone_poly, hdr_path=None):
             )[:d, :d]
             dst_patch[valid_pixels_mask] = src_patch[valid_pixels_mask]
             plot[b, y_dst:y_dst+d, x_dst:x_dst+d] = dst_patch
+        
+        # Appliquer le blending sur les bords du cercle
+        apply_blending(plot, valid_pixels_mask, x_dst, y_dst, d, d, BLEND_WIDTH)
+        # Alternative plus sophistiquée:
+        # apply_smooth_blending(plot, valid_pixels_mask, x_dst, y_dst, d, d, BLEND_WIDTH)
     
     # Mettre à jour l'occupation
     update_occ(occ, circle_mask, x_dst, y_dst)
@@ -473,7 +613,6 @@ def place_circle_patch(plot, occ, cube, zone_poly, hdr_path=None):
     poly = np.array(contours[0])
     poly[:, 0] += x_dst
     poly[:, 1] += y_dst
-    # Convertir en float pour JSON
     poly = [[float(p[0]), float(p[1])] for p in poly]
 
     trou_shapes = []
@@ -642,7 +781,6 @@ def generate(plot_root, extrude_root, out_dir):
         selected = batch
         singles  = [e for e in selected if e["class"] in SINGLE_CLASSES]
         
-        # Make a copy of selected extrudes to return unused ones to pool
         used_extrudes = []
         successful_placement = False
 
@@ -671,7 +809,6 @@ def generate(plot_root, extrude_root, out_dir):
                     used_extrudes.append(e)
                     successful_placement = True
                     
-                    # Try to place remaining extrudes
                     for e2 in [x for x in selected if x != e]:
                         cube2, _ = load_cube(e2["hdr"])
                         mask2    = get_valid_mask_fast(cube2)
@@ -699,7 +836,6 @@ def generate(plot_root, extrude_root, out_dir):
                     used_extrudes.append(e)
                     successful_placement = True
                     
-                    # Try to place remaining extrudes
                     for e2 in [x for x in selected if x != e]:
                         cube2, _ = load_cube(e2["hdr"])
                         mask2    = get_valid_mask_fast(cube2)
@@ -735,7 +871,6 @@ def generate(plot_root, extrude_root, out_dir):
                     failed_attempts[e["class"]] += 1
                     print(f"  [WARNING] Failed to place extrude {e['hdr'].stem}, returning to pool")
 
-        # Only save if at least one extrude was successfully placed
         if successful_placement and shapes:
             name  = f"aug_{i}"
             save_envi_cube(plot, out_dir / name)
