@@ -123,7 +123,7 @@ def _crop_extrude(cube, mask, th, tw):
     th = min(th, eh)
     tw = min(tw, ew)
     if eh == th and ew == tw:
-        return cube, mask
+        return cube, mask, 0, 0
     best = None
     for _ in range(20):
         r0 = random.randint(0, eh - th) if eh > th else 0
@@ -138,32 +138,47 @@ def _crop_extrude(cube, mask, th, tw):
         c0 = max(0, min(cx - tw // 2, ew - tw))
         best = (r0, c0)
     r0, c0 = best
-    return cube[:, r0:r0+th, c0:c0+tw], mask[r0:r0+th, c0:c0+tw]
+    return cube[:, r0:r0+th, c0:c0+tw], mask[r0:r0+th, c0:c0+tw], r0, c0
 
 
 def fit_extrude_to_zone(cube, mask, zone_mask, zone_poly, H, W):
     rmin, rmax, cmin, cmax = zone_bbox(zone_poly, H, W)
     zone_h = rmax - rmin
     zone_w  = cmax - cmin
-    cube, mask = _crop_extrude(cube, mask, zone_h, zone_w)
+    cube, mask, r0, c0 = _crop_extrude(cube, mask, zone_h, zone_w)
+    total_r0, total_c0 = r0, c0
     scale = 1.0
     for _ in range(15):
         if compute_valid_positions(zone_mask, mask).any():
             break
         scale *= 0.90
         eh, ew = mask.shape
-        cube, mask = _crop_extrude(cube, mask,
-                                   max(1, int(eh * scale)),
-                                   max(1, int(ew * scale)))
-    return cube, mask
+        cube, mask, r0, c0 = _crop_extrude(cube, mask,
+                                            max(1, int(eh * scale)),
+                                            max(1, int(ew * scale)))
+        total_r0 += r0
+        total_c0 += c0
+    return cube, mask, total_r0, total_c0
 
 
 def clip_extrude_to_zone(cube, extrude_mask, zone_poly, H, W, x, y):
-    zone_mask  = polygon_to_mask(zone_poly, H, W)
-    h, w       = extrude_mask.shape
-    zone_crop  = zone_mask[y:y+h, x:x+w]
-    clipped    = extrude_mask & zone_crop
+    zone_mask = polygon_to_mask(zone_poly, H, W)
+    h, w      = extrude_mask.shape
+    zone_crop = zone_mask[y:y+h, x:x+w]
+    clipped   = extrude_mask & zone_crop
     return cube, clipped
+
+
+def filter_trous_after_crop(trou_pts_list, crop_r0, crop_c0, extrude_mask):
+    H_mask, W_mask = extrude_mask.shape
+    filtered = []
+    for pts in trou_pts_list:
+        rel_pts = [[x - crop_c0, y - crop_r0] for x, y in pts]
+        cx = sum(p[0] for p in rel_pts) / len(rel_pts)
+        cy = sum(p[1] for p in rel_pts) / len(rel_pts)
+        if 0 <= cx < W_mask and 0 <= cy < H_mask and extrude_mask[int(cy), int(cx)]:
+            filtered.append(rel_pts)
+    return filtered
 
 
 def can_place(occ, mask, x, y):
@@ -207,8 +222,11 @@ def place_full(plot, occ, cube, extrude_mask, zone_poly, hdr_path=None, all_plot
     zone_h = rmax - rmin
     zone_w  = cmax - cmin
 
+    trou_pts_list        = load_trou_json(hdr_path) if hdr_path is not None else []
+    crop_r0, crop_c0     = 0, 0
+
     if ext_h <= zone_h and ext_w <= zone_w:
-        cube, extrude_mask = fit_extrude_to_zone(
+        cube, extrude_mask, crop_r0, crop_c0 = fit_extrude_to_zone(
             cube, extrude_mask, zone_mask, zone_poly, H, W)
         valid = compute_valid_positions(zone_mask, extrude_mask)
         ys, xs = np.where(valid)
@@ -245,7 +263,7 @@ def place_full(plot, occ, cube, extrude_mask, zone_poly, hdr_path=None, all_plot
             p_cube, p_zones, p_img, pH, pW = best_plot_data
             zone_poly  = random.choice(p_zones)
             zone_mask  = polygon_to_mask(zone_poly, pH, pW)
-            cube, extrude_mask = fit_extrude_to_zone(
+            cube, extrude_mask, crop_r0, crop_c0 = fit_extrude_to_zone(
                 cube, extrude_mask, zone_mask, zone_poly, pH, pW)
             valid = compute_valid_positions(zone_mask, extrude_mask)
             ys, xs = np.where(valid)
@@ -290,9 +308,10 @@ def place_full(plot, occ, cube, extrude_mask, zone_poly, hdr_path=None, all_plot
     poly[:, 1] += y
 
     trou_shapes = []
-    if hdr_path is not None:
-        for trou_pts in load_trou_json(hdr_path):
-            translated = translate_points(trou_pts, x, y)
+    if trou_pts_list:
+        filtered = filter_trous_after_crop(trou_pts_list, crop_r0, crop_c0, extrude_mask)
+        for rel_pts in filtered:
+            translated = translate_points(rel_pts, x, y)
             trou_shapes.append({
                 "label"     : "trou",
                 "points"    : translated,
@@ -308,11 +327,11 @@ def place_circle_patch(plot, occ, cube, zone_poly, hdr_path=None):
     _, H, W   = plot.shape
     zone_mask = polygon_to_mask(zone_poly, H, W)
 
-    _, Hc, Wc      = cube.shape
-    src_active     = cube.var(axis=0) > 1e-6
-    active_pixels  = int(src_active.sum())
+    _, Hc, Wc     = cube.shape
+    src_active    = cube.var(axis=0) > 1e-6
+    active_pixels = int(src_active.sum())
 
-    r_start = random.randint(5, 15)
+    r_start     = random.randint(5, 15)
     circle_mask = None
     valid       = None
     for r in range(r_start, 0, -1):
@@ -320,8 +339,7 @@ def place_circle_patch(plot, occ, cube, zone_poly, hdr_path=None):
         cm = np.zeros((d, d), dtype=np.uint8)
         cv2.circle(cm, (r, r), r, 1, -1)
         cm = cm.astype(bool)
-        circle_pixels = int(cm.sum())
-        if circle_pixels > active_pixels:
+        if int(cm.sum()) > active_pixels:
             continue
         v = compute_valid_positions(zone_mask, cm)
         if v.any():
@@ -338,7 +356,7 @@ def place_circle_patch(plot, occ, cube, zone_poly, hdr_path=None):
     if not free:
         return False, None, []
 
-    idx       = random.choice(free)
+    idx          = random.choice(free)
     y_dst, x_dst = ys[idx], xs[idx]
 
     src_y = random.randint(0, max(0, Hc - d))
