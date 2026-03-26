@@ -13,6 +13,7 @@ MIN_PATCHES    = 10
 MAX_PATCHES    = 14
 WAVELENGTH_1   = 996
 WAVELENGTH_2   = 1197
+NULL_THRESHOLD = 1e-6  # Seuil pour considérer un pixel comme nul
 
 
 def load_cube(hdr_path):
@@ -244,6 +245,18 @@ def trous_to_shapes(clipped_trous, place_x, place_y):
     return shapes
 
 
+def detect_null_pixels_in_region(cube_region, mask):
+    """
+    Détecte les pixels nuls dans la région de l'extrude à copier.
+    Retourne un masque des pixels nuls à l'intérieur de la zone d'extrude.
+    """
+    # Vérifier si des pixels sont nuls sur toutes les bandes ou en dessous du seuil
+    # On considère qu'un pixel est nul si sa valeur moyenne sur toutes les bandes est inférieure au seuil
+    mean_spectrum = np.mean(cube_region, axis=0)
+    null_mask = (mean_spectrum < NULL_THRESHOLD) & mask
+    return null_mask
+
+
 def place_full(plot, occ, cube, extrude_mask, zone_poly, hdr_path=None, all_plots=None):
     _, H, W   = plot.shape
     zone_mask = polygon_to_mask(zone_poly, H, W)
@@ -328,19 +341,28 @@ def place_full(plot, occ, cube, extrude_mask, zone_poly, hdr_path=None, all_plot
     if y + h > plot.shape[1] or x + w > plot.shape[2]:
         return False, None, [], None
 
-    # Attempt to transfer spectrum
-    try:
+    # Détecter les pixels nuls dans la région source à copier
+    source_region = cube[:, :h, :w]
+    null_pixels_mask = detect_null_pixels_in_region(source_region, extrude_mask)
+    
+    # Créer un masque pour les pixels valides (non nuls)
+    valid_pixels_mask = extrude_mask & ~null_pixels_mask
+    
+    # Créer un masque pour les trous (pixels nuls dans l'extrude)
+    trou_mask = null_pixels_mask
+    
+    # Copier seulement les pixels valides
+    if valid_pixels_mask.any():
         for b in range(plot.shape[0]):
             patch = plot[b, y:y+h, x:x+w].copy()
-            patch[extrude_mask] = cube[b][extrude_mask]
+            patch[valid_pixels_mask] = cube[b][valid_pixels_mask]
             plot[b, y:y+h, x:x+w] = patch
-    except Exception as e:
-        # Spectrum transfer failed
-        print(f"  [WARNING] Spectrum transfer failed: {e}")
-        return False, None, [], None
-
+    
+    # Mettre à jour l'occupation avec tous les pixels de l'extrude (même les trous)
+    # pour éviter de superposer d'autres extrudes
     update_occ(occ, extrude_mask, x, y)
 
+    # Créer le polygone principal de l'extrude
     contours = find_contour_polygons(extrude_mask)
     if not contours:
         return False, None, [], None
@@ -349,11 +371,29 @@ def place_full(plot, occ, cube, extrude_mask, zone_poly, hdr_path=None, all_plot
     poly[:, 1] += y
 
     trou_shapes = []
+    
+    # Ajouter les trous existants du JSON source
     if trou_pts_list:
         eh, ew      = extrude_mask.shape
         region_box  = box(crop_c0, crop_r0, crop_c0 + ew, crop_r0 + eh)
         clipped     = clip_trous_to_region(trou_pts_list, region_box, crop_c0, crop_r0)
         trou_shapes = trous_to_shapes(clipped, x, y)
+    
+    # Ajouter les nouveaux trous détectés (pixels nuls)
+    if trou_mask.any():
+        # Trouver les contours des zones de pixels nuls
+        trou_contours = find_contour_polygons(trou_mask)
+        for contour in trou_contours:
+            if len(contour) >= 3:
+                # Convertir en coordonnées absolues
+                abs_contour = [[p[0] + x, p[1] + y] for p in contour]
+                trou_shapes.append({
+                    "label": "trou",
+                    "points": abs_contour,
+                    "shape_type": "polygon",
+                    "flags": {},
+                    "group_id": None,
+                })
 
     return True, poly.tolist(), trou_shapes, plot
 
@@ -397,23 +437,33 @@ def place_circle_patch(plot, occ, cube, zone_poly, hdr_path=None):
     src_y = random.randint(0, max(0, Hc - d))
     src_x = random.randint(0, max(0, Wc - d))
 
-    # Attempt to transfer spectrum
-    try:
+    # Extraire la région source
+    src_region = cube[:, src_y:src_y+d, src_x:src_x+d]
+    
+    # Détecter les pixels nuls dans la région source
+    null_pixels_mask = detect_null_pixels_in_region(src_region, circle_mask)
+    
+    # Créer un masque pour les pixels valides
+    valid_pixels_mask = circle_mask & ~null_pixels_mask
+    
+    # Créer un masque pour les trous
+    trou_mask = null_pixels_mask
+    
+    # Copier seulement les pixels valides
+    if valid_pixels_mask.any():
         for b in range(plot.shape[0]):
             dst_patch = plot[b, y_dst:y_dst+d, x_dst:x_dst+d].copy()
             src_patch = np.tile(
-                cube[b, src_y:src_y+min(d, Hc), src_x:src_x+min(d, Wc)],
-                (d // max(1, Hc - src_y) + 1, d // max(1, Wc - src_x) + 1)
+                src_region[b],
+                (d // max(1, d) + 1, d // max(1, d) + 1)
             )[:d, :d]
-            dst_patch[circle_mask] = src_patch[circle_mask]
+            dst_patch[valid_pixels_mask] = src_patch[valid_pixels_mask]
             plot[b, y_dst:y_dst+d, x_dst:x_dst+d] = dst_patch
-    except Exception as e:
-        # Spectrum transfer failed
-        print(f"  [WARNING] Circle patch spectrum transfer failed: {e}")
-        return False, None, [], None
-
+    
+    # Mettre à jour l'occupation
     update_occ(occ, circle_mask, x_dst, y_dst)
 
+    # Créer le polygone principal
     contours = find_contour_polygons(circle_mask)
     if not contours:
         return False, None, [], None
@@ -422,11 +472,13 @@ def place_circle_patch(plot, occ, cube, zone_poly, hdr_path=None):
     poly[:, 1] += y_dst
 
     trou_shapes = []
+    
+    # Ajouter les trous existants du JSON source
     if hdr_path is not None:
         trou_pts_list = load_trou_json(hdr_path)
         if trou_pts_list:
-            src_region = box(src_x, src_y, src_x + d, src_y + d)
-            clipped_to_src = clip_trous_to_region(trou_pts_list, src_region, src_x, src_y)
+            src_region_box = box(src_x, src_y, src_x + d, src_y + d)
+            clipped_to_src = clip_trous_to_region(trou_pts_list, src_region_box, src_x, src_y)
 
             circle_poly = Polygon([(p[0], p[1]) for p in
                                    np.column_stack(np.where(circle_mask))[:, ::-1].tolist()])
@@ -451,6 +503,20 @@ def place_circle_patch(plot, occ, cube, zone_poly, hdr_path=None):
                     final.append(coords)
 
             trou_shapes = trous_to_shapes(final, x_dst, y_dst)
+    
+    # Ajouter les nouveaux trous détectés (pixels nuls)
+    if trou_mask.any():
+        trou_contours = find_contour_polygons(trou_mask)
+        for contour in trou_contours:
+            if len(contour) >= 3:
+                abs_contour = [[p[0] + x_dst, p[1] + y_dst] for p in contour]
+                trou_shapes.append({
+                    "label": "trou",
+                    "points": abs_contour,
+                    "shape_type": "polygon",
+                    "flags": {},
+                    "group_id": None,
+                })
 
     return True, poly.tolist(), trou_shapes, plot
 
@@ -684,7 +750,6 @@ def generate(plot_root, extrude_root, out_dir):
                   f"trous: {len(trou_polys):>2}  {dict(counter)}")
         else:
             print(f"Plot {i:>4}  [{plot_hdr.stem}]  FAILED - No extrudes placed successfully, skipping save")
-            # Return unused extrudes to pool (they remain in raw_pool for future batches)
 
     print("\n[RESUME] Placements reels par classe :")
     for cls, cnt in sorted(counter.items()):
