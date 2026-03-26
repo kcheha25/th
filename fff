@@ -90,6 +90,7 @@ def find_contour_polygons(mask):
     for c in contours:
         pts = c.reshape(-1, 2).tolist()
         if len(pts) >= 3:
+            # Garder en float pour la cohérence avec le reste du code
             polys.append(pts)
     return polys
 
@@ -118,7 +119,8 @@ def zone_bbox(zone_poly, H, W):
     cols = np.where(zone_mask.any(axis=0))[0]
     if len(rows) == 0 or len(cols) == 0:
         return 0, H, 0, W
-    return rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+    # Convertir en Python int pour éviter les problèmes numpy
+    return int(rows[0]), int(rows[-1] + 1), int(cols[0]), int(cols[-1] + 1)
 
 
 def _crop_extrude(cube, mask, th, tw):
@@ -196,7 +198,7 @@ def clip_trous_to_region(trou_pts_list, region_box, offset_x, offset_y):
             coords = list(part.exterior.coords[:-1])
             if len(coords) < 3:
                 continue
-            rel_pts = [[round(x - offset_x, 2), round(y - offset_y, 2)]
+            rel_pts = [[float(round(x - offset_x, 2)), float(round(y - offset_y, 2))]
                        for x, y in coords]
             result.append(rel_pts)
     return result
@@ -226,7 +228,7 @@ def load_trou_json(hdr_path):
 
 def translate_points(points, x_offset, y_offset):
     return [
-        [round(p[0] + x_offset, 2), round(p[1] + y_offset, 2)]
+        [float(round(p[0] + x_offset, 2)), float(round(p[1] + y_offset, 2))]
         for p in points
     ]
 
@@ -369,6 +371,8 @@ def place_full(plot, occ, cube, extrude_mask, zone_poly, hdr_path=None, all_plot
     poly = np.array(contours[0])
     poly[:, 0] += x
     poly[:, 1] += y
+    # Convertir en float pour JSON
+    poly = [[float(p[0]), float(p[1])] for p in poly]
 
     trou_shapes = []
     
@@ -381,12 +385,11 @@ def place_full(plot, occ, cube, extrude_mask, zone_poly, hdr_path=None, all_plot
     
     # Ajouter les nouveaux trous détectés (pixels nuls)
     if trou_mask.any():
-        # Trouver les contours des zones de pixels nuls
         trou_contours = find_contour_polygons(trou_mask)
         for contour in trou_contours:
             if len(contour) >= 3:
-                # Convertir en coordonnées absolues
-                abs_contour = [[p[0] + x, p[1] + y] for p in contour]
+                # Convertir en coordonnées absolues avec des floats
+                abs_contour = [[float(p[0] + x), float(p[1] + y)] for p in contour]
                 trou_shapes.append({
                     "label": "trou",
                     "points": abs_contour,
@@ -395,7 +398,7 @@ def place_full(plot, occ, cube, extrude_mask, zone_poly, hdr_path=None, all_plot
                     "group_id": None,
                 })
 
-    return True, poly.tolist(), trou_shapes, plot
+    return True, poly, trou_shapes, plot
 
 
 def place_circle_patch(plot, occ, cube, zone_poly, hdr_path=None):
@@ -470,6 +473,8 @@ def place_circle_patch(plot, occ, cube, zone_poly, hdr_path=None):
     poly = np.array(contours[0])
     poly[:, 0] += x_dst
     poly[:, 1] += y_dst
+    # Convertir en float pour JSON
+    poly = [[float(p[0]), float(p[1])] for p in poly]
 
     trou_shapes = []
     
@@ -509,7 +514,7 @@ def place_circle_patch(plot, occ, cube, zone_poly, hdr_path=None):
         trou_contours = find_contour_polygons(trou_mask)
         for contour in trou_contours:
             if len(contour) >= 3:
-                abs_contour = [[p[0] + x_dst, p[1] + y_dst] for p in contour]
+                abs_contour = [[float(p[0] + x_dst), float(p[1] + y_dst)] for p in contour]
                 trou_shapes.append({
                     "label": "trou",
                     "points": abs_contour,
@@ -518,7 +523,7 @@ def place_circle_patch(plot, occ, cube, zone_poly, hdr_path=None):
                     "group_id": None,
                 })
 
-    return True, poly.tolist(), trou_shapes, plot
+    return True, poly, trou_shapes, plot
 
 
 def try_place_full(plot, occ, cube, mask, zones, hdr_path=None, all_plots=None):
