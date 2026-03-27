@@ -895,4 +895,3 @@ def generate(plot_root, extrude_root, out_dir):
 if __name__ == "__main__":
     generate("plots_zone_to_add", "aug_after_rot_flip", "output")
 
-However, several existing works use traditional spectral methodologies such as the Spectral Angle Mapper (SAM), as well as unsupervised approaches like K-means. [13] proposes an hsi classification framework that combines empirical ensemble modal decomposition (EEMD) with k-means and hierarchical clustering to reconstruct an improved spectrum, and then these reconstructed spectra are fed into a SAM-based classifier.
