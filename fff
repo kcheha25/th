@@ -895,3 +895,24 @@ def generate(plot_root, extrude_root, out_dir):
 if __name__ == "__main__":
     generate("plots_zone_to_add", "aug_after_rot_flip", "output")
 
+from PIL import Image
+import os
+
+dossier_images = "images"
+fichiers = sorted(os.listdir(dossier_images))
+
+images = []
+
+for fichier in fichiers:
+    if fichier.endswith((".png", ".jpg", ".jpeg")):
+        chemin = os.path.join(dossier_images, fichier)
+        img = Image.open(chemin)
+        images.append(img)
+
+images[0].save(
+    "animation.gif",
+    save_all=True,
+    append_images=images[1:],
+    duration=500,
+    loop=0
+)
