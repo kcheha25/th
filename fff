@@ -895,3 +895,4 @@ def generate(plot_root, extrude_root, out_dir):
 if __name__ == "__main__":
     generate("plots_zone_to_add", "aug_after_rot_flip", "output")
 
+Similarly, [10] addressed the lack of spatial context exploitation, a weakness of standard KNN, by combining spectral KNN with guide filter post-processing. The image is first classified using JKNN, an improved version of KNN that takes into account a pixel window using a set-point distance, then the classification is converted into class probability maps to which a guide filter is then applied to correct and denoise the final classification map.
