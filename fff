@@ -686,6 +686,8 @@ def generate(plot_root, extrude_root, out_dir):
     
     plot_index = 0
     remaining_extrudes = available_pool.copy()
+    max_attempts_per_extrude = 10
+    attempt_counter = defaultdict(int)
     
     while remaining_extrudes:
         batch_size = random.randint(MIN_PATCHES, MAX_PATCHES)
@@ -694,9 +696,7 @@ def generate(plot_root, extrude_root, out_dir):
         batch_indices = random.sample(range(len(remaining_extrudes)), batch_size)
         batch = [remaining_extrudes[i] for i in sorted(batch_indices)]
         
-        remaining_extrudes = [e for i, e in enumerate(remaining_extrudes) if i not in batch_indices]
-        
-        print(f"\n[PLOT {plot_index}] Création avec {len(batch)} extrudes, reste {len(remaining_extrudes)} extrudes")
+        print(f"\n[PLOT {plot_index}] Tentative avec {len(batch)} extrudes, reste {len(remaining_extrudes)} extrudes")
         
         successful_placement = False
         plot_hdr = random.choice(plots)
@@ -704,6 +704,9 @@ def generate(plot_root, extrude_root, out_dir):
         _, H, W = plot.shape
         occ = np.zeros((H, W), bool)
         shapes = []
+        
+        successfully_placed = []
+        failed_this_plot = []
         
         singles = [e for e in batch if e["class"] in SINGLE_CLASSES]
         
@@ -714,8 +717,6 @@ def generate(plot_root, extrude_root, out_dir):
             cube_e, mask_e = crop_to_valid(cube_e, mask_e)
             strat = random.choice([1, 2])
             
-            used_in_plot = []
-            
             if strat == 1:
                 ok, poly, trous, updated_plot = try_place_full(
                     plot, occ, cube_e, mask_e, zones,
@@ -725,7 +726,7 @@ def generate(plot_root, extrude_root, out_dir):
                     shapes = [{"label": e["class"], "points": poly, "shape_type": "polygon"}]
                     shapes.extend(trous)
                     counter[e["class"]] += 1
-                    used_in_plot.append(e)
+                    successfully_placed.append(e)
                     successful_placement = True
                     
                     for e2 in [x for x in batch if x != e]:
@@ -740,13 +741,17 @@ def generate(plot_root, extrude_root, out_dir):
                             shapes.append({"label": e2["class"], "points": poly2, "shape_type": "polygon"})
                             shapes.extend(trous2)
                             counter[e2["class"]] += 1
-                            used_in_plot.append(e2)
+                            successfully_placed.append(e2)
                         else:
+                            failed_this_plot.append(e2)
                             failed_attempts[e2["class"]] += 1
-                            print(f"  [WARNING] Failed to place extrude {e2['hdr'].stem}")
+                            attempt_counter[e2["hdr"]] += 1
+                            print(f"  [WARNING] Failed to place extrude {e2['hdr'].stem} (attempt {attempt_counter[e2['hdr']]})")
                 else:
+                    failed_this_plot.append(e)
                     failed_attempts[e["class"]] += 1
-                    print(f"  [WARNING] Failed to place extrude {e['hdr'].stem}")
+                    attempt_counter[e["hdr"]] += 1
+                    print(f"  [WARNING] Failed to place extrude {e['hdr'].stem} (attempt {attempt_counter[e['hdr']]})")
             else:
                 ok, poly, trous, updated_plot = try_place_circle_patch(
                     plot, occ, cube_e, zones, hdr_path=e["hdr"])
@@ -755,7 +760,7 @@ def generate(plot_root, extrude_root, out_dir):
                     shapes.append({"label": e["class"], "points": poly, "shape_type": "polygon"})
                     shapes.extend(trous)
                     counter[e["class"]] += 1
-                    used_in_plot.append(e)
+                    successfully_placed.append(e)
                     successful_placement = True
                     
                     for e2 in [x for x in batch if x != e]:
@@ -770,15 +775,18 @@ def generate(plot_root, extrude_root, out_dir):
                             shapes.append({"label": e2["class"], "points": poly2, "shape_type": "polygon"})
                             shapes.extend(trous2)
                             counter[e2["class"]] += 1
-                            used_in_plot.append(e2)
+                            successfully_placed.append(e2)
                         else:
+                            failed_this_plot.append(e2)
                             failed_attempts[e2["class"]] += 1
-                            print(f"  [WARNING] Failed to place extrude {e2['hdr'].stem}")
+                            attempt_counter[e2["hdr"]] += 1
+                            print(f"  [WARNING] Failed to place extrude {e2['hdr'].stem} (attempt {attempt_counter[e2['hdr']]})")
                 else:
+                    failed_this_plot.append(e)
                     failed_attempts[e["class"]] += 1
-                    print(f"  [WARNING] Failed to place extrude {e['hdr'].stem}")
+                    attempt_counter[e["hdr"]] += 1
+                    print(f"  [WARNING] Failed to place extrude {e['hdr'].stem} (attempt {attempt_counter[e['hdr']]})")
         else:
-            used_in_plot = []
             for e in batch:
                 cube, _ = load_cube(e["hdr"])
                 mask = get_valid_mask_fast(cube)
@@ -791,11 +799,13 @@ def generate(plot_root, extrude_root, out_dir):
                     shapes.append({"label": e["class"], "points": poly, "shape_type": "polygon"})
                     shapes.extend(trous)
                     counter[e["class"]] += 1
-                    used_in_plot.append(e)
+                    successfully_placed.append(e)
                     successful_placement = True
                 else:
+                    failed_this_plot.append(e)
                     failed_attempts[e["class"]] += 1
-                    print(f"  [WARNING] Failed to place extrude {e['hdr'].stem}")
+                    attempt_counter[e["hdr"]] += 1
+                    print(f"  [WARNING] Failed to place extrude {e['hdr'].stem} (attempt {attempt_counter[e['hdr']]})")
         
         if successful_placement and shapes:
             name = f"aug_{plot_index}"
@@ -813,21 +823,33 @@ def generate(plot_root, extrude_root, out_dir):
             save_labelme_json(out_dir / f"{name}.json", shapes, f"{name}.png", H, W)
             
             print(f"  -> SUCCÈS: {len(extrude_polys)} patches placés, {len(trou_polys)} trous")
+            print(f"  -> Placés: {len(successfully_placed)} | Échoués: {len(failed_this_plot)}")
             
-            used_extrudes.extend(used_in_plot)
+            used_extrudes.extend(successfully_placed)
             plot_index += 1
+            
+            for e in successfully_placed:
+                if e in remaining_extrudes:
+                    remaining_extrudes.remove(e)
+            
+            for e in failed_this_plot:
+                if attempt_counter[e["hdr"]] >= max_attempts_per_extrude:
+                    print(f"  -> Extrude {e['hdr'].stem} a échoué {max_attempts_per_extrude} fois, abandon")
+                    if e in remaining_extrudes:
+                        remaining_extrudes.remove(e)
+                else:
+                    print(f"  -> Extrude {e['hdr'].stem} reste dans la pool pour réessayer")
         else:
-            print(f"  -> ÉCHEC: Aucun extrude placé avec succès")
-            remaining_extrudes.extend(batch)
-            random.shuffle(remaining_extrudes)
-            print(f"  -> Les {len(batch)} extrudes sont remis dans la pool pour réessayer")
+            print(f"  -> ÉCHEC COMPLET: Aucun extrude placé avec succès")
+            print(f"  -> Tous les {len(failed_this_plot)} extrudes restent dans la pool pour réessayer")
         
         used_count = len(used_extrudes)
         if used_count % 20 == 0 and used_count > 0:
             print(f"\n[PROGRESSION] {used_count}/{total_extrudes} extrudes utilisés, {plot_index} plots générés")
+            print(f"[PROGRESSION] Encore {len(remaining_extrudes)} extrudes dans la pool")
         
-        if len(remaining_extrudes) == len(batch) and not successful_placement:
-            print(f"[WARNING] Aucun progrès, réorganisation de la pool restante...")
+        if len(remaining_extrudes) == total_extrudes - len(used_extrudes) and plot_index > 0 and plot_index % 50 == 0:
+            print(f"[INFO] Réorganisation de la pool restante...")
             random.shuffle(remaining_extrudes)
     
     print("\n" + "="*60)
@@ -842,16 +864,34 @@ def generate(plot_root, extrude_root, out_dir):
     print("\n[RESUME] Échecs par classe :")
     for cls, cnt in sorted(failed_attempts.items()):
         print(f"  {cls}: {cnt}")
+    
+    print("\n[RESUME] Extrudes abandonnés après échecs répétés:")
+    abandoned = []
+    for e, attempts in attempt_counter.items():
+        if attempts >= max_attempts_per_extrude and e not in [x["hdr"] for x in used_extrudes]:
+            abandoned.append(e)
+    for e in abandoned:
+        print(f"  {Path(e).stem}")
+    
     counts = list(counter.values())
     if counts:
-        print(f"  min={min(counts)}  max={max(counts)}  écart={max(counts) - min(counts)}")
+        print(f"\n  min={min(counts)}  max={max(counts)}  écart={max(counts) - min(counts)}")
     
     used_path = out_dir / "used_extrudes.txt"
     with open(used_path, "w") as f:
         for e in used_extrudes:
             f.write(f"{e['hdr']}\n")
+    
+    failed_path = out_dir / "failed_extrudes.txt"
+    with open(failed_path, "w") as f:
+        for e, attempts in attempt_counter.items():
+            if attempts >= max_attempts_per_extrude:
+                f.write(f"{e}\n")
+    
     print(f"\n[INFO] Liste des extrudes utilisés sauvegardée dans {used_path}")
+    print(f"[INFO] Liste des extrudes abandonnés sauvegardée dans {failed_path}")
 
 
 if __name__ == "__main__":
     generate("plots_zone_to_add", "aug_after_rot_flip", "output")
+
