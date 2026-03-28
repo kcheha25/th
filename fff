@@ -916,4 +916,8 @@ images[0].save(
     duration=500,
     loop=0
 )
-Plus un pixel est éloigné de la frontière, plus il reste intact, tandis que plus il s’en rapproche, plus le poids de mélange augmente.
+À la suite des questionnements la dernière fois sur la distribution des spectres, l’homogénéité des spectres au sein d’un même extrudé et entre extrudés de la même classe, il y aura une partie consacrée à la visualisation des spectres.
+Ce qui a été fait pour contourner l’hétérogénéité qu’on pourrait avoir au sein des extrudés, et pour faire en sorte de garder la même distribution de spectres pour les différentes classes d’extrudés.
+La génération des extrudés augmentés.
+Le remplissage et la génération de plots de résine vides.
+La génération de plots augmentés finaux, contenant les différents extrudés augmentés.
