@@ -918,14 +918,9 @@ images[0].save(
 )
 
 
-Cube hyperspectral
-Diffusion de Laplace
-Chaque pixel masqué est remplacé par une moyenne pondérée
-de lui-même et de ses 4 voisins, répétée sur n itérations.
-Extraction de texture
-La texture haute fréquence est extraite des zones réelles
-via un filtre bilatéral, pour être réinjectée plus tard.
-Netteté et fusion finale
-La zone reconstruite est affinée par unsharp masking,
-enrichie de la texture réelle, puis ramenée à l'échelle d'origine.
-Cube restauré
+1 — Localiser la frontière
+On repère une bande étroite de pixels
+de chaque côté de la limite du masque.
+2 — Pondérer selon la distance
+Un pixel loin de la frontière reste intact.
+Un pixel proche est de plus en plus mélangé.
