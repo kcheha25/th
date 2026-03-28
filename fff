@@ -916,3 +916,16 @@ images[0].save(
     duration=500,
     loop=0
 )
+
+
+Cube hyperspectral
+Diffusion de Laplace
+Chaque pixel masqué est remplacé par une moyenne pondérée
+de lui-même et de ses 4 voisins, répétée sur n itérations.
+Extraction de texture
+La texture haute fréquence est extraite des zones réelles
+via un filtre bilatéral, pour être réinjectée plus tard.
+Netteté et fusion finale
+La zone reconstruite est affinée par unsharp masking,
+enrichie de la texture réelle, puis ramenée à l'échelle d'origine.
+Cube restauré
