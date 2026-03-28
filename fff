@@ -917,10 +917,9 @@ images[0].save(
     loop=0
 )
 
-
-1 — Localiser la frontière
-On repère une bande étroite de pixels
-de chaque côté de la limite du masque.
-2 — Pondérer selon la distance
-Un pixel loin de la frontière reste intact.
-Un pixel proche est de plus en plus mélangé.
+Localisation de la frontière
+Distance de chaque pixel au bord du masque calculée,
+côté réel et côté reconstruit.
+2 — Pondération par la distance
+Loin de la frontière → pixel intact.
+Proche de la frontière → poids de mélange croissant.
