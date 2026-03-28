@@ -916,10 +916,4 @@ images[0].save(
     duration=500,
     loop=0
 )
-
-Localisation de la frontière
-Distance de chaque pixel au bord du masque calculée,
-côté réel et côté reconstruit.
-2 — Pondération par la distance
-Loin de la frontière → pixel intact.
-Proche de la frontière → poids de mélange croissant.
+Plus un pixel est éloigné de la frontière, plus il reste intact, tandis que plus il s’en rapproche, plus le poids de mélange augmente.
