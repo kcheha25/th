@@ -916,8 +916,129 @@ images[0].save(
     duration=500,
     loop=0
 )
-À la suite des questionnements la dernière fois sur la distribution des spectres, l’homogénéité des spectres au sein d’un même extrudé et entre extrudés de la même classe, il y aura une partie consacrée à la visualisation des spectres.
-Ce qui a été fait pour contourner l’hétérogénéité qu’on pourrait avoir au sein des extrudés, et pour faire en sorte de garder la même distribution de spectres pour les différentes classes d’extrudés.
-La génération des extrudés augmentés.
-Le remplissage et la génération de plots de résine vides.
-La génération de plots augmentés finaux, contenant les différents extrudés augmentés.
+
+
+def generate_from_failed(failed_file, plot_root, extrude_root, out_dir):
+    plots = list(Path(plot_root).rglob("*.hdr"))
+    out_dir = Path(out_dir)
+    out_dir.mkdir(exist_ok=True)
+    
+    with open(failed_file, 'r') as f:
+        failed_paths = [line.strip() for line in f.readlines()]
+    
+    failed_extrudes = []
+    for path in failed_paths:
+        hdr_path = Path(path)
+        if hdr_path.exists():
+            failed_extrudes.append({"hdr": hdr_path, "class": get_class(hdr_path.stem)})
+    
+    total_failed = len(failed_extrudes)
+    print(f"[INFO] Total extrudes à traiter depuis failed: {total_failed}")
+    print(f"[INFO] Nombre de plots disponibles: {len(plots)}")
+    
+    random.shuffle(failed_extrudes)
+    
+    counter = defaultdict(int)
+    used_extrudes = []
+    plot_index = 0
+    remaining_extrudes = failed_extrudes.copy()
+    
+    while remaining_extrudes:
+        batch_size = random.randint(MIN_PATCHES, MAX_PATCHES)
+        batch_size = min(batch_size, len(remaining_extrudes))
+        
+        batch_indices = random.sample(range(len(remaining_extrudes)), batch_size)
+        batch = [remaining_extrudes[i] for i in sorted(batch_indices)]
+        
+        print(f"\n[PLOT {plot_index}] Tentative avec {len(batch)} extrudes (mode cercle), reste {len(remaining_extrudes)} extrudes")
+        
+        plot_hdr = random.choice(plots)
+        plot, zones, img = load_plot(plot_hdr)
+        _, H, W = plot.shape
+        occ = np.zeros((H, W), bool)
+        shapes = []
+        
+        successfully_placed = []
+        
+        for e in batch:
+            cube_e, _ = load_cube(e["hdr"])
+            mask_e = get_valid_mask_fast(cube_e)
+            cube_e, mask_e = crop_to_valid(cube_e, mask_e)
+            
+            ok, poly, trous, updated_plot = try_place_circle_patch(
+                plot, occ, cube_e, zones, hdr_path=e["hdr"])
+            
+            if ok:
+                plot = updated_plot
+                shapes.append({"label": e["class"], "points": poly, "shape_type": "polygon"})
+                shapes.extend(trous)
+                counter[e["class"]] += 1
+                successfully_placed.append(e)
+                print(f"  -> Placé: {e['hdr'].stem}")
+            else:
+                print(f"  -> Échec: {e['hdr'].stem}")
+        
+        if shapes:
+            name = f"aug_circle_{plot_index}"
+            save_envi_cube(plot, out_dir / name)
+            
+            b1 = get_band_index(img, WAVELENGTH_1)
+            b2 = get_band_index(img, WAVELENGTH_2)
+            ratio = compute_ratio_map(plot, b1, b2)
+            
+            extrude_polys = [s["points"] for s in shapes if s["label"] != "trou"]
+            trou_polys = [s["points"] for s in shapes if s["label"] == "trou"]
+            
+            save_ratio_plain(ratio, out_dir / f"{name}.png")
+            save_ratio_with_contours(ratio, extrude_polys, trou_polys, out_dir / f"{name}_ratio.png")
+            save_labelme_json(out_dir / f"{name}.json", shapes, f"{name}.png", H, W)
+            
+            print(f"  -> SUCCÈS: {len(extrude_polys)} patches placés, {len(trou_polys)} trous")
+            
+            used_extrudes.extend(successfully_placed)
+            plot_index += 1
+            
+            for e in successfully_placed:
+                if e in remaining_extrudes:
+                    remaining_extrudes.remove(e)
+        else:
+            print(f"  -> ÉCHEC COMPLET: Aucun extrude placé avec succès")
+        
+        if len(remaining_extrudes) > 0 and plot_index % 50 == 0:
+            print(f"\n[PROGRESSION] {len(used_extrudes)}/{total_failed} extrudes utilisés, {plot_index} plots générés")
+    
+    print("\n" + "="*60)
+    print(f"[RESUME FINAL - MODE CERCLE]")
+    print(f"  Total extrudes à traiter: {total_failed}")
+    print(f"  Extrudes utilisés avec succès: {len(used_extrudes)}")
+    print(f"  Extrudes jamais utilisés: {total_failed - len(used_extrudes)}")
+    print(f"  Nombre de plots générés: {plot_index}")
+    print("\n[RESUME] Placements par classe :")
+    for cls, cnt in sorted(counter.items()):
+        print(f"  {cls}: {cnt}")
+    
+    used_path = out_dir / "used_from_failed.txt"
+    with open(used_path, "w") as f:
+        for e in used_extrudes:
+            f.write(f"{e['hdr']}\n")
+    
+    remaining_path = out_dir / "still_failed.txt"
+    still_failed = [e for e in remaining_extrudes if e not in used_extrudes]
+    with open(remaining_path, "w") as f:
+        for e in still_failed:
+            f.write(f"{e['hdr']}\n")
+    
+    print(f"\n[INFO] Liste des extrudes utilisés sauvegardée dans {used_path}")
+    print(f"[INFO] Liste des extrudes encore en échec sauvegardée dans {remaining_path}")
+
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--failed":
+        generate_from_failed(sys.argv[2], "plots_zone_to_add", "aug_after_rot_flip", "output_circle")
+    else:
+        generate("plots_zone_to_add", "aug_after_rot_flip", "output")
+
+
+generate_from_failed("output/first_pass/failed_extrudes.txt", "plots_zone_to_add", "aug_after_rot_flip", "output_circle")
