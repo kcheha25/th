@@ -1130,6 +1130,8 @@ def process_cubes(ann_dir, hsi_subdir="hsi_cube", output_dir="output"):
 
     cube_folders = sorted([d for d in hsi_dir.iterdir() if d.is_dir()])
 
+    global_idx = 0
+
     for cube_folder in cube_folders:
         cube_name = cube_folder.name
         json_path = ann_dir / f"{cube_name}.json"
@@ -1149,10 +1151,10 @@ def process_cubes(ann_dir, hsi_subdir="hsi_cube", output_dir="output"):
         others = [s for s in annotation["shapes"] if s["shape_type"] != "rectangle"]
 
         if not plots:
+            print(f"[SKIP] Aucun plot rectangle dans {cube_name}")
             continue
 
-        for plot_idx, plot in enumerate(plots):
-            plot_label = plot.get("label", f"plot_{plot_idx}")
+        for plot in plots:
             x1, y1, x2, y2 = bbox_from_points(plot["points"])
 
             x1c, y1c = max(0, x1), max(0, y1)
@@ -1161,12 +1163,13 @@ def process_cubes(ann_dir, hsi_subdir="hsi_cube", output_dir="output"):
             cube_crop  = cube[y1c:y2c, :, x1c:x2c]
             ratio_crop = ratio[y1c:y2c, x1c:x2c]
 
-            safe_label = plot_label.replace(" ", "_")
-            plot_out = out_dir / cube_name / safe_label
+            plot_out = out_dir / f"plot_{global_idx}"
             plot_out.mkdir(parents=True, exist_ok=True)
 
             save_envi_cube(str(plot_out / "cube"), cube_crop, wavelengths)
-            save_ratio_png(str(plot_out / "ratio_996_1197"), ratio_crop)
+
+            ratio_filename = f"plot_{global_idx}_ratio"
+            save_ratio_png(str(plot_out / ratio_filename), ratio_crop)
 
             local_shapes = crop_shapes(others, x1c, y1c, x2c, y2c)
 
@@ -1174,7 +1177,7 @@ def process_cubes(ann_dir, hsi_subdir="hsi_cube", output_dir="output"):
                 "version": annotation.get("version", "5.0"),
                 "flags": {},
                 "shapes": local_shapes,
-                "imagePath": "ratio_996_1197.png",
+                "imagePath": f"{ratio_filename}.png",
                 "imageData": None,
                 "imageHeight": int(y2c - y1c),
                 "imageWidth":  int(x2c - x1c),
@@ -1182,6 +1185,9 @@ def process_cubes(ann_dir, hsi_subdir="hsi_cube", output_dir="output"):
 
             with open(plot_out / "annotations.json", "w") as f:
                 json.dump(local_ann, f, indent=2)
+
+            print(f"plot_{global_idx} sauvegardé ({cube_name})")
+            global_idx += 1
 
 
 if __name__ == "__main__":
