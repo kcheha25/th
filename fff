@@ -1163,13 +1163,10 @@ def process_cubes(ann_dir, hsi_subdir="hsi_cube", output_dir="output"):
             cube_crop  = cube[y1c:y2c, :, x1c:x2c]
             ratio_crop = ratio[y1c:y2c, x1c:x2c]
 
-            plot_out = out_dir / f"plot_{global_idx}"
-            plot_out.mkdir(parents=True, exist_ok=True)
-
-            save_envi_cube(str(plot_out / "cube"), cube_crop, wavelengths)
+            save_envi_cube(str(out_dir / f"plot_{global_idx}_cube"), cube_crop, wavelengths)
 
             ratio_filename = f"plot_{global_idx}_ratio"
-            save_ratio_png(str(plot_out / ratio_filename), ratio_crop)
+            save_ratio_png(str(out_dir / ratio_filename), ratio_crop)
 
             local_shapes = crop_shapes(others, x1c, y1c, x2c, y2c)
 
@@ -1183,7 +1180,7 @@ def process_cubes(ann_dir, hsi_subdir="hsi_cube", output_dir="output"):
                 "imageWidth":  int(x2c - x1c),
             }
 
-            with open(plot_out / "annotations.json", "w") as f:
+            with open(out_dir / f"plot_{global_idx}_annotations.json", "w") as f:
                 json.dump(local_ann, f, indent=2)
 
             print(f"plot_{global_idx} sauvegardé ({cube_name})")
