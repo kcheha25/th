@@ -1042,3 +1042,151 @@ if __name__ == "__main__":
 
 
 generate_from_failed("output/first_pass/failed_extrudes.txt", "plots_zone_to_add", "aug_after_rot_flip", "output_circle")
+
+
+import json
+import numpy as np
+import specarray as sa
+import matplotlib.pyplot as plt
+from spectral import envi
+from pathlib import Path
+
+
+def load_cube(folder):
+    arr = sa.SpecArray.from_folder(folder)
+    arr = arr.spectral_albedo()
+    cube = arr.array
+    metadata = {"wavelength": arr.wavelengths}
+    return cube, metadata
+
+
+def load_annotation(json_path):
+    with open(json_path, "r") as f:
+        return json.load(f)
+
+
+def bbox_from_points(points):
+    pts = np.array(points)
+    x1, y1 = pts[:, 0].min(), pts[:, 1].min()
+    x2, y2 = pts[:, 0].max(), pts[:, 1].max()
+    return int(x1), int(y1), int(x2), int(y2)
+
+
+def find_band(wavelengths, target_nm):
+    wavelengths = np.array(wavelengths, dtype=float)
+    return int(np.argmin(np.abs(wavelengths - target_nm)))
+
+
+def compute_ratio(cube, metadata):
+    i1 = find_band(metadata["wavelength"], 996)
+    i2 = find_band(metadata["wavelength"], 1197)
+    ratio = cube[:, i1, :] / (cube[:, i2, :] + 1e-6)
+    return ratio.astype(np.float32)
+
+
+def crop_shapes(shapes, x1, y1, x2, y2):
+    cropped = []
+    for shape in shapes:
+        pts = np.array(shape["points"])
+        cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+        if x1 <= cx <= x2 and y1 <= cy <= y2:
+            new_pts = (pts - [x1, y1]).tolist()
+            new_shape = shape.copy()
+            new_shape["points"] = new_pts
+            cropped.append(new_shape)
+    return cropped
+
+
+def save_envi_cube(file_path, cube_crop, wavelengths):
+    envi.save_image(
+        file_path + ".hdr",
+        cube_crop.astype(np.float32),
+        dtype=np.float32,
+        interleave="bil",
+        metadata={
+            "wavelength": [str(w) for w in wavelengths],
+            "wavelength units": "nm",
+        },
+        force=True,
+    )
+
+
+def save_ratio_png(file_path, ratio_crop):
+    fig, ax = plt.subplots(figsize=(6, 4))
+    im = ax.imshow(ratio_crop, cmap="RdYlGn")
+    plt.colorbar(im, ax=ax, label="ratio 996/1197")
+    ax.set_title("Ratio 996 / 1197 nm")
+    ax.axis("off")
+    plt.tight_layout()
+    plt.savefig(file_path + ".png", dpi=150)
+    plt.close()
+
+
+def process_cubes(ann_dir, hsi_subdir="hsi_cube", output_dir="output"):
+    ann_dir = Path(ann_dir)
+    hsi_dir = ann_dir / hsi_subdir
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cube_folders = sorted([d for d in hsi_dir.iterdir() if d.is_dir()])
+
+    for cube_folder in cube_folders:
+        cube_name = cube_folder.name
+        json_path = ann_dir / f"{cube_name}.json"
+
+        if not json_path.exists():
+            print(f"[SKIP] Pas d'annotation pour {cube_name}")
+            continue
+
+        cube, metadata = load_cube(str(cube_folder))
+        annotation = load_annotation(json_path)
+        wavelengths = metadata["wavelength"]
+
+        H, B, W = cube.shape
+        ratio = compute_ratio(cube, metadata)
+
+        plots  = [s for s in annotation["shapes"] if s["shape_type"] == "rectangle"]
+        others = [s for s in annotation["shapes"] if s["shape_type"] != "rectangle"]
+
+        if not plots:
+            continue
+
+        for plot_idx, plot in enumerate(plots):
+            plot_label = plot.get("label", f"plot_{plot_idx}")
+            x1, y1, x2, y2 = bbox_from_points(plot["points"])
+
+            x1c, y1c = max(0, x1), max(0, y1)
+            x2c, y2c = min(W, x2), min(H, y2)
+
+            cube_crop  = cube[y1c:y2c, :, x1c:x2c]
+            ratio_crop = ratio[y1c:y2c, x1c:x2c]
+
+            safe_label = plot_label.replace(" ", "_")
+            plot_out = out_dir / cube_name / safe_label
+            plot_out.mkdir(parents=True, exist_ok=True)
+
+            save_envi_cube(str(plot_out / "cube"), cube_crop, wavelengths)
+            save_ratio_png(str(plot_out / "ratio_996_1197"), ratio_crop)
+
+            local_shapes = crop_shapes(others, x1c, y1c, x2c, y2c)
+
+            local_ann = {
+                "version": annotation.get("version", "5.0"),
+                "flags": {},
+                "shapes": local_shapes,
+                "imagePath": "ratio_996_1197.png",
+                "imageData": None,
+                "imageHeight": int(y2c - y1c),
+                "imageWidth":  int(x2c - x1c),
+            }
+
+            with open(plot_out / "annotations.json", "w") as f:
+                json.dump(local_ann, f, indent=2)
+
+
+if __name__ == "__main__":
+    process_cubes(
+        ann_dir="ann",
+        hsi_subdir="hsi_cube",
+        output_dir="output",
+    )
