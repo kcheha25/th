@@ -1,0 +1,536 @@
+"""
+dataset.py — Pipeline HSI → SSFTTnet
+======================================
+
+Fonctionnalités :
+  - Mapping JSON : 60 classes extrudes → 12 classes finales
+  - Pixels non annotés (hors "trou") → classe "background"
+  - Split PLOT-LEVEL : un plot entier → train OU test OU val (jamais mixé)
+  - Deux modes de split :
+      * "aug_real" : augmentés → train+val  |  réels → test
+      * "shuffle"  : tous les plots mélangés → split train/val/test
+  - PCA optionnelle (argument)
+  - Patches 13×13 créés APRÈS le split
+
+Utilisation
+-----------
+    from dataset import build_loaders
+
+    train_loader, val_loader, test_loader, meta = build_loaders(
+        output_dir     = "output",
+        circle_dir     = "output_circle",
+        mapping_path   = "mapping.json",
+        split_mode     = "aug_real",   # ou "shuffle"
+        use_pca        = True,
+        pca_components = 30,
+        test_ratio     = 0.15,         # uniquement si split_mode="shuffle"
+        val_ratio      = 0.15,         # uniquement si split_mode="shuffle"
+        patch_size     = 13,
+        batch_size     = 64,
+        random_state   = 345,
+    )
+
+    print(meta["class_names"])   # 12 classes finales + background
+    print(meta["num_classes"])
+
+Format mapping.json attendu
+----------------------------
+    {
+        "classe_finale_1": ["A1", "A2", "F3"],
+        "classe_finale_2": ["B1", "B4"],
+        ...
+    }
+"""
+
+import json
+import random
+import re
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import torch
+from shapely.geometry import Point, Polygon
+from sklearn.decomposition import PCA
+from spectral import envi
+from torch.utils.data import DataLoader, Dataset
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  CHARGEMENT MAPPING JSON
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_mapping(mapping_path: str):
+    """
+    Lit mapping.json et retourne :
+      - extrude2final : dict  {label_extrude -> label_final}
+      - class_names   : list  labels finaux triés + ["background"] en dernier
+      - label2idx     : dict  {label_final -> int}
+    """
+    with open(mapping_path) as f:
+        raw = json.load(f)                        # {"final": ["A1","A2",...], ...}
+
+    extrude2final = {}
+    for final_class, extrude_list in raw.items():
+        for ext in extrude_list:
+            extrude2final[ext.strip()] = final_class
+
+    final_classes = sorted(raw.keys())
+    class_names   = final_classes + ["background"]
+    label2idx     = {name: i for i, name in enumerate(class_names)}
+
+    print(f"[MAPPING] {len(extrude2final)} labels extrudes "
+          f"-> {len(final_classes)} classes finales + background")
+    return extrude2final, class_names, label2idx
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  LOADER ENVI + LABELME
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_envi(hdr_path: Path):
+    img         = envi.open(str(hdr_path))
+    cube        = img.load().astype(np.float32)   # (H, B, W) BIL
+    wavelengths = [float(w) for w in img.metadata.get("wavelength", [])]
+    return cube, wavelengths
+
+
+def _load_shapes(json_path: Path):
+    with open(json_path) as f:
+        ann = json.load(f)
+    return ann.get("shapes", [])
+
+
+def _pair_real(directory: Path):
+    for hdr in sorted(directory.glob("plot_*_cube.hdr")):
+        m = re.match(r"plot_(\d+)_cube", hdr.stem)
+        if not m:
+            continue
+        jsn = directory / f"plot_{m.group(1)}_annotations.json"
+        if jsn.exists():
+            yield "real", hdr.stem, hdr, jsn
+
+
+def _pair_aug(directory: Path, prefix: str, source: str):
+    for hdr in sorted(directory.glob(f"{prefix}*.hdr")):
+        if any(hdr.stem.endswith(s) for s in ("_ratio", "_cube")):
+            continue
+        jsn = directory / f"{hdr.stem}.json"
+        if jsn.exists():
+            yield source, hdr.stem, hdr, jsn
+
+
+def iter_plots(output_dir="output", circle_dir="output_circle"):
+    output_dir = Path(output_dir)
+    circle_dir = Path(circle_dir)
+    pairs = []
+    if output_dir.exists():
+        pairs += list(_pair_real(output_dir))
+        pairs += list(_pair_aug(output_dir, "aug_", "aug"))
+    if circle_dir.exists():
+        pairs += list(_pair_aug(circle_dir, "aug_circle_", "circle"))
+
+    n_real = sum(1 for s, *_ in pairs if s == "real")
+    n_aug  = sum(1 for s, *_ in pairs if s in ("aug", "circle"))
+    print(f"[INFO] {len(pairs)} plots trouves ({n_real} reels | {n_aug} augmentes)")
+
+    for source, name, hdr, jsn in pairs:
+        try:
+            cube, wavelengths = _load_envi(hdr)
+            shapes            = _load_shapes(jsn)
+            yield {"source": source, "name": name,
+                   "cube": cube, "wavelengths": wavelengths, "shapes": shapes}
+        except Exception as e:
+            print(f"[WARN] {name} ignore : {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  CARTE DE LABELS PAR PLOT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _polygon_mask(points, H, W):
+    if len(points) < 3:
+        return np.zeros((H, W), dtype=bool)
+    poly = Polygon(points)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    xs  = [p[0] for p in points]
+    ys  = [p[1] for p in points]
+    c0, c1 = max(0, int(min(xs))), min(W - 1, int(max(xs)))
+    r0, r1 = max(0, int(min(ys))), min(H - 1, int(max(ys)))
+    mask = np.zeros((H, W), dtype=bool)
+    for r in range(r0, r1 + 1):
+        for c in range(c0, c1 + 1):
+            if poly.contains(Point(c + 0.5, r + 0.5)):
+                mask[r, c] = True
+    return mask
+
+
+def build_label_map(cube_HBW, shapes, extrude2final, label2idx):
+    """
+    Construit la carte de labels (H, W) :
+      - pixels non annotés             -> background
+      - pixels dans un polygon extrude -> classe mappée via extrude2final
+      - pixels dans "trou"             -> -1  (ignorés partout)
+
+    Retourne label_map (H, W) int64
+    """
+    H, B, W  = cube_HBW.shape
+    bg_idx   = label2idx["background"]
+
+    label_map = np.full((H, W), bg_idx, dtype=np.int64)
+    trou_mask = np.zeros((H, W), dtype=bool)
+
+    # 1) Marquer les trous en premier
+    for shape in shapes:
+        if (shape.get("label", "").lower() == "trou" and
+                shape.get("shape_type") in ("polygon", "rectangle")):
+            trou_mask |= _polygon_mask(shape["points"], H, W)
+
+    # 2) Appliquer les classes extrudes (par-dessus le background)
+    for shape in shapes:
+        raw_label = shape.get("label", "").strip()
+        stype     = shape.get("shape_type", "")
+        if raw_label.lower() == "trou" or stype not in ("polygon", "rectangle"):
+            continue
+        final = extrude2final.get(raw_label)
+        if final is None:
+            print(f"  [WARN] label '{raw_label}' absent du mapping -> ignore")
+            continue
+        mask = _polygon_mask(shape["points"], H, W)
+        label_map[mask] = label2idx[final]
+
+    # 3) Pixels trou -> -1
+    label_map[trou_mask] = -1
+    return label_map
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  SPLIT AU NIVEAU PLOT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def split_plots(plots_list, split_mode="aug_real",
+                val_ratio=0.15, test_ratio=0.15, random_state=345):
+    """
+    Divise les plots en train / val / test sans jamais mélanger les patches
+    d'un meme plot entre deux ensembles.
+
+    split_mode = "aug_real"
+        augmentes (aug|circle) -> train + val
+        reels     (real)       -> test  (tous)
+
+    split_mode = "shuffle"
+        melange tous les plots puis split proportionnel
+    """
+    rng = random.Random(random_state)
+
+    if split_mode == "aug_real":
+        aug  = [p for p in plots_list if p["source"] in ("aug", "circle")]
+        real = [p for p in plots_list if p["source"] == "real"]
+        rng.shuffle(aug)
+        n_val = max(1, int(len(aug) * val_ratio))
+        val   = aug[:n_val]
+        train = aug[n_val:]
+        test  = real
+        print(f"[SPLIT aug_real] train={len(train)} | val={len(val)} | test={len(test)}")
+
+    elif split_mode == "shuffle":
+        all_p = plots_list[:]
+        rng.shuffle(all_p)
+        n      = len(all_p)
+        n_test = max(1, int(n * test_ratio))
+        n_val  = max(1, int(n * val_ratio))
+        test   = all_p[:n_test]
+        val    = all_p[n_test:n_test + n_val]
+        train  = all_p[n_test + n_val:]
+        print(f"[SPLIT shuffle]  train={len(train)} | val={len(val)} | test={len(test)}")
+
+    else:
+        raise ValueError(f"split_mode inconnu : '{split_mode}'. Choisir 'aug_real' ou 'shuffle'.")
+
+    return train, val, test
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  EXTRACTION PATCHES 13x13
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pad_cube_HWB(cube_HWB, margin):
+    H, W, B  = cube_HWB.shape
+    padded   = np.zeros((H + 2 * margin, W + 2 * margin, B), dtype=np.float32)
+    padded[margin:H + margin, margin:W + margin, :] = cube_HWB
+    return padded
+
+
+def extract_patches(cube_HBW, coords, patch_size=13):
+    """
+    Extrait un patch (patch_size x patch_size) centre sur chaque (r,c).
+    Retourne (N, patch_size, patch_size, B).
+    """
+    H, B, W  = cube_HBW.shape
+    margin   = patch_size // 2
+    cube_HWB = cube_HBW.transpose(0, 2, 1)        # (H, W, B)
+    padded   = _pad_cube_HWB(cube_HWB, margin)
+
+    patches = np.zeros((len(coords), patch_size, patch_size, B), dtype=np.float32)
+    for i, (r, c) in enumerate(coords):
+        rp, cp     = r + margin, c + margin
+        patches[i] = padded[rp - margin: rp + margin + 1,
+                             cp - margin: cp + margin + 1, :]
+    return patches
+
+
+def process_plot_list(plot_list, extrude2final, label2idx, patch_size=13):
+    """
+    Traite une liste de plots -> (X, y) bruts avant PCA.
+    X : (N, patch_size, patch_size, B)
+    y : (N,)  int64
+    """
+    all_patches, all_labels = [], []
+    class_counts = defaultdict(int)
+    idx2name     = {v: k for k, v in label2idx.items()}
+
+    for plot in plot_list:
+        cube      = plot["cube"]          # (H, B, W)
+        shapes    = plot["shapes"]
+        H, B, W   = cube.shape
+
+        label_map = build_label_map(cube, shapes, extrude2final, label2idx)
+
+        rows, cols = np.where(label_map >= 0)
+        if len(rows) == 0:
+            print(f"  [SKIP] {plot['name']} — aucun pixel valide")
+            continue
+
+        coords  = list(zip(rows.tolist(), cols.tolist()))
+        labels  = label_map[rows, cols]
+        patches = extract_patches(cube, coords, patch_size)
+
+        all_patches.append(patches)
+        all_labels.append(labels)
+
+        for lbl in labels:
+            class_counts[idx2name[int(lbl)]] += 1
+
+        print(f"  {plot['source']:6} | {plot['name']:25} -> {len(coords):6} pixels valides")
+
+    if not all_patches:
+        B_fallback = plot_list[0]["cube"].shape[1] if plot_list else 1
+        return (np.empty((0, patch_size, patch_size, B_fallback), dtype=np.float32),
+                np.empty(0, dtype=np.int64),
+                class_counts)
+
+    return (np.concatenate(all_patches, axis=0),
+            np.concatenate(all_labels,  axis=0),
+            class_counts)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  PCA  (fit sur train uniquement)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_pca(X_train, X_val, X_test, pca_components):
+    """
+    Fit PCA sur X_train, applique a val et test.
+    X_* : (N, ps, ps, B)  ->  (N, ps, ps, pca_components)
+    """
+    ps = X_train.shape[1]
+    B  = X_train.shape[-1]
+
+    pca     = PCA(n_components=pca_components, whiten=True)
+    X_train = pca.fit_transform(X_train.reshape(-1, B)).astype(np.float32) \
+                 .reshape(-1, ps, ps, pca_components)
+
+    def _t(X):
+        return pca.transform(X.reshape(-1, B)).astype(np.float32) \
+                  .reshape(-1, ps, ps, pca_components)
+
+    X_val  = _t(X_val)  if len(X_val)  > 0 else X_val
+    X_test = _t(X_test) if len(X_test) > 0 else X_test
+
+    print(f"[PCA] {pca_components} composantes | "
+          f"variance expliquee : {pca.explained_variance_ratio_.sum():.3f}")
+    return X_train, X_val, X_test, pca
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  FORMAT SSFTTnet  (N, ps, ps, B) -> (N, 1, B, ps, ps)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def to_ssftt_format(X):
+    if len(X) == 0:
+        return X
+    X = X.transpose(0, 3, 1, 2)          # (N, B, ps, ps)
+    return X[:, np.newaxis, :, :, :]      # (N, 1, B, ps, ps)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  DATASET PYTORCH
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HSIDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.FloatTensor(X)
+        self.y = torch.LongTensor(y)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9.  POINT D'ENTREE PRINCIPAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_loaders(
+    output_dir     = "output",
+    circle_dir     = "output_circle",
+    mapping_path   = "mapping.json",
+    split_mode     = "aug_real",
+    use_pca        = True,
+    pca_components = 30,
+    patch_size     = 13,
+    test_ratio     = 0.15,
+    val_ratio      = 0.15,
+    batch_size     = 64,
+    random_state   = 345,
+):
+    """
+    Pipeline complet :
+      mapping -> chargement plots -> split plot-level -> patches -> PCA -> DataLoaders
+
+    Retourne : train_loader, val_loader, test_loader, meta
+    """
+    # ── Mapping ───────────────────────────────────────────────────────────
+    extrude2final, class_names, label2idx = load_mapping(mapping_path)
+
+    # ── Chargement plots ──────────────────────────────────────────────────
+    print("\n[STEP 1] Chargement des plots...")
+    plots_list = list(iter_plots(output_dir, circle_dir))
+
+    # ── Split plot-level ──────────────────────────────────────────────────
+    print("\n[STEP 2] Split au niveau plot...")
+    train_plots, val_plots, test_plots = split_plots(
+        plots_list, split_mode=split_mode,
+        val_ratio=val_ratio, test_ratio=test_ratio,
+        random_state=random_state,
+    )
+
+    # ── Extraction patches (apres split) ──────────────────────────────────
+    print("\n[STEP 3a] Extraction patches TRAIN...")
+    X_train, y_train, cnt_train = process_plot_list(
+        train_plots, extrude2final, label2idx, patch_size)
+
+    print("\n[STEP 3b] Extraction patches VAL...")
+    X_val, y_val, cnt_val = process_plot_list(
+        val_plots, extrude2final, label2idx, patch_size)
+
+    print("\n[STEP 3c] Extraction patches TEST...")
+    X_test, y_test, cnt_test = process_plot_list(
+        test_plots, extrude2final, label2idx, patch_size)
+
+    # ── Résumé distribution ───────────────────────────────────────────────
+    print("\n[DISTRIBUTION] Pixels par classe :")
+    all_cls = sorted(set(list(cnt_train) + list(cnt_val) + list(cnt_test)))
+    print(f"  {'Classe':25}  {'Train':>8}  {'Val':>8}  {'Test':>8}")
+    print(f"  {'-'*25}  {'-'*8}  {'-'*8}  {'-'*8}")
+    for cls in all_cls:
+        print(f"  {cls:25}  {cnt_train.get(cls,0):8}  "
+              f"{cnt_val.get(cls,0):8}  {cnt_test.get(cls,0):8}")
+
+    # ── PCA fit sur train uniquement ──────────────────────────────────────
+    pca_model = None
+    num_bands = X_train.shape[-1] if len(X_train) > 0 else 0
+
+    if use_pca and len(X_train) > 0:
+        print(f"\n[STEP 4] PCA -> {pca_components} composantes (fit sur train)...")
+        X_train, X_val, X_test, pca_model = apply_pca(
+            X_train, X_val, X_test, pca_components)
+        num_bands = pca_components
+    else:
+        print("\n[STEP 4] PCA desactivee.")
+
+    # ── Format SSFTTnet ───────────────────────────────────────────────────
+    print("\n[STEP 5] Conversion -> (N, 1, B, ps, ps)...")
+    X_train = to_ssftt_format(X_train)
+    X_val   = to_ssftt_format(X_val)
+    X_test  = to_ssftt_format(X_test)
+
+    # ── DataLoaders ───────────────────────────────────────────────────────
+    train_loader = DataLoader(HSIDataset(X_train, y_train),
+                              batch_size=batch_size, shuffle=True,  num_workers=0)
+    val_loader   = DataLoader(HSIDataset(X_val,   y_val),
+                              batch_size=batch_size, shuffle=False, num_workers=0)
+    test_loader  = DataLoader(HSIDataset(X_test,  y_test),
+                              batch_size=batch_size, shuffle=False, num_workers=0)
+
+    meta = {
+        "class_names":   class_names,
+        "label2idx":     label2idx,
+        "num_classes":   len(class_names),
+        "num_bands":     num_bands,
+        "patch_size":    patch_size,
+        "pca":           pca_model,
+        "extrude2final": extrude2final,
+        "split_mode":    split_mode,
+        "n_train":       len(X_train),
+        "n_val":         len(X_val),
+        "n_test":        len(X_test),
+    }
+
+    print(f"\n{'='*55}")
+    print(f"  Classes       : {len(class_names)}  -> {class_names}")
+    print(f"  Bandes        : {num_bands}")
+    print(f"  Train patches : {len(X_train)}")
+    print(f"  Val   patches : {len(X_val)}")
+    print(f"  Test  patches : {len(X_test)}")
+    if len(X_train) > 0:
+        print(f"  Shape batch   : {X_train.shape[1:]}  (1, B, ps, ps)")
+    print(f"{'='*55}\n")
+
+    return train_loader, val_loader, test_loader, meta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10.  CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Prepare donnees HSI pour SSFTTnet")
+    parser.add_argument("--output_dir",     default="output")
+    parser.add_argument("--circle_dir",     default="output_circle")
+    parser.add_argument("--mapping_path",   default="mapping.json")
+    parser.add_argument("--split_mode",     default="aug_real",
+                        choices=["aug_real", "shuffle"],
+                        help="aug_real: aug->train/val, reels->test | shuffle: tout melange")
+    parser.add_argument("--use_pca",        action="store_true",  default=True)
+    parser.add_argument("--no_pca",         action="store_false", dest="use_pca")
+    parser.add_argument("--pca_components", type=int,   default=30)
+    parser.add_argument("--patch_size",     type=int,   default=13)
+    parser.add_argument("--test_ratio",     type=float, default=0.15)
+    parser.add_argument("--val_ratio",      type=float, default=0.15)
+    parser.add_argument("--batch_size",     type=int,   default=64)
+    parser.add_argument("--random_state",   type=int,   default=345)
+    args = parser.parse_args()
+
+    train_loader, val_loader, test_loader, meta = build_loaders(
+        output_dir     = args.output_dir,
+        circle_dir     = args.circle_dir,
+        mapping_path   = args.mapping_path,
+        split_mode     = args.split_mode,
+        use_pca        = args.use_pca,
+        pca_components = args.pca_components,
+        patch_size     = args.patch_size,
+        test_ratio     = args.test_ratio,
+        val_ratio      = args.val_ratio,
+        batch_size     = args.batch_size,
+        random_state   = args.random_state,
+    )
+
+    X_b, y_b = next(iter(train_loader))
+    print(f"Batch shape : {X_b.shape}   labels : {y_b.shape}")
+    print("-> Pret pour SSFTTnet")
