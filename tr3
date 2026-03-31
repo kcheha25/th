@@ -1,0 +1,804 @@
+"""
+dataset.py — Pipeline HSI → SSFTTnet  [VERSION GPU / BACKGROUND ÉQUILIBRÉ]
+===========================================================================
+
+FORMAT CUBE
+-----------
+  - Real plots (dataset réel)      : format (B, H, W)  [bandes, hauteur, largeur]
+  - Augmented cubes (data augmentée) : format (H, B, W) [hauteur, bandes, largeur]
+
+  Toutes les fonctions de ce fichier normalisent en interne vers (B, H, W).
+
+COMPORTEMENT
+------------
+  - Mapping JSON : labels extrudes → classes finales.
+  - Pixels non annotés ET trous → classe "background" (inclus).
+  - Équilibrage background PAR PLOT :
+        n_bg_conservé = n_pixels_annotés du plot
+    Les pixels background excédentaires sont ignorés.
+  - Split PLOT-LEVEL strict (jamais mixé entre train/val/test).
+  - Modes aug_real et shuffle.
+  - Label map vectorisée GPU (ray-casting, sans boucle shapely).
+  - Patches via torch.nn.functional.unfold GPU.
+  - Streaming plot-par-plot (un seul cube en RAM à la fois).
+  - PCA fit sur sous-ensemble + transform par chunks.
+  - pin_memory pour transfert GPU rapide.
+
+Utilisation
+-----------
+    from dataset import build_loaders
+
+    train_loader, val_loader, test_loader, meta = build_loaders(
+        real_dir       = "data/real",
+        aug_dir        = "data/augmented",
+        mapping_path   = "mapping.json",
+        split_mode     = "aug_real",
+        use_pca        = True,
+        pca_components = 30,
+        patch_size     = 13,
+        batch_size     = 64,
+        random_state   = 345,
+    )
+"""
+
+import gc
+import json
+import random
+import re
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.decomposition import PCA
+from spectral import envi
+from torch.utils.data import DataLoader, Dataset
+
+# ─── device global ────────────────────────────────────────────────────────────
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[DEVICE] Utilisation de : {DEVICE}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  MAPPING JSON
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_mapping(mapping_path: str):
+    with open(mapping_path) as f:
+        raw = json.load(f)
+
+    extrude2final = {}
+    for final_class, extrude_list in raw.items():
+        for ext in extrude_list:
+            extrude2final[ext.strip()] = final_class
+
+    final_classes = sorted(raw.keys())
+    class_names   = final_classes + ["background"]
+    label2idx     = {name: i for i, name in enumerate(class_names)}
+
+    print(f"[MAPPING] {len(extrude2final)} labels → {len(final_classes)} classes + background")
+    return extrude2final, class_names, label2idx
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  CHARGEMENT FICHIERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_envi_real(hdr_path: Path):
+    """
+    Charge un cube ENVI réel (format natif (B, H, W)).
+    Retourne cube (B, H, W) float32 et la liste des longueurs d'onde.
+    """
+    img         = envi.open(str(hdr_path))
+    cube        = img.load().astype(np.float32)
+    wavelengths = [float(w) for w in img.metadata.get("wavelength", [])]
+
+    # Si le cube est chargé en (H, W, B) on le transpose
+    if cube.ndim == 3 and cube.shape[2] == len(wavelengths) and len(wavelengths) > 0:
+        cube = cube.transpose(2, 0, 1)
+    
+    # Vérification finale du format
+    if cube.ndim != 3:
+        raise ValueError(f"Format cube invalide: shape {cube.shape}")
+    
+    return cube, wavelengths  # (B, H, W)
+
+
+def _load_envi_augmented(hdr_path: Path):
+    """
+    Charge un cube augmenté (format natif (H, B, W)).
+    Retourne cube (B, H, W) float32 et la liste des longueurs d'onde.
+    """
+    img         = envi.open(str(hdr_path))
+    cube        = img.load().astype(np.float32)
+    wavelengths = [float(w) for w in img.metadata.get("wavelength", [])]
+
+    # Format attendu: (H, B, W) → transposer en (B, H, W)
+    if cube.ndim == 3:
+        # Si la deuxième dimension correspond au nombre de bandes
+        if len(wavelengths) > 0 and cube.shape[1] == len(wavelengths):
+            cube = cube.transpose(1, 0, 2)  # (H, B, W) → (B, H, W)
+        # Si c'est déjà (B, H, W) on garde tel quel
+        elif cube.shape[0] == len(wavelengths):
+            pass  # Déjà bon format
+        else:
+            print(f"  [WARN] Format inattendu pour {hdr_path.name}: shape {cube.shape}, "
+                  f"bandes attendues {len(wavelengths)}")
+    
+    if cube.ndim != 3:
+        raise ValueError(f"Format cube invalide après transformation: shape {cube.shape}")
+    
+    return cube, wavelengths  # (B, H, W)
+
+
+def _load_envi_auto(hdr_path: Path, source: str = "real"):
+    """
+    Charge un cube ENVI en détectant automatiquement le format selon la source.
+    """
+    if source == "real":
+        return _load_envi_real(hdr_path)
+    else:  # augmented or circle
+        return _load_envi_augmented(hdr_path)
+
+
+def _load_shapes(json_path: Path):
+    with open(json_path) as f:
+        ann = json.load(f)
+    return ann.get("shapes", [])
+
+
+def _iter_real_dir(real_dir: Path):
+    for hdr in sorted(real_dir.glob("plot_*_cube.hdr")):
+        m = re.match(r"plot_(\d+)_cube", hdr.stem)
+        if not m:
+            continue
+        jsn = real_dir / f"plot_{m.group(1)}_annotations.json"
+        if jsn.exists():
+            yield "real", hdr.stem, hdr, jsn
+        else:
+            print(f"[WARN] Pas de JSON pour {hdr.name} -> ignoré")
+
+
+def _iter_aug_dir(aug_dir: Path):
+    for hdr in sorted(aug_dir.glob("*.hdr")):
+        if any(hdr.stem.endswith(s) for s in ("_ratio", "_cube")):
+            continue
+        jsn = aug_dir / f"{hdr.stem}.json"
+        if not jsn.exists():
+            print(f"[WARN] Pas de JSON pour {hdr.name} -> ignoré")
+            continue
+        source = "circle" if "circle" in hdr.stem.lower() else "aug"
+        yield source, hdr.stem, hdr, jsn
+
+
+def collect_plots_meta(real_dir=None, aug_dir=None):
+    """
+    Collecte uniquement les métadonnées (chemins) sans charger les cubes.
+    Retourne une liste de dicts {source, name, hdr, jsn}.
+    """
+    meta_list = []
+
+    if real_dir is not None:
+        real_dir = Path(real_dir)
+        if real_dir.exists():
+            for source, name, hdr, jsn in _iter_real_dir(real_dir):
+                meta_list.append({"source": source, "name": name,
+                                   "hdr": hdr, "jsn": jsn})
+            n_real = sum(1 for m in meta_list if m["source"] == "real")
+            print(f"[INFO] real_dir -> {n_real} réels")
+        else:
+            print(f"[WARN] real_dir='{real_dir}' introuvable")
+
+    if aug_dir is not None:
+        aug_dir = Path(aug_dir)
+        if aug_dir.exists():
+            before = len(meta_list)
+            for source, name, hdr, jsn in _iter_aug_dir(aug_dir):
+                meta_list.append({"source": source, "name": name,
+                                   "hdr": hdr, "jsn": jsn})
+            print(f"[INFO] aug_dir  -> {len(meta_list) - before} augmentés")
+        else:
+            print(f"[WARN] aug_dir='{aug_dir}' introuvable")
+
+    if not meta_list:
+        raise RuntimeError("Aucun plot trouvé. Vérifiez --real_dir et --aug_dir.")
+
+    n_real = sum(1 for m in meta_list if m["source"] == "real")
+    n_aug  = len(meta_list) - n_real
+    print(f"[INFO] Total : {len(meta_list)} plots ({n_real} réels | {n_aug} augmentés)\n")
+    return meta_list
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  LABEL MAP — vectorisée GPU
+#     cube shape : (B, H, W)
+#     label_map  : (H, W)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _rasterize_polygon_gpu(points, H, W, device):
+    """
+    Rasterise un polygone en masque booléen (H, W) sur GPU.
+    Ray-casting even-odd, entièrement vectorisé, sans boucle Python sur pixels.
+
+    points : liste de [x, y] où x = colonne, y = ligne (convention LabelMe).
+    """
+    pts = torch.tensor(points, dtype=torch.float32, device=device)  # (N, 2)
+    n   = len(pts)
+
+    # Grille de centres de pixels : (H*W,)
+    # x = colonne (axe W), y = ligne (axe H)
+    rows = torch.arange(H, device=device, dtype=torch.float32) + 0.5  # (H,)
+    cols = torch.arange(W, device=device, dtype=torch.float32) + 0.5  # (W,)
+    grid_c, grid_r = torch.meshgrid(cols, rows, indexing="xy")        # (H, W) chacun
+    px = grid_c.reshape(-1)   # x = col, (H*W,)
+    py = grid_r.reshape(-1)   # y = row, (H*W,)
+
+    # Sommets du polygone
+    x1 = pts[:, 0]                              # (N,)
+    y1 = pts[:, 1]
+    idx_next = (torch.arange(n, device=device) + 1) % n
+    x2 = pts[idx_next, 0]
+    y2 = pts[idx_next, 1]
+
+    # Broadcast (H*W, N)
+    px_ = px.unsqueeze(1)   # (H*W, 1)
+    py_ = py.unsqueeze(1)
+
+    # Éviter division par zéro avec torch.where
+    cond1       = (y1 < py_) != (y2 < py_)
+    denom       = (y2 - y1).clone()
+    safe_denom = torch.where(denom == 0, torch.ones_like(denom) * 1e-10, denom)
+    x_intersect = x1 + (py_ - y1) * (x2 - x1) / safe_denom
+    cond2       = px_ < x_intersect
+
+    inside = (cond1 & cond2).sum(dim=1) % 2 == 1   # (H*W,)
+    return inside.reshape(H, W)                      # (H, W) bool
+
+
+def build_label_map_gpu(cube_BHW, shapes, extrude2final, label2idx, device):
+    """
+    Construit la carte de labels (H, W) sur GPU.
+
+    cube_BHW : numpy (B, H, W)
+    Retourne label_map numpy (H, W) int64.
+
+      - pixels non annotés / trous → background
+      - pixels annotés             → classe mappée
+    """
+    B, H, W = cube_BHW.shape   # ← format (B, H, W)
+    bg_idx  = label2idx["background"]
+
+    label_map_gpu = torch.full((H, W), bg_idx, dtype=torch.int64, device=device)
+
+    for shape in shapes:
+        raw_label = shape.get("label", "").strip()
+        stype     = shape.get("shape_type", "")
+
+        if raw_label.lower() == "trou" or stype not in ("polygon", "rectangle"):
+            continue
+
+        final = extrude2final.get(raw_label)
+        if final is None:
+            print(f"  [WARN] label '{raw_label}' absent du mapping -> ignoré")
+            continue
+
+        points = shape["points"]
+        if len(points) < 3:
+            continue
+
+        try:
+            mask = _rasterize_polygon_gpu(points, H, W, device)  # (H, W)
+            label_map_gpu[mask] = label2idx[final]
+        except Exception as e:
+            print(f"  [WARN] rasterisation '{raw_label}' échouée : {e}")
+
+    n_bg    = int((label_map_gpu == bg_idx).sum().item())
+    n_total = H * W
+    print(f"    [LABEL MAP] {n_total} pixels | "
+          f"{n_total - n_bg} annotés | {n_bg} background brut")
+
+    label_map = label_map_gpu.cpu().numpy()
+    del label_map_gpu
+    return label_map   # numpy (H, W) int64
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  SPLIT PLOT-LEVEL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def split_plots(plots_meta, split_mode="aug_real",
+                val_ratio=0.15, test_ratio=0.15, random_state=345):
+    rng = random.Random(random_state)
+
+    if split_mode == "aug_real":
+        aug  = [p for p in plots_meta if p["source"] in ("aug", "circle")]
+        real = [p for p in plots_meta if p["source"] == "real"]
+        rng.shuffle(aug)
+        n_val = max(1, int(len(aug) * val_ratio))
+        val   = aug[:n_val]
+        train = aug[n_val:]
+        test  = real
+        print(f"[SPLIT aug_real] train={len(train)} | val={len(val)} | test={len(test)}")
+
+    elif split_mode == "shuffle":
+        all_p = plots_meta[:]
+        rng.shuffle(all_p)
+        n      = len(all_p)
+        n_test = max(1, int(n * test_ratio))
+        n_val  = max(1, int(n * val_ratio))
+        test   = all_p[:n_test]
+        val    = all_p[n_test:n_test + n_val]
+        train  = all_p[n_test + n_val:]
+        print(f"[SPLIT shuffle]  train={len(train)} | val={len(val)} | test={len(test)}")
+
+    else:
+        raise ValueError(f"split_mode inconnu : '{split_mode}'")
+
+    return train, val, test
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  ÉQUILIBRAGE BACKGROUND PAR PLOT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def balance_background(labels: np.ndarray, bg_idx: int,
+                       rng: np.random.Generator) -> np.ndarray:
+    """
+    Retourne un masque booléen (N,) tel que :
+
+        n_background_conservé = n_pixels_annotés  (toutes classes du plot)
+
+    Règles :
+      - Si n_annotés == 0  → aucun background conservé (plot sans annotation).
+      - Si n_bg < n_annotés → tout le background disponible est conservé.
+      - Sinon              → tirage aléatoire de n_annotés pixels bg.
+
+    Les pixels annotés sont toujours tous conservés.
+    """
+    bg_mask = labels == bg_idx
+    fg_mask = ~bg_mask
+
+    n_fg = int(fg_mask.sum())
+    n_bg = int(bg_mask.sum())
+
+    keep_mask = fg_mask.copy()   # annotés toujours gardés
+
+    if n_fg == 0:
+        return keep_mask         # plot vide → 0 background
+
+    n_bg_keep = min(n_fg, n_bg)
+    if n_bg_keep > 0:
+        bg_indices        = np.where(bg_mask)[0]
+        chosen            = rng.choice(bg_indices, size=n_bg_keep, replace=False)
+        keep_mask[chosen] = True
+
+    return keep_mask
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  EXTRACTION PATCHES — F.unfold GPU
+#     cube shape entrée : (B, H, W)
+#     patches sortie    : (N, B, ps, ps)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_patches_gpu(cube_BHW: np.ndarray, coords: np.ndarray,
+                        patch_size: int, device: torch.device) -> torch.Tensor:
+    """
+    Extrait les patches (patch_size × patch_size) centrés sur chaque coord.
+
+    cube_BHW : numpy (B, H, W)
+    coords   : numpy (N, 2) — colonnes [row, col]
+    Retourne : tenseur float32 GPU (N, B, ps, ps)
+
+    Stratégie F.unfold :
+      1. (B, H, W) → tenseur GPU (1, B, H, W).
+      2. Padding zéro margin = ps // 2 sur H et W.
+      3. F.unfold(kernel_size=ps) → (1, B*ps*ps, H*W).
+      4. Sélection par indices linéaires row*W + col.
+      5. Reshape → (N, B, ps, ps).
+    """
+    B, H, W = cube_BHW.shape   # ← format (B, H, W)
+    margin  = patch_size // 2
+
+    # numpy (B, H, W) → GPU tensor (1, B, H, W)
+    cube_t = torch.from_numpy(cube_BHW).unsqueeze(0).to(device=device,
+                                                         dtype=torch.float32)
+
+    # Padding zéro sur les dimensions spatiales H et W
+    # F.pad ordre : (W_left, W_right, H_top, H_bot)
+    cube_padded = F.pad(cube_t,
+                        (margin, margin, margin, margin),
+                        mode="constant", value=0)
+    # (1, B, H + 2*margin, W + 2*margin)
+
+    # F.unfold → (1, B*ps*ps, H*W)
+    unfolded = F.unfold(cube_padded, kernel_size=patch_size, stride=1)
+
+    # Indices linéaires des pixels sélectionnés dans la grille H×W
+    rows = coords[:, 0]
+    cols = coords[:, 1]
+    lin_idx = torch.from_numpy(
+        (rows * W + cols).astype(np.int64)
+    ).to(device)
+
+    # Sélection : (B*ps*ps, N) → transpose → (N, B*ps*ps)
+    selected = unfolded[0, :, lin_idx].T          # (N, B*ps*ps)
+
+    # Reshape final → (N, B, ps, ps)
+    patches = selected.reshape(-1, B, patch_size, patch_size)
+
+    del cube_t, cube_padded, unfolded, selected
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return patches   # (N, B, ps, ps) float32 GPU
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  TRAITEMENT D'UNE LISTE DE PLOTS  (streaming + background équilibré)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_plot_list(plot_meta_list, extrude2final, label2idx,
+                      patch_size=13, random_state=345, device=DEVICE):
+    """
+    Traite les plots UN PAR UN.
+
+    Pour chaque plot :
+      - Charge le cube avec le format adapté selon la source
+      - Construit la label map (H, W) sur GPU.
+      - Équilibre : n_bg_conservé = n_pixels_annotés.
+      - Extrait les patches (N, B, ps, ps) via F.unfold GPU.
+      - Libère cube + tenseurs GPU avant le plot suivant.
+
+    Retourne
+    --------
+    X            : numpy (N_total, B, ps, ps) float32
+    y            : numpy (N_total,) int64
+    class_counts : defaultdict
+    """
+    all_patches  = []
+    all_labels   = []
+    class_counts = defaultdict(int)
+    idx2name     = {v: k for k, v in label2idx.items()}
+    bg_idx       = label2idx["background"]
+    rng          = np.random.default_rng(seed=random_state)
+
+    for meta in plot_meta_list:
+        name   = meta["name"]
+        source = meta["source"]
+
+        # ── Chargement cube avec format adapté (B, H, W) ───────────────────
+        try:
+            # Utilisation du chargeur automatique selon la source
+            cube, _ = _load_envi_auto(meta["hdr"], source)   # (B, H, W)
+            shapes  = _load_shapes(meta["jsn"])
+        except Exception as e:
+            print(f"  [WARN] {name} ignoré : {e}")
+            continue
+
+        B, H, W = cube.shape   # ← format normalisé (B, H, W)
+
+        # ── Label map GPU (H, W) ─────────────────────────────────────────
+        label_map = build_label_map_gpu(cube, shapes, extrude2final,
+                                        label2idx, device)   # (H, W) numpy
+
+        # ── Tous les pixels (label >= 0 = tous ici) ──────────────────────
+        rows, cols   = np.where(label_map >= 0)
+        labels_all   = label_map[rows, cols]   # (N_total,)
+
+        del label_map
+        gc.collect()
+
+        if len(rows) == 0:
+            print(f"  [SKIP] {name} — aucun pixel")
+            del cube
+            gc.collect()
+            continue
+
+        # ── Équilibrage background ────────────────────────────────────────
+        keep_mask = balance_background(labels_all, bg_idx, rng)
+
+        rows_k   = rows[keep_mask]
+        cols_k   = cols[keep_mask]
+        labels_k = labels_all[keep_mask]
+
+        n_fg      = int((labels_all != bg_idx).sum())
+        n_bg_raw  = int((labels_all == bg_idx).sum())
+        n_bg_kept = int((labels_k   == bg_idx).sum())
+
+        del labels_all, rows, cols, keep_mask
+        gc.collect()
+
+        if len(rows_k) == 0:
+            print(f"  [SKIP] {name} — 0 pixels après équilibrage")
+            del cube
+            gc.collect()
+            continue
+
+        coords = np.stack([rows_k, cols_k], axis=1)   # (N_keep, 2)
+
+        # ── Patches GPU via F.unfold ──────────────────────────────────────
+        patches_gpu = extract_patches_gpu(cube, coords, patch_size, device)
+        patches_cpu = patches_gpu.cpu().numpy()   # (N_keep, B, ps, ps)
+
+        del patches_gpu, cube, rows_k, cols_k
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        all_patches.append(patches_cpu)
+        all_labels.append(labels_k)
+
+        for lbl in labels_k:
+            class_counts[idx2name[int(lbl)]] += 1
+
+        print(f"  {source:6} | {name:30} | "
+              f"annotés={n_fg:6} | "
+              f"bg brut={n_bg_raw:7} → bg gardé={n_bg_kept:6} | "
+              f"total={len(labels_k):7}")
+
+    if not all_patches:
+        return (np.empty((0, 1, patch_size, patch_size), dtype=np.float32),
+                np.empty(0, dtype=np.int64),
+                class_counts)
+
+    X = np.concatenate(all_patches, axis=0)   # (N, B, ps, ps)
+    y = np.concatenate(all_labels,  axis=0)   # (N,)
+    return X, y, class_counts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  PCA — fit sur sous-ensemble, transform par chunks
+#     X shape : (N, B, ps, ps) → (N, pca_components, ps, ps)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_pca(X_train, X_val, X_test, pca_components,
+              fit_max_pixels=500_000, transform_chunk=50_000):
+    """
+    PCA fit sur train uniquement.
+    X_* : (N, B, ps, ps) → (N, pca_components, ps, ps)
+    """
+    N, B, ps, _ = X_train.shape
+    # Aplatir : chaque pixel d'un patch est un échantillon de dim B
+    X_flat = X_train.transpose(0, 2, 3, 1).reshape(-1, B)  # (N*ps*ps, B)
+
+    if len(X_flat) > fit_max_pixels:
+        idx   = np.random.choice(len(X_flat), fit_max_pixels, replace=False)
+        X_fit = X_flat[idx]
+    else:
+        X_fit = X_flat
+
+    print(f"  [PCA] fit sur {len(X_fit):,} pixels (/{len(X_flat):,})")
+    pca = PCA(n_components=pca_components, whiten=True)
+    pca.fit(X_fit)
+    print(f"  [PCA] variance expliquée : {pca.explained_variance_ratio_.sum():.3f}")
+
+    def _transform_chunked(X_arr):
+        """(N, B, ps, ps) → (N, C, ps, ps)"""
+        N_, B_, ps_, _ = X_arr.shape
+        # (N, B, ps, ps) → (N*ps*ps, B)
+        flat = X_arr.transpose(0, 2, 3, 1).reshape(-1, B_)
+        out  = np.empty((len(flat), pca_components), dtype=np.float32)
+        for start in range(0, len(flat), transform_chunk):
+            end = min(start + transform_chunk, len(flat))
+            out[start:end] = pca.transform(flat[start:end]).astype(np.float32)
+        # (N*ps*ps, C) → (N, ps, ps, C) → (N, C, ps, ps)
+        return out.reshape(N_, ps_, ps_, pca_components).transpose(0, 3, 1, 2)
+
+    X_train = _transform_chunked(X_train)
+    X_val   = _transform_chunked(X_val)  if len(X_val)  > 0 else X_val
+    X_test  = _transform_chunked(X_test) if len(X_test) > 0 else X_test
+
+    return X_train, X_val, X_test, pca
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9.  FORMAT SSFTTnet  (N, B, ps, ps) -> (N, 1, B, ps, ps)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def to_ssftt_format(X):
+    """Ajoute la dimension canal attendue par SSFTTnet."""
+    if len(X) == 0:
+        return X
+    return X[:, np.newaxis, :, :, :]   # (N, 1, B, ps, ps)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10.  DATASET PYTORCH
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HSIDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = torch.from_numpy(X).float()
+        self.y = torch.from_numpy(y).long()
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11.  POINT D'ENTRÉE PRINCIPAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_loaders(
+    real_dir        = None,
+    aug_dir         = None,
+    mapping_path    = "mapping.json",
+    split_mode      = "aug_real",
+    use_pca         = True,
+    pca_components  = 30,
+    patch_size      = 13,
+    test_ratio      = 0.15,
+    val_ratio       = 0.15,
+    batch_size      = 64,
+    random_state    = 345,
+    fit_max_pixels  = 500_000,
+    num_workers     = 0,
+):
+    """
+    Pipeline complet GPU / mémoire optimisé avec background équilibré par plot.
+
+    Règle background : n_bg_conservé = n_pixels_annotés  (par plot).
+    Format cube      : (B, H, W) partout dans le pipeline après normalisation.
+    """
+    extrude2final, class_names, label2idx = load_mapping(mapping_path)
+
+    print("\n[STEP 1] Collecte des métadonnées plots...")
+    plots_meta = collect_plots_meta(real_dir=real_dir, aug_dir=aug_dir)
+
+    print("\n[STEP 2] Split au niveau plot...")
+    train_meta, val_meta, test_meta = split_plots(
+        plots_meta, split_mode=split_mode,
+        val_ratio=val_ratio, test_ratio=test_ratio,
+        random_state=random_state,
+    )
+
+    print("\n[STEP 3a] Extraction patches TRAIN...")
+    X_train, y_train, cnt_train = process_plot_list(
+        train_meta, extrude2final, label2idx,
+        patch_size=patch_size, random_state=random_state, device=DEVICE)
+
+    print("\n[STEP 3b] Extraction patches VAL...")
+    X_val, y_val, cnt_val = process_plot_list(
+        val_meta, extrude2final, label2idx,
+        patch_size=patch_size, random_state=random_state, device=DEVICE)
+
+    print("\n[STEP 3c] Extraction patches TEST...")
+    X_test, y_test, cnt_test = process_plot_list(
+        test_meta, extrude2final, label2idx,
+        patch_size=patch_size, random_state=random_state, device=DEVICE)
+
+    # ── Distribution ──────────────────────────────────────────────────────
+    print("\n[DISTRIBUTION] Pixels par classe :")
+    all_cls = sorted(set(list(cnt_train) + list(cnt_val) + list(cnt_test)))
+    print(f"  {'Classe':25}  {'Train':>9}  {'Val':>9}  {'Test':>9}")
+    print(f"  {'-'*25}  {'-'*9}  {'-'*9}  {'-'*9}")
+    for cls in all_cls:
+        print(f"  {cls:25}  {cnt_train.get(cls,0):9}  "
+              f"{cnt_val.get(cls,0):9}  {cnt_test.get(cls,0):9}")
+
+    # ── PCA ───────────────────────────────────────────────────────────────
+    pca_model = None
+    num_bands = X_train.shape[1] if len(X_train) > 0 else 0  # dim B de (N,B,ps,ps)
+
+    if use_pca and len(X_train) > 0:
+        print(f"\n[STEP 4] PCA -> {pca_components} composantes...")
+        X_train, X_val, X_test, pca_model = apply_pca(
+            X_train, X_val, X_test,
+            pca_components=pca_components,
+            fit_max_pixels=fit_max_pixels,
+        )
+        num_bands = pca_components
+    else:
+        print("\n[STEP 4] PCA désactivée.")
+
+    # ── Format SSFTTnet (N, 1, B, ps, ps) ────────────────────────────────
+    print("\n[STEP 5] Ajout dim canal -> (N, 1, B, ps, ps)...")
+    X_train = to_ssftt_format(X_train)
+    X_val   = to_ssftt_format(X_val)
+    X_test  = to_ssftt_format(X_test)
+
+    # ── DataLoaders ───────────────────────────────────────────────────────
+    pin = DEVICE.type == "cuda"
+    train_loader = DataLoader(HSIDataset(X_train, y_train),
+                              batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=pin)
+    val_loader   = DataLoader(HSIDataset(X_val, y_val),
+                              batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=pin)
+    test_loader  = DataLoader(HSIDataset(X_test, y_test),
+                              batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=pin)
+
+    meta = {
+        "class_names":   class_names,
+        "label2idx":     label2idx,
+        "num_classes":   len(class_names),
+        "num_bands":     num_bands,
+        "patch_size":    patch_size,
+        "pca":           pca_model,
+        "extrude2final": extrude2final,
+        "split_mode":    split_mode,
+        "real_dir":      str(real_dir),
+        "aug_dir":       str(aug_dir),
+        "n_train":       len(X_train),
+        "n_val":         len(X_val),
+        "n_test":        len(X_test),
+        "device":        str(DEVICE),
+    }
+
+    print(f"\n{'='*60}")
+    print(f"  Device        : {DEVICE}")
+    print(f"  Format cube   : (B, H, W) après normalisation")
+    print(f"  bg rule       : n_bg = n_pixels_annotés  (par plot)")
+    print(f"  real_dir      : {real_dir}")
+    print(f"  aug_dir       : {aug_dir}")
+    print(f"  Classes       : {len(class_names)}  -> {class_names}")
+    print(f"  Bandes        : {num_bands}")
+    print(f"  Train patches : {len(X_train):,}")
+    print(f"  Val   patches : {len(X_val):,}")
+    print(f"  Test  patches : {len(X_test):,}")
+    if len(X_train) > 0:
+        print(f"  Shape batch   : {X_train.shape[1:]}  (1, B, ps, ps)")
+    print(f"{'='*60}\n")
+
+    return train_loader, val_loader, test_loader, meta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12.  CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Prépare données HSI pour SSFTTnet [GPU + bg équilibré, cube (B,H,W)]"
+    )
+    parser.add_argument("--real_dir",       default=None,
+        help="Dossier des plots RÉELS (plot_*_cube.hdr + plot_*_annotations.json).")
+    parser.add_argument("--aug_dir",        default=None,
+        help="Dossier des plots AUGMENTÉS (aug_*.hdr/.json, aug_circle_*.hdr/.json).")
+    parser.add_argument("--mapping_path",   default="mapping.json")
+    parser.add_argument("--split_mode",     default="aug_real",
+                        choices=["aug_real", "shuffle"])
+    parser.add_argument("--use_pca",        action="store_true", default=True)
+    parser.add_argument("--no_pca",         action="store_false", dest="use_pca")
+    parser.add_argument("--pca_components", type=int,   default=30)
+    parser.add_argument("--patch_size",     type=int,   default=13)
+    parser.add_argument("--test_ratio",     type=float, default=0.15)
+    parser.add_argument("--val_ratio",      type=float, default=0.15)
+    parser.add_argument("--batch_size",     type=int,   default=64)
+    parser.add_argument("--random_state",   type=int,   default=345)
+    parser.add_argument("--fit_max_pixels", type=int,   default=500_000,
+        help="Nb max de pixels pour le fit PCA.")
+    parser.add_argument("--num_workers",    type=int,   default=0)
+
+    args = parser.parse_args()
+
+    if args.real_dir is None and args.aug_dir is None:
+        parser.error("Au moins un de --real_dir ou --aug_dir doit être fourni.")
+
+    train_loader, val_loader, test_loader, meta = build_loaders(
+        real_dir        = args.real_dir,
+        aug_dir         = args.aug_dir,
+        mapping_path    = args.mapping_path,
+        split_mode      = args.split_mode,
+        use_pca         = args.use_pca,
+        pca_components  = args.pca_components,
+        patch_size      = args.patch_size,
+        test_ratio      = args.test_ratio,
+        val_ratio       = args.val_ratio,
+        batch_size      = args.batch_size,
+        random_state    = args.random_state,
+        fit_max_pixels  = args.fit_max_pixels,
+        num_workers     = args.num_workers,
+    )
+
+    X_b, y_b = next(iter(train_loader))
+    print(f"Batch shape : {X_b.shape}   labels : {y_b.shape}")
+    print("-> Prêt pour SSFTTnet")
