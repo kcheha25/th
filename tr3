@@ -1,5 +1,6 @@
+```python
 """
-dataset.py — Pipeline HSI → SSFTTnet [4 GPU PARALLEL + INDICES CACHE ONLY]
+dataset.py — Pipeline HSI → SSFTTnet [4 GPU PARALLEL + INDICES CACHE + CLASS BALANCING]
 """
 
 import gc
@@ -206,20 +207,79 @@ def split_plots(plots_meta, split_mode="aug_real", val_ratio=0.15, test_ratio=0.
         raise ValueError(f"Unknown split_mode: '{split_mode}'")
     return train, val, test
 
-def balance_background(labels: np.ndarray, bg_idx: int, rng: np.random.Generator, bg_ratio: float = 1.5) -> np.ndarray:
-    bg_mask = labels == bg_idx
-    fg_mask = ~bg_mask
-    n_fg = int(fg_mask.sum())
-    n_bg = int(bg_mask.sum())
-    keep_mask = fg_mask.copy()
-    if n_fg == 0:
-        return keep_mask
-    n_bg_keep = min(int(n_fg * bg_ratio), n_bg)
-    if n_bg_keep > 0:
-        bg_indices = np.where(bg_mask)[0]
-        chosen = rng.choice(bg_indices, size=n_bg_keep, replace=False)
-        keep_mask[chosen] = True
-    return keep_mask
+def balance_classes_per_plot(pixels_by_class_per_plot, bg_ratio=2.0, random_state=345):
+    rng = random.Random(random_state)
+    selected_pixels = defaultdict(lambda: defaultdict(list))
+    remaining_pixels = defaultdict(lambda: defaultdict(list))
+    print("\nClass balancing per plot (50/50 split):")
+    for class_name, plots_data in pixels_by_class_per_plot.items():
+        if class_name == "background":
+            continue
+        print(f"\n  {class_name}:")
+        for plot_name, pixels in plots_data.items():
+            n_pixels = len(pixels)
+            rng.shuffle(pixels)
+            n_train = n_pixels // 2
+            train_pixels = pixels[:n_train]
+            test_pixels = pixels[n_train:]
+            selected_pixels[class_name][plot_name] = train_pixels
+            remaining_pixels[class_name][plot_name] = test_pixels
+            print(f"    {plot_name}: total={n_pixels} | train={len(train_pixels)} | test={len(test_pixels)}")
+    if "background" in pixels_by_class_per_plot:
+        print(f"\n  background:")
+        bg_plots_data = pixels_by_class_per_plot["background"]
+        for plot_name, pixels in bg_plots_data.items():
+            n_pixels = len(pixels)
+            rng.shuffle(pixels)
+            n_bg_target = n_pixels // 2
+            train_bg_pixels = pixels[:n_bg_target]
+            test_bg_pixels = pixels[n_bg_target:]
+            selected_pixels["background"][plot_name] = train_bg_pixels
+            remaining_pixels["background"][plot_name] = test_bg_pixels
+            print(f"    {plot_name}: total={n_pixels} | train={len(train_bg_pixels)} | test={len(test_bg_pixels)}")
+    return selected_pixels, remaining_pixels
+
+def collect_pixels_per_plot(plot_meta_list, extrude2final, label2idx, random_state, device):
+    pixels_by_class = defaultdict(lambda: defaultdict(list))
+    class_counts = defaultdict(int)
+    idx2name = {v: k for k, v in label2idx.items()}
+    print(f"\nCollecting pixels from {len(plot_meta_list)} plots...")
+    for meta in plot_meta_list:
+        name = meta["name"]
+        source = meta["source"]
+        try:
+            cube, _ = _load_envi_auto(meta["hdr"], source)
+            shapes = _load_shapes(meta["jsn"])
+        except Exception as e:
+            print(f"  Warning: {name} ignored: {e}")
+            continue
+        label_map = build_label_map_gpu(cube, shapes, extrude2final, label2idx, device)
+        rows, cols = np.where(label_map >= 0)
+        labels = label_map[rows, cols]
+        for r, c, lbl in zip(rows, cols, labels):
+            class_name = idx2name[int(lbl)]
+            pixels_by_class[class_name][name].append((int(r), int(c), int(lbl)))
+            class_counts[class_name] += 1
+        del cube, label_map
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+    return pixels_by_class, class_counts
+
+def extract_indices_from_pixels(selected_pixels):
+    indices_list = []
+    for class_name, plots_data in selected_pixels.items():
+        for plot_name, pixels in plots_data.items():
+            source = "real" if "plot" in plot_name else "aug"
+            for row, col, lbl in pixels:
+                indices_list.append({
+                    'cube_name': plot_name,
+                    'source': source,
+                    'row': int(row),
+                    'col': int(col),
+                    'label': int(lbl)
+                })
+    return indices_list
 
 def extract_patches_gpu(cube_BHW: np.ndarray, coords: np.ndarray, patch_size: int, device: torch.device) -> torch.Tensor:
     B, H, W = cube_BHW.shape
@@ -279,108 +339,6 @@ def load_indices(cache_dir: str = "indices_cache", config_hash: str = None):
     print(f"  Test: {len(indices_data['test']):,} indices")
     return indices_data
 
-def collect_indices_for_plot(meta, extrude2final, label2idx, random_state, bg_ratio, device_id):
-    device = torch.device(f"cuda:{device_id}")
-    name = meta["name"]
-    source = meta["source"]
-    rng = np.random.default_rng(seed=random_state + hash(name) % 10000)
-    bg_idx = label2idx["background"]
-    
-    try:
-        cube, _ = _load_envi_auto(meta["hdr"], source)
-        shapes = _load_shapes(meta["jsn"])
-    except Exception as e:
-        print(f"  Warning: {name} ignored: {e}")
-        return None
-    
-    B, H, W = cube.shape
-    label_map = build_label_map_gpu(cube, shapes, extrude2final, label2idx, device)
-    rows, cols = np.where(label_map >= 0)
-    labels_all = label_map[rows, cols]
-    del label_map
-    gc.collect()
-    
-    if len(rows) == 0:
-        print(f"  Skip: {name} — no pixels")
-        del cube
-        gc.collect()
-        return None
-    
-    keep_mask = balance_background(labels_all, bg_idx, rng, bg_ratio)
-    rows_k = rows[keep_mask]
-    cols_k = cols[keep_mask]
-    labels_k = labels_all[keep_mask]
-    
-    n_fg = int((labels_all != bg_idx).sum())
-    n_bg_raw = int((labels_all == bg_idx).sum())
-    n_bg_kept = int((labels_k == bg_idx).sum())
-    
-    del labels_all, rows, cols, keep_mask, cube
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    gc.collect()
-    
-    if len(rows_k) == 0:
-        print(f"  Skip: {name} — 0 pixels after balancing")
-        return None
-    
-    indices_list = []
-    for r, c, lbl in zip(rows_k, cols_k, labels_k):
-        indices_list.append({
-            'cube_name': name,
-            'source': source,
-            'row': int(r),
-            'col': int(c),
-            'label': int(lbl),
-            'num_bands': B
-        })
-    
-    print(f"  GPU {device_id} | {source:6} | {name:30} | annotated={n_fg:6} | raw bg={n_bg_raw:7} -> kept bg={n_bg_kept:6} | indices={len(indices_list):7}")
-    
-    return indices_list
-
-def collect_indices_parallel(plot_meta_list, extrude2final, label2idx, random_state, bg_ratio, num_gpus=NUM_GPUS):
-    print(f"\nCollecting indices from {len(plot_meta_list)} plots using {num_gpus} GPUs")
-    
-    all_indices = []
-    class_counts = defaultdict(int)
-    idx2name = {v: k for k, v in label2idx.items()}
-    
-    plot_index = 0
-    while plot_index < len(plot_meta_list):
-        batch_plots = []
-        for gpu_id in range(num_gpus):
-            if plot_index + gpu_id < len(plot_meta_list):
-                batch_plots.append((plot_index + gpu_id, plot_meta_list[plot_index + gpu_id], gpu_id))
-        
-        if not batch_plots:
-            break
-        
-        results = []
-        with ThreadPoolExecutor(max_workers=num_gpus) as executor:
-            futures = {}
-            for idx, meta, gpu_id in batch_plots:
-                future = executor.submit(collect_indices_for_plot, meta, extrude2final, label2idx, random_state, bg_ratio, gpu_id)
-                futures[future] = (idx, meta)
-            
-            for future in as_completed(futures):
-                idx, meta = futures[future]
-                try:
-                    indices = future.result()
-                    if indices is not None:
-                        all_indices.extend(indices)
-                        for item in indices:
-                            class_counts[idx2name[item['label']]] += 1
-                except Exception as e:
-                    print(f"  Error processing {meta['name']}: {e}")
-        
-        plot_index += num_gpus
-        
-        torch.cuda.empty_cache()
-        gc.collect()
-    
-    return all_indices, class_counts
-
 class StreamingPatchDataset(Dataset):
     def __init__(self, indices_list, real_dir, aug_dir, patch_size):
         self.indices = indices_list
@@ -396,7 +354,6 @@ class StreamingPatchDataset(Dataset):
             cache_key = f"{source}_{cube_name}"
             if cache_key in self.cube_cache:
                 return self.cube_cache[cache_key]
-        
         if source == "real":
             if self.real_dir is None:
                 raise FileNotFoundError(f"Real directory not set for cube: {cube_name}")
@@ -405,18 +362,14 @@ class StreamingPatchDataset(Dataset):
             if self.aug_dir is None:
                 raise FileNotFoundError(f"Aug directory not set for cube: {cube_name}")
             hdr_path = self.aug_dir / f"{cube_name}.hdr"
-        
         if not hdr_path.exists():
             raise FileNotFoundError(f"Cube not found: {cube_name} at {hdr_path}")
-        
         cube, _ = _load_envi_auto(hdr_path, source)
-        
         with self.lock:
             if len(self.cube_cache) >= self.cache_max_size:
                 oldest = next(iter(self.cube_cache))
                 del self.cube_cache[oldest]
             self.cube_cache[cache_key] = cube
-        
         return cube
     
     def __len__(self):
@@ -425,57 +378,55 @@ class StreamingPatchDataset(Dataset):
     def __getitem__(self, idx):
         item = self.indices[idx]
         cube = self._load_cube(item['cube_name'], item['source'])
-        
         B, H, W = cube.shape
         r, c = item['row'], item['col']
         ps = self.patch_size
         margin = ps // 2
-        
         r_start = max(0, r - margin)
         r_end = min(H, r + margin + 1)
         c_start = max(0, c - margin)
         c_end = min(W, c + margin + 1)
-        
         patch = cube[:, r_start:r_end, c_start:c_end]
-        
         if patch.shape[1] != ps or patch.shape[2] != ps:
             patch_padded = np.zeros((B, ps, ps), dtype=np.float32)
             r_offset = max(0, margin - r)
             c_offset = max(0, margin - c)
             patch_padded[:, r_offset:r_offset+patch.shape[1], c_offset:c_offset+patch.shape[2]] = patch
             patch = patch_padded
-        
         patch = torch.from_numpy(patch).float()
         label = torch.tensor(item['label'], dtype=torch.long)
-        
         return patch, label
 
 def apply_pca_to_tensor(X, pca_components, fit_max_pixels=500000):
     N, B, ps, _ = X.shape
     X_flat = X.transpose(0, 2, 3, 1).reshape(-1, B)
-    
     if len(X_flat) > fit_max_pixels:
         idx = np.random.choice(len(X_flat), fit_max_pixels, replace=False)
         X_fit = X_flat[idx]
     else:
         X_fit = X_flat
-    
     print(f"  PCA fit on {len(X_fit):,} pixels (/{len(X_flat):,})")
     pca = PCA(n_components=pca_components, whiten=True)
     pca.fit(X_fit)
     print(f"  PCA explained variance: {pca.explained_variance_ratio_.sum():.3f}")
-    
     chunk = 50000
     out = np.empty((len(X_flat), pca_components), dtype=np.float32)
     for start in range(0, len(X_flat), chunk):
         end = min(start + chunk, len(X_flat))
         out[start:end] = pca.transform(X_flat[start:end]).astype(np.float32)
-    
     X_pca = out.reshape(N, ps, ps, pca_components).transpose(0, 3, 1, 2)
-    
     return X_pca, pca
 
-def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json", split_mode="aug_real", use_pca=True, pca_components=30, patch_size=13, test_ratio=0.15, val_ratio=0.15, batch_size=64, random_state=345, fit_max_pixels=500000, num_workers=4, bg_ratio=1.5, cache_dir="indices_cache", force_recompute=False):
+class PreprocessedDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.from_numpy(X).float()
+        self.y = torch.from_numpy(y).long()
+    def __len__(self):
+        return len(self.y)
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json", split_mode="aug_real", use_pca=True, pca_components=30, patch_size=13, test_ratio=0.15, val_ratio=0.15, batch_size=64, random_state=345, fit_max_pixels=500000, num_workers=4, bg_ratio=2.0, cache_dir="indices_cache", force_recompute=False):
     
     extrude2final, class_names, label2idx = load_mapping(mapping_path)
     
@@ -573,36 +524,47 @@ def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json", spli
             
             return train_loader, val_loader, test_loader, meta
     
-    print("\nNo cache found. Collecting indices from scratch...")
+    print("\nNo cache found. Collecting pixels from scratch...")
     
+    device = torch.device("cuda:0")
     plots_meta = collect_plots_meta(real_dir=real_dir, aug_dir=aug_dir)
     train_meta, val_meta, test_meta = split_plots(plots_meta, split_mode=split_mode, val_ratio=val_ratio, test_ratio=test_ratio, random_state=random_state)
     
-    print("\nCollecting TRAIN indices with parallel GPUs...")
-    train_indices, cnt_train = collect_indices_parallel(train_meta, extrude2final, label2idx, random_state, bg_ratio, NUM_GPUS)
+    print("\nCollecting all pixels per plot...")
+    all_pixels_by_class, class_counts = collect_pixels_per_plot(train_meta + val_meta + test_meta, extrude2final, label2idx, random_state, device)
     
-    print("\nCollecting VAL indices with parallel GPUs...")
-    val_indices, cnt_val = collect_indices_parallel(val_meta, extrude2final, label2idx, random_state, bg_ratio, NUM_GPUS)
+    print("\nClass distribution before balancing:")
+    for class_name, count in class_counts.items():
+        print(f"  {class_name}: {count:,} pixels")
     
-    print("\nCollecting TEST indices with parallel GPUs...")
-    test_indices, cnt_test = collect_indices_parallel(test_meta, extrude2final, label2idx, random_state, bg_ratio, NUM_GPUS)
+    print("\nBalancing classes per plot (50/50 split)...")
+    train_selected_pixels, test_remaining_pixels = balance_classes_per_plot(all_pixels_by_class, bg_ratio=bg_ratio, random_state=random_state)
+    
+    print("\nGenerating train indices...")
+    train_indices = extract_indices_from_pixels(train_selected_pixels)
+    print(f"  Train indices: {len(train_indices):,}")
+    
+    print("\nGenerating test indices...")
+    test_indices = extract_indices_from_pixels(test_remaining_pixels)
+    print(f"  Test indices: {len(test_indices):,}")
+    
+    print("\nSplitting test into val and test...")
+    random.Random(random_state).shuffle(test_indices)
+    n_val = int(len(test_indices) * val_ratio)
+    val_indices = test_indices[:n_val]
+    test_indices_final = test_indices[n_val:]
+    print(f"  Val indices: {len(val_indices):,}")
+    print(f"  Test indices: {len(test_indices_final):,}")
     
     indices_data = {
         'train': train_indices,
         'val': val_indices,
-        'test': test_indices,
+        'test': test_indices_final,
         'config': config,
-        'class_counts': {'train': dict(cnt_train), 'val': dict(cnt_val), 'test': dict(cnt_test)},
+        'class_counts': {'train': {}, 'val': {}, 'test': {}},
         'metadata': {'class_names': class_names, 'label2idx': label2idx, 'patch_size': patch_size, 'bg_ratio': bg_ratio, 'created_at': datetime.now().isoformat()}
     }
     save_indices(indices_data, cache_dir)
-    
-    print("\nDistribution: Pixels per class:")
-    all_cls = sorted(set(list(cnt_train) + list(cnt_val) + list(cnt_test)))
-    print(f"  Class {'':24} Train      Val      Test")
-    print(f"  {'-'*25}  {'-'*9}  {'-'*9}  {'-'*9}")
-    for cls in all_cls:
-        print(f"  {cls:25}  {cnt_train.get(cls,0):9}  {cnt_val.get(cls,0):9}  {cnt_test.get(cls,0):9}")
     
     print("\nExtracting TRAIN patches...")
     train_dataset = StreamingPatchDataset(train_indices, real_dir, aug_dir, patch_size)
@@ -629,7 +591,7 @@ def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json", spli
     print(f"  VAL: {X_val.shape}")
     
     print("\nExtracting TEST patches...")
-    test_dataset = StreamingPatchDataset(test_indices, real_dir, aug_dir, patch_size)
+    test_dataset = StreamingPatchDataset(test_indices_final, real_dir, aug_dir, patch_size)
     X_test_list = []
     y_test_list = []
     for i in range(len(test_dataset)):
@@ -669,7 +631,7 @@ def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json", spli
     
     print(f"\n{'='*60}")
     print(f"GPUs used: {NUM_GPUS}")
-    print(f"BG ratio: {bg_ratio} (bg = {bg_ratio} × annotated)")
+    print(f"BG ratio: {bg_ratio}")
     print(f"Classes: {len(class_names)} -> {class_names}")
     print(f"Bands: {num_bands}")
     print(f"Train patches: {len(X_train):,}")
@@ -679,20 +641,9 @@ def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json", spli
     
     return train_loader, val_loader, test_loader, meta
 
-class PreprocessedDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.from_numpy(X).float()
-        self.y = torch.from_numpy(y).long()
-    
-    def __len__(self):
-        return len(self.y)
-    
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Prepare HSI data for SSFTTnet with 4 GPU parallel + indices cache")
+    parser = argparse.ArgumentParser(description="Prepare HSI data for SSFTTnet with 4 GPU parallel + indices cache + class balancing")
     parser.add_argument("--real_dir", default=None)
     parser.add_argument("--aug_dir", default=None)
     parser.add_argument("--mapping_path", default="mapping.json")
@@ -707,7 +658,7 @@ if __name__ == "__main__":
     parser.add_argument("--random_state", type=int, default=345)
     parser.add_argument("--fit_max_pixels", type=int, default=500000)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--bg_ratio", type=float, default=1.5)
+    parser.add_argument("--bg_ratio", type=float, default=2.0)
     parser.add_argument("--cache_dir", default="indices_cache")
     parser.add_argument("--force_recompute", action="store_true")
     
@@ -728,7 +679,7 @@ if __name__ == "__main__":
     X_b, y_b = next(iter(train_loader))
     print(f"Batch shape: {X_b.shape}   labels: {y_b.shape}")
     print("Ready for SSFTTnet")
-
+```
 
 ############################################################################33
 
