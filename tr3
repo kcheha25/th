@@ -1289,3 +1289,333 @@ if __name__ == "__main__":
     X_b, y_b = next(iter(train_loader))
     print(f"Batch shape: {X_b.shape}   labels: {y_b.shape}")
     print("Ready for SSFTTnet")
+
+
+"""
+train_ssfttnet.py — Entraînement de SSFTTnet avec le pipeline dataset.py
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import confusion_matrix, accuracy_score, classification_report, cohen_kappa_score
+from operator import truediv
+import time
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).parent))
+
+from dataset import build_loaders
+import SSFTTnet
+
+def train(train_loader, epochs, learning_rate=0.001, device=None):
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
+    print(f"\nTraining on device: {device}")
+    
+    # Get number of bands from first batch
+    for data, _ in train_loader:
+        num_bands = data.shape[2]
+        break
+    
+    # Create model with correct number of bands and classes
+    # SSFTTnet expects: n_bands, n_classes, patch_size
+    net = SSFTTnet.SSFTTnet(
+        n_bands=num_bands,
+        n_classes=meta['num_classes'],
+        patch_size=meta['patch_size']
+    ).to(device)
+    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(net.parameters(), lr=learning_rate)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+    
+    total_loss = 0
+    best_loss = float('inf')
+    
+    print("\nStarting training...")
+    print("="*60)
+    
+    for epoch in range(epochs):
+        net.train()
+        epoch_loss = 0
+        batch_count = 0
+        
+        for i, (data, target) in enumerate(train_loader):
+            data, target = data.to(device), target.to(device)
+            
+            outputs = net(data)
+            loss = criterion(outputs, target)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            batch_count += 1
+            
+            if (i + 1) % 50 == 0:
+                print(f'  Epoch [{epoch+1}/{epochs}] Batch [{i+1}/{len(train_loader)}] Loss: {loss.item():.4f}')
+        
+        avg_loss = epoch_loss / batch_count
+        total_loss += avg_loss
+        
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(net.state_dict(), 'cls_params/SSFTTnet_best.pth')
+            print(f'  New best model saved! (loss: {best_loss:.4f})')
+        
+        scheduler.step()
+        
+        print(f'[Epoch {epoch+1}/{epochs}] Avg Loss: {avg_loss:.4f} | Best Loss: {best_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}')
+    
+    print("\n" + "="*60)
+    print("Training finished!")
+    
+    # Save final model
+    torch.save(net.state_dict(), 'cls_params/SSFTTnet_final.pth')
+    
+    return net, device
+
+def test(device, net, test_loader):
+    print("\nTesting model...")
+    net.eval()
+    y_pred_test = []
+    y_test = []
+    
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs = inputs.to(device)
+            outputs = net(inputs)
+            outputs = np.argmax(outputs.cpu().numpy(), axis=1)
+            y_pred_test.extend(outputs)
+            y_test.extend(labels.numpy())
+    
+    return np.array(y_pred_test), np.array(y_test)
+
+def predict_all(device, net, all_loader):
+    print("\nGenerating predictions for all pixels...")
+    net.eval()
+    y_pred_all = []
+    
+    with torch.no_grad():
+        for inputs, _ in all_loader:
+            inputs = inputs.to(device)
+            outputs = net(inputs)
+            outputs = np.argmax(outputs.cpu().numpy(), axis=1)
+            y_pred_all.extend(outputs)
+    
+    return np.array(y_pred_all)
+
+def AA_andEachClassAccuracy(confusion_matrix):
+    list_diag = np.diag(confusion_matrix)
+    list_raw_sum = np.sum(confusion_matrix, axis=1)
+    each_acc = np.nan_to_num(truediv(list_diag, list_raw_sum))
+    average_acc = np.mean(each_acc)
+    return each_acc, average_acc
+
+def acc_reports(y_test, y_pred_test, class_names):
+    classification = classification_report(y_test, y_pred_test, digits=4, target_names=class_names)
+    oa = accuracy_score(y_test, y_pred_test)
+    confusion = confusion_matrix(y_test, y_pred_test)
+    each_acc, aa = AA_andEachClassAccuracy(confusion)
+    kappa = cohen_kappa_score(y_test, y_pred_test)
+    
+    return classification, oa*100, confusion, each_acc*100, aa*100, kappa*100
+
+def create_all_data_loader(train_loader, val_loader, test_loader):
+    all_indices = []
+    all_labels = []
+    
+    for loader in [train_loader, val_loader, test_loader]:
+        for data, labels in loader:
+            all_indices.append(data)
+            all_labels.append(labels)
+    
+    if all_indices:
+        all_data = torch.cat(all_indices, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
+        
+        class AllDataset(torch.utils.data.Dataset):
+            def __init__(self, X, y):
+                self.X = X
+                self.y = y
+            def __len__(self):
+                return len(self.y)
+            def __getitem__(self, idx):
+                return self.X[idx], self.y[idx]
+        
+        all_dataset = AllDataset(all_data, all_labels)
+        all_loader = torch.utils.data.DataLoader(
+            all_dataset, 
+            batch_size=64, 
+            shuffle=False, 
+            num_workers=0
+        )
+        return all_loader
+    return None
+
+if __name__ == '__main__':
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train SSFTTnet with HSI data")
+    parser.add_argument("--real_dir", default=None)
+    parser.add_argument("--aug_dir", default=None)
+    parser.add_argument("--mapping_path", default="mapping.json")
+    parser.add_argument("--split_mode", default="aug_real", choices=["aug_real", "shuffle"])
+    parser.add_argument("--use_pca", action="store_true", default=True)
+    parser.add_argument("--no_pca", action="store_false", dest="use_pca")
+    parser.add_argument("--pca_components", type=int, default=30)
+    parser.add_argument("--patch_size", type=int, default=13)
+    parser.add_argument("--test_ratio", type=float, default=0.15)
+    parser.add_argument("--val_ratio", type=float, default=0.15)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--random_state", type=int, default=345)
+    parser.add_argument("--bg_ratio", type=float, default=2.0)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--learning_rate", type=float, default=0.001)
+    parser.add_argument("--force_recompute", action="store_true")
+    
+    args = parser.parse_args()
+    
+    if args.real_dir is None and args.aug_dir is None:
+        parser.error("At least one of --real_dir or --aug_dir must be provided")
+    
+    print("="*60)
+    print("LOADING DATA WITH CUSTOM PIPELINE")
+    print("="*60)
+    
+    tic_load = time.perf_counter()
+    
+    train_loader, val_loader, test_loader, meta = build_loaders(
+        real_dir=args.real_dir,
+        aug_dir=args.aug_dir,
+        mapping_path=args.mapping_path,
+        split_mode=args.split_mode,
+        use_pca=args.use_pca,
+        pca_components=args.pca_components,
+        patch_size=args.patch_size,
+        test_ratio=args.test_ratio,
+        val_ratio=args.val_ratio,
+        batch_size=args.batch_size,
+        random_state=args.random_state,
+        num_workers=args.num_workers,
+        bg_ratio=args.bg_ratio,
+        force_recompute=args.force_recompute
+    )
+    
+    toc_load = time.perf_counter()
+    load_time = toc_load - tic_load
+    
+    print(f"\nData loading completed in {load_time:.2f} seconds")
+    print(f"Number of classes: {meta['num_classes']}")
+    print(f"Class names: {meta['class_names']}")
+    print(f"Number of bands: {meta['num_bands']}")
+    print(f"Patch size: {meta['patch_size']}")
+    
+    if val_loader is not None and len(val_loader.dataset) > 0:
+        print(f"Using validation set of size: {len(val_loader.dataset)}")
+        use_validation = True
+    else:
+        print("No validation set, using test for validation")
+        val_loader = test_loader
+        use_validation = False
+    
+    print("\n" + "="*60)
+    print("TRAINING SSFTTNET")
+    print("="*60)
+    
+    tic_train = time.perf_counter()
+    
+    net, device = train(
+        train_loader, 
+        epochs=args.epochs, 
+        learning_rate=args.learning_rate
+    )
+    
+    toc_train = time.perf_counter()
+    train_time = toc_train - tic_train
+    
+    print("\n" + "="*60)
+    print("TESTING SSFTTNET")
+    print("="*60)
+    
+    tic_test = time.perf_counter()
+    
+    y_pred_test, y_test = test(device, net, test_loader)
+    
+    toc_test = time.perf_counter()
+    test_time = toc_test - tic_test
+    
+    print("\n" + "="*60)
+    print("EVALUATION METRICS")
+    print("="*60)
+    
+    classification, oa, confusion, each_acc, aa, kappa = acc_reports(
+        y_test, y_pred_test, meta['class_names']
+    )
+    
+    print(f"\nOverall Accuracy (OA): {oa:.2f}%")
+    print(f"Average Accuracy (AA): {aa:.2f}%")
+    print(f"Kappa Coefficient: {kappa:.2f}%")
+    print(f"\nPer-class Accuracy:")
+    for i, (name, acc) in enumerate(zip(meta['class_names'], each_acc)):
+        print(f"  {name:25}: {acc:.2f}%")
+    
+    print(f"\nClassification Report:")
+    print(classification)
+    
+    print(f"\nConfusion Matrix:")
+    print(confusion)
+    
+    print("\n" + "="*60)
+    print("TIMING SUMMARY")
+    print("="*60)
+    print(f"Data Loading Time: {load_time:.2f} seconds")
+    print(f"Training Time: {train_time:.2f} seconds ({train_time/60:.2f} minutes)")
+    print(f"Testing Time: {test_time:.2f} seconds")
+    print(f"Total Time: {load_time + train_time + test_time:.2f} seconds")
+    
+    results_dir = Path("cls_results")
+    results_dir.mkdir(exist_ok=True)
+    
+    file_name = results_dir / "classification_report.txt"
+    with open(file_name, 'w') as x_file:
+        x_file.write(f"Configuration:\n")
+        x_file.write(f"  real_dir: {args.real_dir}\n")
+        x_file.write(f"  aug_dir: {args.aug_dir}\n")
+        x_file.write(f"  split_mode: {args.split_mode}\n")
+        x_file.write(f"  use_pca: {args.use_pca}\n")
+        x_file.write(f"  pca_components: {args.pca_components}\n")
+        x_file.write(f"  patch_size: {args.patch_size}\n")
+        x_file.write(f"  bg_ratio: {args.bg_ratio}\n")
+        x_file.write(f"  epochs: {args.epochs}\n")
+        x_file.write(f"  learning_rate: {args.learning_rate}\n")
+        x_file.write(f"\n")
+        x_file.write(f"Data Loading Time (s): {load_time}\n")
+        x_file.write(f"Training Time (s): {train_time}\n")
+        x_file.write(f"Test Time (s): {test_time}\n")
+        x_file.write(f"\n")
+        x_file.write(f"Overall Accuracy (%): {oa}\n")
+        x_file.write(f"Average Accuracy (%): {aa}\n")
+        x_file.write(f"Kappa Accuracy (%): {kappa}\n")
+        x_file.write(f"\n")
+        x_file.write(f"Each Accuracy (%): {each_acc}\n")
+        x_file.write(f"\n")
+        x_file.write(f"Classification Report:\n{classification}\n")
+        x_file.write(f"\n")
+        x_file.write(f"Confusion Matrix:\n{confusion}\n")
+    
+    print(f"\nResults saved to: {file_name}")
+    
+    model_dir = Path("cls_params")
+    model_dir.mkdir(exist_ok=True)
+    torch.save(net.state_dict(), model_dir / "SSFTTnet_final.pth")
+    print(f"Model saved to: {model_dir / 'SSFTTnet_final.pth'}")
+    
+    print("\n" + "="*60)
+    print("TRAINING COMPLETE!")
+    print("="*60)
