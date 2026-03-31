@@ -1,5 +1,5 @@
 """
-dataset.py — Pipeline HSI → SSFTTnet [4 GPU PARALLEL + INDICES CACHE ONLY]
+dataset.py — Pipeline HSI → SSFTTnet [4 GPU PARALLEL + FULL PATCHES CACHE AFTER PCA]
 """
 
 import gc
@@ -237,49 +237,7 @@ def extract_patches_gpu(cube_BHW: np.ndarray, coords: np.ndarray, patch_size: in
         torch.cuda.empty_cache()
     return patches
 
-def save_indices(indices_data: dict, cache_dir: str = "indices_cache"):
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(exist_ok=True, parents=True)
-    config = indices_data['config']
-    config_str = f"{config['real_dir']}_{config['aug_dir']}_{config['split_mode']}_{config['patch_size']}_{config['random_state']}_{config.get('bg_ratio', 1.5)}"
-    config_hash = hashlib.md5(config_str.encode()).hexdigest()[:12]
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    cache_file = cache_dir / f"indices_{config_hash}_{timestamp}.pkl"
-    existing_files = sorted(cache_dir.glob(f"indices_{config_hash}_*.pkl"))
-    for old_file in existing_files[:-5]:
-        old_file.unlink()
-        print(f"  Cache: removed old cache {old_file.name}")
-    with open(cache_file, 'wb') as f:
-        pickle.dump(indices_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-    size_mb = cache_file.stat().st_size / 1e6
-    print(f"\nCache saved: {cache_file.name} ({size_mb:.1f} MB)")
-    print(f"  Train: {len(indices_data['train']):,} indices")
-    print(f"  Val: {len(indices_data['val']):,} indices")
-    print(f"  Test: {len(indices_data['test']):,} indices")
-    return cache_file
-
-def load_indices(cache_dir: str = "indices_cache", config_hash: str = None):
-    cache_dir = Path(cache_dir)
-    if not cache_dir.exists():
-        return None
-    if config_hash:
-        cache_files = list(cache_dir.glob(f"indices_{config_hash}_*.pkl"))
-    else:
-        cache_files = list(cache_dir.glob("indices_*.pkl"))
-    if not cache_files:
-        return None
-    latest = max(cache_files, key=lambda x: x.stem)
-    print(f"\nCache loaded: {latest.name}")
-    with open(latest, 'rb') as f:
-        indices_data = pickle.load(f)
-    size_mb = latest.stat().st_size / 1e6
-    print(f"  Size: {size_mb:.1f} MB")
-    print(f"  Train: {len(indices_data['train']):,} indices")
-    print(f"  Val: {len(indices_data['val']):,} indices")
-    print(f"  Test: {len(indices_data['test']):,} indices")
-    return indices_data
-
-def collect_indices_for_plot(meta, extrude2final, label2idx, random_state, bg_ratio, device_id):
+def extract_patches_for_plot(meta, extrude2final, label2idx, patch_size, random_state, bg_ratio, device_id):
     device = torch.device(f"cuda:{device_id}")
     name = meta["name"]
     source = meta["source"]
@@ -291,7 +249,7 @@ def collect_indices_for_plot(meta, extrude2final, label2idx, random_state, bg_ra
         shapes = _load_shapes(meta["jsn"])
     except Exception as e:
         print(f"  Warning: {name} ignored: {e}")
-        return None
+        return None, None, None
     
     B, H, W = cube.shape
     label_map = build_label_map_gpu(cube, shapes, extrude2final, label2idx, device)
@@ -304,7 +262,7 @@ def collect_indices_for_plot(meta, extrude2final, label2idx, random_state, bg_ra
         print(f"  Skip: {name} — no pixels")
         del cube
         gc.collect()
-        return None
+        return None, None, None
     
     keep_mask = balance_background(labels_all, bg_idx, rng, bg_ratio)
     rows_k = rows[keep_mask]
@@ -315,34 +273,48 @@ def collect_indices_for_plot(meta, extrude2final, label2idx, random_state, bg_ra
     n_bg_raw = int((labels_all == bg_idx).sum())
     n_bg_kept = int((labels_k == bg_idx).sum())
     
-    del labels_all, rows, cols, keep_mask, cube
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    del labels_all, rows, cols, keep_mask
     gc.collect()
     
     if len(rows_k) == 0:
         print(f"  Skip: {name} — 0 pixels after balancing")
-        return None
+        del cube
+        gc.collect()
+        return None, None, None
     
-    indices_list = []
-    for r, c, lbl in zip(rows_k, cols_k, labels_k):
-        indices_list.append({
-            'cube_name': name,
-            'source': source,
-            'row': int(r),
-            'col': int(c),
-            'label': int(lbl),
-            'num_bands': B
-        })
+    coords = np.stack([rows_k, cols_k], axis=1)
     
-    print(f"  GPU {device_id} | {source:6} | {name:30} | annotated={n_fg:6} | raw bg={n_bg_raw:7} -> kept bg={n_bg_kept:6} | indices={len(indices_list):7}")
+    n_patches = len(coords)
+    batch_size = 50000
+    all_patches = []
     
-    return indices_list
+    for start in range(0, n_patches, batch_size):
+        end = min(start + batch_size, n_patches)
+        batch_coords = coords[start:end]
+        patches_gpu = extract_patches_gpu(cube, batch_coords, patch_size, device)
+        patches_cpu = patches_gpu.cpu().numpy()
+        del patches_gpu
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        all_patches.append(patches_cpu)
+        gc.collect()
+    
+    patches = np.concatenate(all_patches, axis=0)
+    
+    del cube, coords, all_patches
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    gc.collect()
+    
+    print(f"  GPU {device_id} | {source:6} | {name:30} | annotated={n_fg:6} | raw bg={n_bg_raw:7} -> kept bg={n_bg_kept:6} | patches={len(labels_k):7}")
+    
+    return patches, labels_k, {int(lbl): 1 for lbl in labels_k}
 
-def collect_indices_parallel(plot_meta_list, extrude2final, label2idx, random_state, bg_ratio, num_gpus=NUM_GPUS):
-    print(f"\nCollecting indices from {len(plot_meta_list)} plots using {num_gpus} GPUs")
+def extract_patches_parallel(plot_meta_list, extrude2final, label2idx, patch_size, random_state, bg_ratio, num_gpus=NUM_GPUS):
+    print(f"\nExtracting patches from {len(plot_meta_list)} plots using {num_gpus} GPUs")
     
-    all_indices = []
+    all_patches = []
+    all_labels = []
     class_counts = defaultdict(int)
     idx2name = {v: k for k, v in label2idx.items()}
     
@@ -360,17 +332,18 @@ def collect_indices_parallel(plot_meta_list, extrude2final, label2idx, random_st
         with ThreadPoolExecutor(max_workers=num_gpus) as executor:
             futures = {}
             for idx, meta, gpu_id in batch_plots:
-                future = executor.submit(collect_indices_for_plot, meta, extrude2final, label2idx, random_state, bg_ratio, gpu_id)
+                future = executor.submit(extract_patches_for_plot, meta, extrude2final, label2idx, patch_size, random_state, bg_ratio, gpu_id)
                 futures[future] = (idx, meta)
             
             for future in as_completed(futures):
                 idx, meta = futures[future]
                 try:
-                    indices = future.result()
-                    if indices is not None:
-                        all_indices.extend(indices)
-                        for item in indices:
-                            class_counts[idx2name[item['label']]] += 1
+                    patches, labels, counts = future.result()
+                    if patches is not None and labels is not None:
+                        all_patches.append(patches)
+                        all_labels.append(labels)
+                        for lbl, cnt in counts.items():
+                            class_counts[idx2name[lbl]] += cnt
                 except Exception as e:
                     print(f"  Error processing {meta['name']}: {e}")
         
@@ -379,69 +352,15 @@ def collect_indices_parallel(plot_meta_list, extrude2final, label2idx, random_st
         torch.cuda.empty_cache()
         gc.collect()
     
-    return all_indices, class_counts
+    if not all_patches:
+        return None, None, class_counts
+    
+    X = np.concatenate(all_patches, axis=0)
+    y = np.concatenate(all_labels, axis=0)
+    
+    return X, y, class_counts
 
-class StreamingPatchDataset(Dataset):
-    def __init__(self, indices_list, cubes_dir, patch_size):
-        self.indices = indices_list
-        self.cubes_dir = Path(cubes_dir)
-        self.patch_size = patch_size
-        self.cube_cache = {}
-        self.cache_max_size = 3
-        self.lock = threading.Lock()
-    
-    def _load_cube(self, cube_name):
-        with self.lock:
-            if cube_name in self.cube_cache:
-                return self.cube_cache[cube_name]
-        
-        hdr_path = self.cubes_dir / f"{cube_name}.hdr"
-        if not hdr_path.exists():
-            raise FileNotFoundError(f"Cube not found: {cube_name}")
-        
-        source = "real" if "plot" in cube_name else "aug"
-        cube, _ = _load_envi_auto(hdr_path, source)
-        
-        with self.lock:
-            if len(self.cube_cache) >= self.cache_max_size:
-                oldest = next(iter(self.cube_cache))
-                del self.cube_cache[oldest]
-            self.cube_cache[cube_name] = cube
-        
-        return cube
-    
-    def __len__(self):
-        return len(self.indices)
-    
-    def __getitem__(self, idx):
-        item = self.indices[idx]
-        cube = self._load_cube(item['cube_name'])
-        
-        B, H, W = cube.shape
-        r, c = item['row'], item['col']
-        ps = self.patch_size
-        margin = ps // 2
-        
-        r_start = max(0, r - margin)
-        r_end = min(H, r + margin + 1)
-        c_start = max(0, c - margin)
-        c_end = min(W, c + margin + 1)
-        
-        patch = cube[:, r_start:r_end, c_start:c_end]
-        
-        if patch.shape[1] != ps or patch.shape[2] != ps:
-            patch_padded = np.zeros((B, ps, ps), dtype=np.float32)
-            r_offset = max(0, margin - r)
-            c_offset = max(0, margin - c)
-            patch_padded[:, r_offset:r_offset+patch.shape[1], c_offset:c_offset+patch.shape[2]] = patch
-            patch = patch_padded
-        
-        patch = torch.from_numpy(patch).float()
-        label = torch.tensor(item['label'], dtype=torch.long)
-        
-        return patch, label
-
-def apply_pca_to_tensor(X, pca_components, fit_max_pixels=500000):
+def apply_pca_to_patches(X, pca_components, fit_max_pixels=500000):
     N, B, ps, _ = X.shape
     X_flat = X.transpose(0, 2, 3, 1).reshape(-1, B)
     
@@ -466,213 +385,64 @@ def apply_pca_to_tensor(X, pca_components, fit_max_pixels=500000):
     
     return X_pca, pca
 
-def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json", split_mode="aug_real", use_pca=True, pca_components=30, patch_size=13, test_ratio=0.15, val_ratio=0.15, batch_size=64, random_state=345, fit_max_pixels=500000, num_workers=4, bg_ratio=1.5, cache_dir="indices_cache", force_recompute=False):
-    
-    extrude2final, class_names, label2idx = load_mapping(mapping_path)
-    
+def save_full_cache(X_train, y_train, X_val, y_val, X_test, y_test, config, class_names, label2idx, patch_size, num_bands, bg_ratio, cache_dir="full_cache"):
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(exist_ok=True, parents=True)
     
-    config = {
-        'real_dir': str(real_dir), 'aug_dir': str(aug_dir), 'split_mode': split_mode,
-        'patch_size': patch_size, 'random_state': random_state, 'bg_ratio': bg_ratio
-    }
-    config_str = f"{config['real_dir']}_{config['aug_dir']}_{config['split_mode']}_{config['patch_size']}_{config['random_state']}_{config['bg_ratio']}"
+    config_str = f"{config['real_dir']}_{config['aug_dir']}_{config['split_mode']}_{config['patch_size']}_{config['random_state']}_{config['bg_ratio']}_{config['use_pca']}_{config['pca_components']}"
     config_hash = hashlib.md5(config_str.encode()).hexdigest()[:12]
+    cache_file = cache_dir / f"full_patches_{config_hash}.pkl"
     
-    if not force_recompute:
-        indices_data = load_indices(cache_dir, config_hash)
-        if indices_data is not None and indices_data['config'] == config:
-            print("\nCache found! Using saved indices.")
-            train_indices = indices_data['train']
-            val_indices = indices_data['val']
-            test_indices = indices_data['test']
-            
-            cubes_dir = real_dir if real_dir else aug_dir
-            
-            print("\nExtracting TRAIN patches...")
-            train_dataset = StreamingPatchDataset(train_indices, cubes_dir, patch_size)
-            X_train_list = []
-            y_train_list = []
-            for i in range(len(train_dataset)):
-                x, y = train_dataset[i]
-                X_train_list.append(x.numpy())
-                y_train_list.append(y.numpy())
-            X_train = np.stack(X_train_list)
-            y_train = np.array(y_train_list)
-            print(f"  TRAIN: {X_train.shape}")
-            
-            print("\nExtracting VAL patches...")
-            val_dataset = StreamingPatchDataset(val_indices, cubes_dir, patch_size)
-            X_val_list = []
-            y_val_list = []
-            for i in range(len(val_dataset)):
-                x, y = val_dataset[i]
-                X_val_list.append(x.numpy())
-                y_val_list.append(y.numpy())
-            X_val = np.stack(X_val_list)
-            y_val = np.array(y_val_list)
-            print(f"  VAL: {X_val.shape}")
-            
-            print("\nExtracting TEST patches...")
-            test_dataset = StreamingPatchDataset(test_indices, cubes_dir, patch_size)
-            X_test_list = []
-            y_test_list = []
-            for i in range(len(test_dataset)):
-                x, y = test_dataset[i]
-                X_test_list.append(x.numpy())
-                y_test_list.append(y.numpy())
-            X_test = np.stack(X_test_list)
-            y_test = np.array(y_test_list)
-            print(f"  TEST: {X_test.shape}")
-            
-            if use_pca and len(X_train) > 0:
-                print(f"\nApplying PCA ({pca_components} components) to TRAIN...")
-                X_train, pca_model = apply_pca_to_tensor(X_train, pca_components, fit_max_pixels)
-                print(f"\nApplying PCA to VAL...")
-                X_val, _ = apply_pca_to_tensor(X_val, pca_components, fit_max_pixels)
-                print(f"\nApplying PCA to TEST...")
-                X_test, _ = apply_pca_to_tensor(X_test, pca_components, fit_max_pixels)
-                num_bands = pca_components
-            else:
-                num_bands = X_train.shape[1]
-            
-            X_train = X_train[:, np.newaxis, :, :, :]
-            X_val = X_val[:, np.newaxis, :, :, :]
-            X_test = X_test[:, np.newaxis, :, :, :]
-            
-            print(f"\nFinal shapes:")
-            print(f"  X_train: {X_train.shape}")
-            print(f"  X_val: {X_val.shape}")
-            print(f"  X_test: {X_test.shape}")
-            
-            pin = torch.cuda.is_available()
-            train_loader = DataLoader(PreprocessedDataset(X_train, y_train), batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin)
-            val_loader = DataLoader(PreprocessedDataset(X_val, y_val), batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin)
-            test_loader = DataLoader(PreprocessedDataset(X_test, y_test), batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin)
-            
-            meta = {"class_names": class_names, "label2idx": label2idx, "num_classes": len(class_names), "num_bands": num_bands, "patch_size": patch_size}
-            
-            print(f"\n{'='*60}")
-            print(f"Loaded from cache!")
-            print(f"GPUs used: {NUM_GPUS}")
-            print(f"BG ratio: {bg_ratio}")
-            print(f"Classes: {len(class_names)} -> {class_names}")
-            print(f"Bands: {num_bands}")
-            print(f"Train patches: {len(X_train):,}")
-            print(f"Val patches: {len(X_val):,}")
-            print(f"Test patches: {len(X_test):,}")
-            print(f"{'='*60}\n")
-            
-            return train_loader, val_loader, test_loader, meta
-    
-    print("\nNo cache found. Collecting indices from scratch...")
-    
-    plots_meta = collect_plots_meta(real_dir=real_dir, aug_dir=aug_dir)
-    train_meta, val_meta, test_meta = split_plots(plots_meta, split_mode=split_mode, val_ratio=val_ratio, test_ratio=test_ratio, random_state=random_state)
-    
-    print("\nCollecting TRAIN indices with parallel GPUs...")
-    train_indices, cnt_train = collect_indices_parallel(train_meta, extrude2final, label2idx, random_state, bg_ratio, NUM_GPUS)
-    
-    print("\nCollecting VAL indices with parallel GPUs...")
-    val_indices, cnt_val = collect_indices_parallel(val_meta, extrude2final, label2idx, random_state, bg_ratio, NUM_GPUS)
-    
-    print("\nCollecting TEST indices with parallel GPUs...")
-    test_indices, cnt_test = collect_indices_parallel(test_meta, extrude2final, label2idx, random_state, bg_ratio, NUM_GPUS)
-    
-    indices_data = {
-        'train': train_indices,
-        'val': val_indices,
-        'test': test_indices,
+    cache_data = {
+        'X_train': X_train,
+        'y_train': y_train,
+        'X_val': X_val,
+        'y_val': y_val,
+        'X_test': X_test,
+        'y_test': y_test,
         'config': config,
-        'class_counts': {'train': dict(cnt_train), 'val': dict(cnt_val), 'test': dict(cnt_test)},
-        'metadata': {'class_names': class_names, 'label2idx': label2idx, 'patch_size': patch_size, 'bg_ratio': bg_ratio, 'created_at': datetime.now().isoformat()}
+        'class_names': class_names,
+        'label2idx': label2idx,
+        'patch_size': patch_size,
+        'num_bands': num_bands,
+        'bg_ratio': bg_ratio,
+        'created_at': datetime.now().isoformat()
     }
-    save_indices(indices_data, cache_dir)
     
-    print("\nDistribution: Pixels per class:")
-    all_cls = sorted(set(list(cnt_train) + list(cnt_val) + list(cnt_test)))
-    print(f"  Class {'':24} Train      Val      Test")
-    print(f"  {'-'*25}  {'-'*9}  {'-'*9}  {'-'*9}")
-    for cls in all_cls:
-        print(f"  {cls:25}  {cnt_train.get(cls,0):9}  {cnt_val.get(cls,0):9}  {cnt_test.get(cls,0):9}")
+    with open(cache_file, 'wb') as f:
+        pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
     
-    cubes_dir = real_dir if real_dir else aug_dir
+    size_gb = cache_file.stat().st_size / 1e9
+    print(f"\nFull cache saved: {cache_file.name} ({size_gb:.2f} GB)")
+    print(f"  Train patches: {len(y_train):,}")
+    print(f"  Val patches: {len(y_val):,}")
+    print(f"  Test patches: {len(y_test):,}")
+    print(f"  Bands after PCA: {num_bands}")
     
-    print("\nExtracting TRAIN patches...")
-    train_dataset = StreamingPatchDataset(train_indices, cubes_dir, patch_size)
-    X_train_list = []
-    y_train_list = []
-    for i in range(len(train_dataset)):
-        x, y = train_dataset[i]
-        X_train_list.append(x.numpy())
-        y_train_list.append(y.numpy())
-    X_train = np.stack(X_train_list)
-    y_train = np.array(y_train_list)
-    print(f"  TRAIN: {X_train.shape}")
+    return cache_file
+
+def load_full_cache(cache_dir, config):
+    cache_dir = Path(cache_dir)
     
-    print("\nExtracting VAL patches...")
-    val_dataset = StreamingPatchDataset(val_indices, cubes_dir, patch_size)
-    X_val_list = []
-    y_val_list = []
-    for i in range(len(val_dataset)):
-        x, y = val_dataset[i]
-        X_val_list.append(x.numpy())
-        y_val_list.append(y.numpy())
-    X_val = np.stack(X_val_list)
-    y_val = np.array(y_val_list)
-    print(f"  VAL: {X_val.shape}")
+    config_str = f"{config['real_dir']}_{config['aug_dir']}_{config['split_mode']}_{config['patch_size']}_{config['random_state']}_{config['bg_ratio']}_{config['use_pca']}_{config['pca_components']}"
+    config_hash = hashlib.md5(config_str.encode()).hexdigest()[:12]
+    cache_file = cache_dir / f"full_patches_{config_hash}.pkl"
     
-    print("\nExtracting TEST patches...")
-    test_dataset = StreamingPatchDataset(test_indices, cubes_dir, patch_size)
-    X_test_list = []
-    y_test_list = []
-    for i in range(len(test_dataset)):
-        x, y = test_dataset[i]
-        X_test_list.append(x.numpy())
-        y_test_list.append(y.numpy())
-    X_test = np.stack(X_test_list)
-    y_test = np.array(y_test_list)
-    print(f"  TEST: {X_test.shape}")
+    if not cache_file.exists():
+        return None
     
-    if use_pca and len(X_train) > 0:
-        print(f"\nApplying PCA ({pca_components} components) to TRAIN...")
-        X_train, pca_model = apply_pca_to_tensor(X_train, pca_components, fit_max_pixels)
-        print(f"\nApplying PCA to VAL...")
-        X_val, _ = apply_pca_to_tensor(X_val, pca_components, fit_max_pixels)
-        print(f"\nApplying PCA to TEST...")
-        X_test, _ = apply_pca_to_tensor(X_test, pca_components, fit_max_pixels)
-        num_bands = pca_components
-    else:
-        num_bands = X_train.shape[1]
+    print(f"\nLoading full cache: {cache_file.name}")
+    with open(cache_file, 'rb') as f:
+        data = pickle.load(f)
     
-    X_train = X_train[:, np.newaxis, :, :, :]
-    X_val = X_val[:, np.newaxis, :, :, :]
-    X_test = X_test[:, np.newaxis, :, :, :]
+    size_gb = cache_file.stat().st_size / 1e9
+    print(f"  Size: {size_gb:.2f} GB")
+    print(f"  Train: {len(data['y_train']):,} patches")
+    print(f"  Val: {len(data['y_val']):,} patches")
+    print(f"  Test: {len(data['y_test']):,} patches")
+    print(f"  Bands after PCA: {data['num_bands']}")
     
-    print(f"\nFinal shapes:")
-    print(f"  X_train: {X_train.shape}")
-    print(f"  X_val: {X_val.shape}")
-    print(f"  X_test: {X_test.shape}")
-    
-    pin = torch.cuda.is_available()
-    train_loader = DataLoader(PreprocessedDataset(X_train, y_train), batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin)
-    val_loader = DataLoader(PreprocessedDataset(X_val, y_val), batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin)
-    test_loader = DataLoader(PreprocessedDataset(X_test, y_test), batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin)
-    
-    meta = {"class_names": class_names, "label2idx": label2idx, "num_classes": len(class_names), "num_bands": num_bands, "patch_size": patch_size}
-    
-    print(f"\n{'='*60}")
-    print(f"GPUs used: {NUM_GPUS}")
-    print(f"BG ratio: {bg_ratio} (bg = {bg_ratio} × annotated)")
-    print(f"Classes: {len(class_names)} -> {class_names}")
-    print(f"Bands: {num_bands}")
-    print(f"Train patches: {len(X_train):,}")
-    print(f"Val patches: {len(X_val):,}")
-    print(f"Test patches: {len(X_test):,}")
-    print(f"{'='*60}\n")
-    
-    return train_loader, val_loader, test_loader, meta
+    return data
 
 class PreprocessedDataset(Dataset):
     def __init__(self, X, y):
@@ -685,9 +455,131 @@ class PreprocessedDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
+def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json", split_mode="aug_real", use_pca=True, pca_components=30, patch_size=13, test_ratio=0.15, val_ratio=0.15, batch_size=64, random_state=345, fit_max_pixels=500000, num_workers=4, bg_ratio=1.5, cache_dir="full_cache", force_recompute=False):
+    
+    extrude2final, class_names, label2idx = load_mapping(mapping_path)
+    
+    config = {
+        'real_dir': str(real_dir), 'aug_dir': str(aug_dir), 'split_mode': split_mode,
+        'patch_size': patch_size, 'random_state': random_state, 'bg_ratio': bg_ratio,
+        'use_pca': use_pca, 'pca_components': pca_components if use_pca else 0,
+        'test_ratio': test_ratio, 'val_ratio': val_ratio
+    }
+    
+    if not force_recompute:
+        cached_data = load_full_cache(cache_dir, config)
+        if cached_data is not None:
+            print("\n" + "="*60)
+            print("LOADED FROM CACHE - READY IN SECONDS!")
+            print("="*60)
+            
+            X_train = cached_data['X_train']
+            y_train = cached_data['y_train']
+            X_val = cached_data['X_val']
+            y_val = cached_data['y_val']
+            X_test = cached_data['X_test']
+            y_test = cached_data['y_test']
+            num_bands = cached_data['num_bands']
+            
+            pin = torch.cuda.is_available()
+            train_loader = DataLoader(PreprocessedDataset(X_train, y_train), batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin)
+            val_loader = DataLoader(PreprocessedDataset(X_val, y_val), batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin)
+            test_loader = DataLoader(PreprocessedDataset(X_test, y_test), batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin)
+            
+            meta = {"class_names": class_names, "label2idx": label2idx, "num_classes": len(class_names), "num_bands": num_bands, "patch_size": patch_size}
+            
+            print(f"\n{'='*60}")
+            print(f"Loaded from cache - instant!")
+            print(f"GPUs available: {NUM_GPUS}")
+            print(f"BG ratio: {bg_ratio}")
+            print(f"Classes: {len(class_names)} -> {class_names}")
+            print(f"Bands: {num_bands}")
+            print(f"Train patches: {len(X_train):,}")
+            print(f"Val patches: {len(X_val):,}")
+            print(f"Test patches: {len(X_test):,}")
+            print(f"{'='*60}\n")
+            
+            return train_loader, val_loader, test_loader, meta
+    
+    print("\n" + "="*60)
+    print("NO CACHE FOUND - PROCESSING FROM SCRATCH (THIS WILL TAKE 1-2 HOURS)")
+    print("="*60)
+    
+    print("\nStep 1: Collecting plot metadata...")
+    plots_meta = collect_plots_meta(real_dir=real_dir, aug_dir=aug_dir)
+    
+    print("\nStep 2: Splitting plots...")
+    train_meta, val_meta, test_meta = split_plots(plots_meta, split_mode=split_mode, val_ratio=val_ratio, test_ratio=test_ratio, random_state=random_state)
+    
+    print("\nStep 3: Extracting TRAIN patches with parallel GPUs...")
+    X_train, y_train, cnt_train = extract_patches_parallel(train_meta, extrude2final, label2idx, patch_size, random_state, bg_ratio, NUM_GPUS)
+    print(f"  TRAIN shape: {X_train.shape}")
+    
+    print("\nStep 4: Extracting VAL patches with parallel GPUs...")
+    X_val, y_val, cnt_val = extract_patches_parallel(val_meta, extrude2final, label2idx, patch_size, random_state, bg_ratio, NUM_GPUS)
+    print(f"  VAL shape: {X_val.shape}")
+    
+    print("\nStep 5: Extracting TEST patches with parallel GPUs...")
+    X_test, y_test, cnt_test = extract_patches_parallel(test_meta, extrude2final, label2idx, patch_size, random_state, bg_ratio, NUM_GPUS)
+    print(f"  TEST shape: {X_test.shape}")
+    
+    print("\nDistribution: Pixels per class:")
+    all_cls = sorted(set(list(cnt_train) + list(cnt_val) + list(cnt_test)))
+    print(f"  Class {'':24} Train      Val      Test")
+    print(f"  {'-'*25}  {'-'*9}  {'-'*9}  {'-'*9}")
+    for cls in all_cls:
+        print(f"  {cls:25}  {cnt_train.get(cls,0):9}  {cnt_val.get(cls,0):9}  {cnt_test.get(cls,0):9}")
+    
+    if use_pca and len(X_train) > 0:
+        print(f"\nStep 6: Applying PCA ({pca_components} components)...")
+        print("  Applying PCA to TRAIN...")
+        X_train, pca_model = apply_pca_to_patches(X_train, pca_components, fit_max_pixels)
+        print("  Applying PCA to VAL...")
+        X_val, _ = apply_pca_to_patches(X_val, pca_components, fit_max_pixels)
+        print("  Applying PCA to TEST...")
+        X_test, _ = apply_pca_to_patches(X_test, pca_components, fit_max_pixels)
+        num_bands = pca_components
+    else:
+        num_bands = X_train.shape[1]
+    
+    print(f"\nStep 7: Adding channel dimension for SSFTTnet...")
+    X_train = X_train[:, np.newaxis, :, :, :]
+    X_val = X_val[:, np.newaxis, :, :, :]
+    X_test = X_test[:, np.newaxis, :, :, :]
+    
+    print(f"\nFinal shapes:")
+    print(f"  X_train: {X_train.shape}")
+    print(f"  X_val: {X_val.shape}")
+    print(f"  X_test: {X_test.shape}")
+    
+    print("\nStep 8: Saving to cache for next time...")
+    save_full_cache(X_train, y_train, X_val, y_val, X_test, y_test, config, class_names, label2idx, patch_size, num_bands, bg_ratio, cache_dir)
+    
+    pin = torch.cuda.is_available()
+    train_loader = DataLoader(PreprocessedDataset(X_train, y_train), batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin)
+    val_loader = DataLoader(PreprocessedDataset(X_val, y_val), batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin)
+    test_loader = DataLoader(PreprocessedDataset(X_test, y_test), batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin)
+    
+    meta = {"class_names": class_names, "label2idx": label2idx, "num_classes": len(class_names), "num_bands": num_bands, "patch_size": patch_size}
+    
+    print(f"\n{'='*60}")
+    print(f"PROCESSING COMPLETE!")
+    print(f"GPUs used: {NUM_GPUS}")
+    print(f"BG ratio: {bg_ratio} (bg = {bg_ratio} × annotated)")
+    print(f"Classes: {len(class_names)} -> {class_names}")
+    print(f"Bands after PCA: {num_bands}")
+    print(f"Train patches: {len(X_train):,}")
+    print(f"Val patches: {len(X_val):,}")
+    print(f"Test patches: {len(X_test):,}")
+    print(f"Cache saved to: {cache_dir}/full_patches_*.pkl")
+    print(f"{'='*60}\n")
+    print("Next run will load in 2-3 seconds!")
+    
+    return train_loader, val_loader, test_loader, meta
+
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Prepare HSI data for SSFTTnet with 4 GPU parallel + indices cache")
+    parser = argparse.ArgumentParser(description="Prepare HSI data for SSFTTnet with 4 GPU parallel + full patches cache after PCA")
     parser.add_argument("--real_dir", default=None)
     parser.add_argument("--aug_dir", default=None)
     parser.add_argument("--mapping_path", default="mapping.json")
@@ -703,7 +595,7 @@ if __name__ == "__main__":
     parser.add_argument("--fit_max_pixels", type=int, default=500000)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--bg_ratio", type=float, default=1.5)
-    parser.add_argument("--cache_dir", default="indices_cache")
+    parser.add_argument("--cache_dir", default="full_cache")
     parser.add_argument("--force_recompute", action="store_true")
     
     args = parser.parse_args()
@@ -723,14 +615,3 @@ if __name__ == "__main__":
     X_b, y_b = next(iter(train_loader))
     print(f"Batch shape: {X_b.shape}   labels: {y_b.shape}")
     print("Ready for SSFTTnet")
-
-
-Bonjour,
-
-Je vous remercie pour votre retour.
-
-Serait-il possible de préciser sur l’attestation que je travaille à Solaize ?
-
-Je vous remercie par avance pour votre aide.
-
-Cordialement,
