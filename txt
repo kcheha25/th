@@ -1,1 +1,2 @@
-L’idée de cette approche est de conserver des plots présentant la variabilité observée dans les plots réels
+Chaque extrudé des différents échantillons est tiré aléatoirement et utilisé une seule fois
+Pour les échantillons dont les extrudés couvrent tout le plot, deux choix aléatoires sont possibles : déposer l’extrudé entier et cropper les parties qui débordent, ou créer un cercle de diametre aléatoire et le remplir avec une partie de l’extrudé
