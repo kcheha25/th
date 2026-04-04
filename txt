@@ -1,3 +1,1 @@
-Les pixels appartenant à un extrudé sont supprimés
-Un WGAN-GP a été entraîné pour générer des spectres de résine
-Pour les pixels supprimés, un spectre GAN de résine est généré
+Le résultat obtenu n’est pas visuellement correct, les zones remplies ne sont pas lisses
