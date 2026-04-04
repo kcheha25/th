@@ -1,1 +1,2 @@
-Même entre les extrudés, le spectre moyen montre une signature spectrale globalement similaire
+Certains extrudés peuvent présenter une hétérogénéité
+Sur certains extrudés, quelques spectres présentent une signature différente selon la position
