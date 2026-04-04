@@ -1,1 +1,3 @@
-Après génération des cubes extrudés augmentés, une rotation d’angle aléatoire est appliquée à chacun
+Les pixels appartenant à un extrudé sont supprimés
+Un WGAN-GP a été entraîné pour générer des spectres de résine
+Pour les pixels supprimés, un spectre GAN de résine est généré
