@@ -1,3 +1,1 @@
-À première vue, les plastiques noirs semblent plus variables, mais cet écart n’est pas plus important que celui observé pour les plastiques non noirs à l’échelle de réflectance. »
-« Certains plastiques non noirs présentent des écarts plus importants, jusqu’à 0,2 en réflectance. »
-« Pas de sur-variabilité des plastiques noirs : les spectres gardent globalement la même signature. »
+Même entre les extrudés, le spectre moyen montre une signature spectrale globalement similaire
