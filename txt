@@ -1,2 +1,2 @@
-Certains extrudés peuvent présenter une hétérogénéité
-Sur certains extrudés, quelques spectres présentent une signature différente selon la position
+Pour s’affranchir des écarts et garder la même distribution des spectres en réflectance, les spectres GAN sont ramenés à la moyenne des réels
+Pour les pixels où la signature diffère, le SAM dépasse naturellement le seuil, et le spectre augmenté correspond au spectre réel avec le bruit contrôlé ajouté
