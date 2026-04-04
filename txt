@@ -1,1 +1,1 @@
-Le résultat obtenu n’est pas visuellement correct, les zones remplies ne sont pas lisses
+L’idée de cette approche est de conserver des plots présentant la variabilité observée dans les plots réels
