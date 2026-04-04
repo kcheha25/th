@@ -1,2 +1,1 @@
-Pour s’affranchir des écarts et garder la même distribution des spectres en réflectance, les spectres GAN sont ramenés à la moyenne des réels
-Pour les pixels où la signature diffère, le SAM dépasse naturellement le seuil, et le spectre augmenté correspond au spectre réel avec le bruit contrôlé ajouté
+Après génération des cubes extrudés augmentés, une rotation d’angle aléatoire est appliquée à chacun
