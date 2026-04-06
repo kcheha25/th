@@ -668,3 +668,786 @@ if __name__ == "__main__":
     X_b, y_b = next(iter(train_loader))
     print(f"Batch shape: {X_b.shape}   labels: {y_b.shape}")
     print("Ready for SSFTTnet")
+
+
+###############################################################3
+"""
+dataset_v2.py — Pipeline HSI → SSFTTnet
+Stratégie : LAZY DATASET + LRU CACHE par worker
+- Zéro preprocessing : pas de HDF5, pas de 6 jours d'attente
+- Les cubes sont chargés une fois par worker et restés chauds en RAM
+- La PCA est fittée et sauvegardée une seule fois (pickle)
+- Les indices (coordonnées + labels) sont sauvegardés en .npz (~quelques MB)
+- 4 GPUs utilisés pendant l'entraînement via DistributedDataParallel
+"""
+
+import gc
+import json
+import random
+import re
+import pickle
+import hashlib
+from collections import defaultdict, OrderedDict
+from pathlib import Path
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.decomposition import PCA
+from spectral import envi
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+
+print(f"PyTorch: {torch.__version__} | CUDA: {torch.cuda.is_available()} | GPUs: {torch.cuda.device_count()}")
+NUM_GPUS = torch.cuda.device_count()
+
+
+# ─────────────────────────────────────────────
+#  UTILITAIRES
+# ─────────────────────────────────────────────
+
+def load_mapping(mapping_path: str):
+    with open(mapping_path) as f:
+        raw = json.load(f)
+    extrude2final = {}
+    for final_class, extrude_list in raw.items():
+        for ext in extrude_list:
+            extrude2final[ext.strip()] = final_class
+    final_classes = sorted(raw.keys())
+    class_names = final_classes + ["background"]
+    label2idx = {name: i for i, name in enumerate(class_names)}
+    print(f"Mapping: {len(extrude2final)} labels -> {len(final_classes)} classes + background")
+    return extrude2final, class_names, label2idx
+
+
+def _load_envi_cube(hdr_path: Path, source: str) -> tuple[np.ndarray, list]:
+    img = envi.open(str(hdr_path))
+    cube = img.load().astype(np.float32)
+    wavelengths = [float(w) for w in img.metadata.get("wavelength", [])]
+
+    if cube.ndim == 3:
+        if source == "real":
+            # shape (H, W, B) → (B, H, W)
+            if cube.shape[2] == len(wavelengths) and len(wavelengths) > 0:
+                cube = cube.transpose(2, 0, 1)
+        else:
+            # shape (B, H, W) ou (H, B, W) selon augmentation
+            if len(wavelengths) > 0 and cube.shape[1] == len(wavelengths):
+                cube = cube.transpose(1, 0, 2)
+            elif cube.shape[0] != len(wavelengths):
+                print(f"  Warning: forme inattendue {cube.shape} pour {hdr_path.name}")
+
+    if cube.ndim != 3:
+        raise ValueError(f"Cube invalide: {cube.shape}")
+    return cube, wavelengths
+
+
+def _load_shapes(json_path: Path) -> list:
+    with open(json_path) as f:
+        ann = json.load(f)
+    return ann.get("shapes", [])
+
+
+# ─────────────────────────────────────────────
+#  COLLECTE DES MÉTADONNÉES PLOTS
+# ─────────────────────────────────────────────
+
+def collect_plots_meta(real_dir=None, aug_dir=None) -> list[dict]:
+    meta_list = []
+
+    if real_dir is not None:
+        real_dir = Path(real_dir)
+        if real_dir.exists():
+            for hdr in sorted(real_dir.glob("plot_*_cube.hdr")):
+                m = re.match(r"plot_(\d+)_cube", hdr.stem)
+                if not m:
+                    continue
+                jsn = real_dir / f"plot_{m.group(1)}_annotations.json"
+                if jsn.exists():
+                    meta_list.append({"source": "real", "name": hdr.stem, "hdr": hdr, "jsn": jsn})
+        else:
+            print(f"Warning: real_dir='{real_dir}' introuvable")
+
+    if aug_dir is not None:
+        aug_dir = Path(aug_dir)
+        if aug_dir.exists():
+            before = len(meta_list)
+            for hdr in sorted(aug_dir.glob("*.hdr")):
+                if any(hdr.stem.endswith(s) for s in ("_ratio", "_cube")):
+                    continue
+                jsn = aug_dir / f"{hdr.stem}.json"
+                if not jsn.exists():
+                    continue
+                source = "circle" if "circle" in hdr.stem.lower() else "aug"
+                meta_list.append({"source": source, "name": hdr.stem, "hdr": hdr, "jsn": jsn})
+            print(f"aug_dir -> {len(meta_list) - before} plots augmentés")
+        else:
+            print(f"Warning: aug_dir='{aug_dir}' introuvable")
+
+    if not meta_list:
+        raise RuntimeError("Aucun plot trouvé. Vérifiez --real_dir et --aug_dir.")
+
+    n_real = sum(1 for m in meta_list if m["source"] == "real")
+    print(f"Total: {len(meta_list)} plots ({n_real} réels | {len(meta_list)-n_real} augmentés)")
+    return meta_list
+
+
+def split_plots(plots_meta, split_mode="aug_real", val_ratio=0.15,
+                test_ratio=0.15, random_state=345):
+    rng = random.Random(random_state)
+    if split_mode == "aug_real":
+        aug  = [p for p in plots_meta if p["source"] in ("aug", "circle")]
+        real = [p for p in plots_meta if p["source"] == "real"]
+        rng.shuffle(aug)
+        n_val = max(1, int(len(aug) * val_ratio))
+        val, train, test = aug[:n_val], aug[n_val:], real
+        print(f"Split aug_real: train={len(train)} | val={len(val)} | test={len(test)}")
+    elif split_mode == "shuffle":
+        all_p = plots_meta[:]
+        rng.shuffle(all_p)
+        n = len(all_p)
+        n_test = max(1, int(n * test_ratio))
+        n_val  = max(1, int(n * val_ratio))
+        test, val, train = all_p[:n_test], all_p[n_test:n_test+n_val], all_p[n_test+n_val:]
+        print(f"Split shuffle: train={len(train)} | val={len(val)} | test={len(test)}")
+    else:
+        raise ValueError(f"split_mode inconnu: '{split_mode}'")
+    return train, val, test
+
+
+# ─────────────────────────────────────────────
+#  RASTERISATION POLYGONE (CPU, rapide)
+# ─────────────────────────────────────────────
+
+def _rasterize_polygon_cpu(points, H, W) -> np.ndarray:
+    """Ray-casting vectorisé sur CPU. Suffisant pour la collecte d'indices."""
+    pts = np.array(points, dtype=np.float32)
+    n   = len(pts)
+    rows = np.arange(H, dtype=np.float32) + 0.5
+    cols = np.arange(W, dtype=np.float32) + 0.5
+    grid_c, grid_r = np.meshgrid(cols, rows)  # (H, W)
+    px = grid_c.ravel()
+    py = grid_r.ravel()
+
+    x1, y1 = pts[:, 0], pts[:, 1]
+    x2 = np.roll(x1, -1)
+    y2 = np.roll(y1, -1)
+
+    inside = np.zeros(len(px), dtype=bool)
+    for i in range(n):
+        cond1 = (y1[i] < py) != (y2[i] < py)
+        denom = y2[i] - y1[i]
+        if abs(denom) < 1e-10:
+            continue
+        x_int = x1[i] + (py - y1[i]) * (x2[i] - x1[i]) / denom
+        inside ^= cond1 & (px < x_int)
+
+    return inside.reshape(H, W)
+
+
+def build_label_map(H, W, shapes, extrude2final, label2idx) -> np.ndarray:
+    bg_idx    = label2idx["background"]
+    label_map = np.full((H, W), bg_idx, dtype=np.int32)
+
+    for shape in shapes:
+        raw   = shape.get("label", "").strip()
+        stype = shape.get("shape_type", "")
+        if raw.lower() == "trou" or stype not in ("polygon", "rectangle"):
+            continue
+        final = extrude2final.get(raw)
+        if final is None:
+            continue
+        pts = shape["points"]
+        if len(pts) < 3:
+            continue
+        try:
+            mask = _rasterize_polygon_cpu(pts, H, W)
+            label_map[mask] = label2idx[final]
+        except Exception as e:
+            print(f"  Warning rasterisation '{raw}': {e}")
+
+    return label_map
+
+
+# ─────────────────────────────────────────────
+#  PCA
+# ─────────────────────────────────────────────
+
+def fit_or_load_pca(real_meta_list, pca_components, cache_dir,
+                    config_hash, fit_max_pixels=500_000) -> PCA:
+    pca_path = Path(cache_dir) / f"pca_{config_hash}.pkl"
+    if pca_path.exists():
+        print(f"PCA chargée depuis cache: {pca_path.name}")
+        with open(pca_path, "rb") as f:
+            return pickle.load(f)
+
+    print(f"\nFit PCA sur {len(real_meta_list)} cubes réels...")
+    all_pixels = []
+    for meta in real_meta_list:
+        try:
+            cube, _ = _load_envi_cube(meta["hdr"], meta["source"])
+            B, H, W = cube.shape
+            n = min(20_000, H * W)
+            idx = np.random.choice(H * W, n, replace=False)
+            all_pixels.append(cube.reshape(B, -1)[:, idx].T)
+            del cube; gc.collect()
+        except Exception as e:
+            print(f"  Warning {meta['name']}: {e}")
+
+    all_pixels = np.concatenate(all_pixels, axis=0)
+    if len(all_pixels) > fit_max_pixels:
+        idx = np.random.choice(len(all_pixels), fit_max_pixels, replace=False)
+        all_pixels = all_pixels[idx]
+
+    pca = PCA(n_components=pca_components, whiten=True)
+    pca.fit(all_pixels)
+    print(f"  Variance expliquée: {pca.explained_variance_ratio_.sum():.3f}")
+
+    with open(pca_path, "wb") as f:
+        pickle.dump(pca, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"  PCA sauvegardée: {pca_path.name}")
+    return pca
+
+
+def apply_pca(cube: np.ndarray, pca: PCA, chunk=20_000) -> np.ndarray:
+    B, H, W = cube.shape
+    flat = cube.reshape(B, -1).T          # (H*W, B)
+    out  = np.empty((H * W, pca.n_components_), dtype=np.float32)
+    for s in range(0, len(flat), chunk):
+        out[s:s+chunk] = pca.transform(flat[s:s+chunk])
+    return out.T.reshape(pca.n_components_, H, W).astype(np.float32)
+
+
+# ─────────────────────────────────────────────
+#  COLLECTE DES INDICES (coordonnées + labels)
+# ─────────────────────────────────────────────
+
+def _collect_one_plot(meta, extrude2final, label2idx, bg_ratio,
+                      random_state, pca) -> list[dict]:
+    """Charge un cube, construit la label map, retourne les indices filtrés."""
+    name   = meta["name"]
+    source = meta["source"]
+    rng    = np.random.default_rng(seed=random_state + hash(name) % 10_000)
+    bg_idx = label2idx["background"]
+
+    try:
+        cube, _ = _load_envi_cube(meta["hdr"], source)
+    except Exception as e:
+        print(f"  Warning {name}: {e}")
+        return []
+
+    # PCA optionnelle pour inférer H, W (on n'a besoin que des dims ici)
+    B, H, W = cube.shape
+    del cube; gc.collect()
+
+    # Label map depuis annotations
+    shapes    = _load_shapes(meta["jsn"])
+    label_map = build_label_map(H, W, shapes, extrude2final, label2idx)
+
+    rows, cols    = np.where(label_map >= 0)
+    labels_all    = label_map[rows, cols]
+
+    # Équilibrage background
+    bg_mask  = labels_all == bg_idx
+    fg_mask  = ~bg_mask
+    n_fg     = int(fg_mask.sum())
+    n_bg     = int(bg_mask.sum())
+    keep     = fg_mask.copy()
+
+    if n_fg > 0:
+        n_bg_keep = min(int(n_fg * bg_ratio), n_bg)
+        if n_bg_keep > 0:
+            chosen = rng.choice(np.where(bg_mask)[0], size=n_bg_keep, replace=False)
+            keep[chosen] = True
+
+    rows_k   = rows[keep].astype(np.int32)
+    cols_k   = cols[keep].astype(np.int32)
+    labels_k = labels_all[keep].astype(np.int32)
+
+    # On stocke le chemin absolu du cube pour le lazy loading
+    hdr_str = str(meta["hdr"])
+
+    return [
+        {"hdr": hdr_str, "source": source, "row": int(r), "col": int(c), "label": int(l)}
+        for r, c, l in zip(rows_k, cols_k, labels_k)
+    ]
+
+
+def collect_all_indices(plot_meta_list, extrude2final, label2idx,
+                        bg_ratio, random_state, pca,
+                        num_workers=8) -> tuple[list, dict]:
+    """
+    Collecte les indices pour tous les plots en parallèle (CPU threads).
+    Rapide car on ne charge les cubes que pour lire H, W.
+    """
+    print(f"\nCollecte des indices ({len(plot_meta_list)} plots, {num_workers} threads)...")
+    all_indices   = []
+    class_counts  = defaultdict(int)
+    idx2name      = {v: k for k, v in label2idx.items()}
+
+    with ThreadPoolExecutor(max_workers=num_workers) as ex:
+        futures = {
+            ex.submit(_collect_one_plot, meta, extrude2final, label2idx,
+                      bg_ratio, random_state, pca): meta
+            for meta in plot_meta_list
+        }
+        done = 0
+        for fut in as_completed(futures):
+            meta = futures[fut]
+            try:
+                items = fut.result()
+                all_indices.extend(items)
+                for it in items:
+                    class_counts[idx2name[it["label"]]] += 1
+                done += 1
+                if done % 100 == 0 or done == len(plot_meta_list):
+                    print(f"  {done}/{len(plot_meta_list)} plots traités — {len(all_indices):,} indices")
+            except Exception as e:
+                print(f"  Erreur {meta['name']}: {e}")
+
+    return all_indices, dict(class_counts)
+
+
+def balance_indices(indices_list, label2idx, random_state=345) -> list:
+    """Undersampling à la classe minoritaire (toutes classes confondues)."""
+    by_label = defaultdict(list)
+    for it in indices_list:
+        by_label[it["label"]].append(it)
+
+    min_count = min(len(v) for v in by_label.values())
+    rng = random.Random(random_state)
+    balanced = []
+    for label, items in by_label.items():
+        rng.shuffle(items)
+        balanced.extend(items[:min_count])
+    rng.shuffle(balanced)
+    print(f"  Balancing: {len(indices_list):,} -> {len(balanced):,} indices ({min_count}/classe)")
+    return balanced
+
+
+# ─────────────────────────────────────────────
+#  SAUVEGARDE / CHARGEMENT DES INDICES (.npz)
+# ─────────────────────────────────────────────
+
+def save_indices_npz(indices_data: dict, cache_dir: Path, config_hash: str) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out_path = cache_dir / f"indices_{config_hash}.npz"
+
+    # Sérialiser en arrays numpy pour compacité
+    def pack(lst):
+        if not lst:
+            return {}
+        hdrs    = np.array([it["hdr"]    for it in lst])
+        sources = np.array([it["source"] for it in lst])
+        rows    = np.array([it["row"]    for it in lst], dtype=np.int32)
+        cols    = np.array([it["col"]    for it in lst], dtype=np.int32)
+        labels  = np.array([it["label"]  for it in lst], dtype=np.int32)
+        return {"hdrs": hdrs, "sources": sources, "rows": rows,
+                "cols": cols, "labels": labels}
+
+    train_p = pack(indices_data["train"])
+    val_p   = pack(indices_data["val"])
+    test_p  = pack(indices_data["test"])
+
+    np.savez_compressed(
+        out_path,
+        train_hdrs=train_p["hdrs"],    train_sources=train_p["sources"],
+        train_rows=train_p["rows"],    train_cols=train_p["cols"],
+        train_labels=train_p["labels"],
+        val_hdrs=val_p["hdrs"],        val_sources=val_p["sources"],
+        val_rows=val_p["rows"],        val_cols=val_p["cols"],
+        val_labels=val_p["labels"],
+        test_hdrs=test_p["hdrs"],      test_sources=test_p["sources"],
+        test_rows=test_p["rows"],      test_cols=test_p["cols"],
+        test_labels=test_p["labels"],
+    )
+    size_mb = out_path.stat().st_size / 1e6
+    print(f"Indices sauvegardés: {out_path.name} ({size_mb:.1f} MB)")
+    print(f"  train={len(indices_data['train']):,} | val={len(indices_data['val']):,} | test={len(indices_data['test']):,}")
+    return out_path
+
+
+def load_indices_npz(cache_dir: Path, config_hash: str):
+    path = cache_dir / f"indices_{config_hash}.npz"
+    if not path.exists():
+        return None
+
+    data = np.load(path, allow_pickle=True)
+
+    def unpack(prefix):
+        hdrs    = data[f"{prefix}_hdrs"]
+        sources = data[f"{prefix}_sources"]
+        rows    = data[f"{prefix}_rows"]
+        cols    = data[f"{prefix}_cols"]
+        labels  = data[f"{prefix}_labels"]
+        return [
+            {"hdr": str(h), "source": str(s), "row": int(r), "col": int(c), "label": int(l)}
+            for h, s, r, c, l in zip(hdrs, sources, rows, cols, labels)
+        ]
+
+    print(f"Indices chargés depuis cache: {path.name}")
+    return {"train": unpack("train"), "val": unpack("val"), "test": unpack("test")}
+
+
+# ─────────────────────────────────────────────
+#  LAZY DATASET AVEC LRU CACHE
+# ─────────────────────────────────────────────
+
+class LRUCubeCache:
+    """
+    Cache LRU thread-safe qui garde les N derniers cubes en RAM.
+    Chaque worker DataLoader a sa propre instance → pas de contention.
+
+    Calcul de la taille : avec 30 bandes PCA, un cube 1000×1000 = 30×4 octets ≈ 120 MB.
+    maxsize=4 → ~480 MB par worker. Ajuster selon RAM disponible.
+    """
+    def __init__(self, maxsize=4, pca=None):
+        self.cache   = OrderedDict()
+        self.maxsize = maxsize
+        self.pca     = pca
+
+    def get(self, hdr_path: str, source: str) -> np.ndarray:
+        if hdr_path in self.cache:
+            self.cache.move_to_end(hdr_path)
+            return self.cache[hdr_path]
+
+        cube, _ = _load_envi_cube(Path(hdr_path), source)
+        if self.pca is not None:
+            cube = apply_pca(cube, self.pca)
+
+        self.cache[hdr_path] = cube
+        self.cache.move_to_end(hdr_path)
+
+        if len(self.cache) > self.maxsize:
+            evicted_key, _ = self.cache.popitem(last=False)
+
+        return cube
+
+
+class LazyHSIDataset(Dataset):
+    """
+    Dataset lazy : les patches sont extraits à la volée depuis les cubes.
+    Chaque worker garde un LRUCubeCache local → un cube est chargé
+    une seule fois par worker tant qu'il reste dans le cache.
+
+    Flux par __getitem__:
+      1. Récupère le cube depuis le cache (ou le charge + PCA si absent)
+      2. Extrait le patch (patch_size × patch_size) centré sur (row, col)
+      3. Retourne (patch_tensor, label)
+    """
+
+    def __init__(self, indices: list[dict], patch_size: int,
+                 pca=None, cache_maxsize: int = 4,
+                 augment: bool = False):
+        self.indices       = indices
+        self.patch_size    = patch_size
+        self.pca           = pca
+        self.cache_maxsize = cache_maxsize
+        self.augment       = augment
+
+        # Le cache est initialisé par worker (voir worker_init_fn)
+        self._cache: LRUCubeCache | None = None
+
+    def _get_cache(self) -> LRUCubeCache:
+        """Initialisation lazy du cache (une fois par worker)."""
+        if self._cache is None:
+            self._cache = LRUCubeCache(maxsize=self.cache_maxsize, pca=self.pca)
+        return self._cache
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        item   = self.indices[idx]
+        hdr    = item["hdr"]
+        source = item["source"]
+        r, c   = item["row"], item["col"]
+        label  = item["label"]
+
+        cube   = self._get_cache().get(hdr, source)   # (B, H, W)
+        B, H, W = cube.shape
+        m      = self.patch_size // 2
+
+        # Extraction du patch avec padding de bord
+        r0, r1 = max(0, r - m), min(H, r + m + 1)
+        c0, c1 = max(0, c - m), min(W, c + m + 1)
+        patch  = cube[:, r0:r1, c0:c1]               # peut être plus petit aux bords
+
+        # Padding si nécessaire (pixels de bord de cube)
+        if patch.shape[1] != self.patch_size or patch.shape[2] != self.patch_size:
+            pad = np.zeros((B, self.patch_size, self.patch_size), dtype=np.float32)
+            dr  = max(0, m - r)
+            dc  = max(0, m - c)
+            pad[:, dr:dr+patch.shape[1], dc:dc+patch.shape[2]] = patch
+            patch = pad
+
+        x = torch.from_numpy(patch.copy()).float()    # (B, P, P)
+
+        # Augmentation légère optionnelle (train seulement)
+        if self.augment:
+            k = random.randint(0, 3)
+            if k:
+                x = torch.rot90(x, k, dims=[1, 2])
+            if random.random() < 0.5:
+                x = torch.flip(x, dims=[2])
+
+        return x, torch.tensor(label, dtype=torch.long)
+
+
+def worker_init_fn(worker_id):
+    """Assure que chaque worker a son propre cache (pas de partage entre workers)."""
+    # Rien à faire : le cache est initialisé lazy dans __getitem__
+    # On seed numpy/random pour la reproductibilité des augmentations
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+# ─────────────────────────────────────────────
+#  POINT D'ENTRÉE PRINCIPAL
+# ─────────────────────────────────────────────
+
+def build_loaders(
+    real_dir=None,
+    aug_dir=None,
+    mapping_path="mapping.json",
+    split_mode="aug_real",
+    use_pca=True,
+    pca_components=30,
+    patch_size=13,
+    test_ratio=0.15,
+    val_ratio=0.15,
+    batch_size=64,
+    random_state=345,
+    fit_max_pixels=500_000,
+    num_workers=4,          # workers DataLoader par GPU
+    bg_ratio=1.5,
+    cache_dir="indices_cache",
+    force_recompute=False,
+    balance_train=False,
+    cache_maxsize=4,        # cubes en RAM par worker (ajuster selon RAM dispo)
+):
+    extrude2final, class_names, label2idx = load_mapping(mapping_path)
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Hash de config pour invalidation automatique du cache
+    config_str   = (f"{real_dir}_{aug_dir}_{split_mode}_{patch_size}_"
+                    f"{random_state}_{bg_ratio}_{pca_components if use_pca else 0}_"
+                    f"{balance_train}")
+    config_hash  = hashlib.md5(config_str.encode()).hexdigest()[:12]
+
+    # ── Chargement du cache indices si disponible ──────────────────────────
+    indices_data = None
+    if not force_recompute:
+        indices_data = load_indices_npz(cache_dir, config_hash)
+
+    if indices_data is None:
+        print("\n" + "="*60)
+        print("PAS DE CACHE — COLLECTE DES INDICES")
+        print("="*60)
+
+        plots_meta = collect_plots_meta(real_dir=real_dir, aug_dir=aug_dir)
+        train_meta, val_meta, test_meta = split_plots(
+            plots_meta, split_mode=split_mode,
+            val_ratio=val_ratio, test_ratio=test_ratio,
+            random_state=random_state
+        )
+
+        # PCA (fittée une fois, mise en cache)
+        pca_model = None
+        if use_pca:
+            real_meta = [m for m in plots_meta if m["source"] == "real"]
+            if real_meta:
+                pca_model = fit_or_load_pca(
+                    real_meta, pca_components, cache_dir,
+                    config_hash, fit_max_pixels
+                )
+
+        # Collecte parallèle des indices (CPU, rapide)
+        cpu_workers = min(16, len(plots_meta))
+
+        train_idx, cnt_train = collect_all_indices(
+            train_meta, extrude2final, label2idx, bg_ratio, random_state, pca_model, cpu_workers)
+        val_idx, cnt_val = collect_all_indices(
+            val_meta, extrude2final, label2idx, bg_ratio, random_state, pca_model, cpu_workers)
+        test_idx, cnt_test = collect_all_indices(
+            test_meta, extrude2final, label2idx, bg_ratio, random_state, pca_model, cpu_workers)
+
+        if balance_train:
+            print("\nBalancing train...")
+            train_idx = balance_indices(train_idx, label2idx, random_state)
+
+        indices_data = {"train": train_idx, "val": val_idx, "test": test_idx}
+        save_indices_npz(indices_data, cache_dir, config_hash)
+
+        # Affichage distribution
+        print("\nDistribution des patches:")
+        idx2name = {v: k for k, v in label2idx.items()}
+        all_cls  = sorted(set(list(cnt_train) + list(cnt_val) + list(cnt_test)))
+        print(f"  {'Classe':25}  {'Train':>10}  {'Val':>10}  {'Test':>10}")
+        print(f"  {'-'*25}  {'-'*10}  {'-'*10}  {'-'*10}")
+        for cls in all_cls:
+            print(f"  {cls:25}  {cnt_train.get(cls,0):10,}  "
+                  f"{cnt_val.get(cls,0):10,}  {cnt_test.get(cls,0):10,}")
+    else:
+        # Recharger la PCA depuis cache
+        pca_model = None
+        if use_pca:
+            pca_path = cache_dir / f"pca_{config_hash}.pkl"
+            if pca_path.exists():
+                with open(pca_path, "rb") as f:
+                    pca_model = pickle.load(f)
+                print(f"PCA rechargée: {pca_path.name}")
+
+    # ── Construction des Datasets ──────────────────────────────────────────
+    num_bands = pca_components if (use_pca and pca_model is not None) else None
+
+    train_dataset = LazyHSIDataset(
+        indices_data["train"], patch_size, pca_model,
+        cache_maxsize=cache_maxsize, augment=True
+    )
+    val_dataset = LazyHSIDataset(
+        indices_data["val"], patch_size, pca_model,
+        cache_maxsize=cache_maxsize, augment=False
+    )
+    test_dataset = LazyHSIDataset(
+        indices_data["test"], patch_size, pca_model,
+        cache_maxsize=cache_maxsize, augment=False
+    )
+
+    pin = torch.cuda.is_available()
+
+    # ── DataLoaders ────────────────────────────────────────────────────────
+    # Pour multi-GPU avec DistributedDataParallel, utiliser DistributedSampler.
+    # En mode non-distribué (DataParallel simple), shuffle=True suffit.
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size,
+        shuffle=True, num_workers=num_workers,
+        pin_memory=pin, worker_init_fn=worker_init_fn,
+        persistent_workers=(num_workers > 0)
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size,
+        shuffle=False, num_workers=num_workers,
+        pin_memory=pin, worker_init_fn=worker_init_fn,
+        persistent_workers=(num_workers > 0)
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size,
+        shuffle=False, num_workers=num_workers,
+        pin_memory=pin, worker_init_fn=worker_init_fn,
+        persistent_workers=(num_workers > 0)
+    )
+
+    meta = {
+        "class_names": class_names,
+        "label2idx": label2idx,
+        "num_classes": len(class_names),
+        "num_bands": num_bands,
+        "patch_size": patch_size,
+        "balance_train": balance_train,
+    }
+
+    print(f"\n{'='*60}")
+    print("PRÊT POUR L'ENTRAÎNEMENT")
+    print(f"  Train: {len(train_dataset):,} patches | Val: {len(val_dataset):,} | Test: {len(test_dataset):,}")
+    print(f"  Bandes: {num_bands} | Patch: {patch_size}×{patch_size}")
+    print(f"  Cache cubes par worker: {cache_maxsize} (≈{cache_maxsize * 120:.0f} MB/worker)")
+    print(f"  Workers DataLoader: {num_workers}")
+    print(f"{'='*60}\n")
+
+    return train_loader, val_loader, test_loader, meta
+
+
+# ─────────────────────────────────────────────
+#  HELPER POUR MULTI-GPU (DDP)
+# ─────────────────────────────────────────────
+
+def build_loaders_ddp(rank: int, world_size: int, **kwargs):
+    """
+    Variante pour DistributedDataParallel.
+    Chaque processus (rank) reçoit un sous-ensemble du dataset via DistributedSampler.
+
+    Usage :
+        # Dans chaque processus lancé par torchrun :
+        train_loader, val_loader, test_loader, meta = build_loaders_ddp(
+            rank=rank, world_size=world_size, **cfg
+        )
+    """
+    train_loader, val_loader, test_loader, meta = build_loaders(**kwargs)
+
+    # Remplacer les samplers par des DistributedSampler
+    train_sampler = DistributedSampler(
+        train_loader.dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    val_sampler = DistributedSampler(
+        val_loader.dataset, num_replicas=world_size, rank=rank, shuffle=False)
+
+    pin = torch.cuda.is_available()
+    nw  = kwargs.get("num_workers", 4)
+    bs  = kwargs.get("batch_size", 64)
+
+    train_loader = DataLoader(
+        train_loader.dataset, batch_size=bs, sampler=train_sampler,
+        num_workers=nw, pin_memory=pin,
+        worker_init_fn=worker_init_fn, persistent_workers=(nw > 0)
+    )
+    val_loader = DataLoader(
+        val_loader.dataset, batch_size=bs, sampler=val_sampler,
+        num_workers=nw, pin_memory=pin,
+        worker_init_fn=worker_init_fn, persistent_workers=(nw > 0)
+    )
+    return train_loader, val_loader, test_loader, meta
+
+
+# ─────────────────────────────────────────────
+#  CLI
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Pipeline HSI lazy — collecte indices + entraînement à la volée"
+    )
+    parser.add_argument("--real_dir",        default=None)
+    parser.add_argument("--aug_dir",         default=None)
+    parser.add_argument("--mapping_path",    default="mapping.json")
+    parser.add_argument("--split_mode",      default="aug_real", choices=["aug_real","shuffle"])
+    parser.add_argument("--use_pca",         action="store_true", default=True)
+    parser.add_argument("--no_pca",          action="store_false", dest="use_pca")
+    parser.add_argument("--pca_components",  type=int,   default=30)
+    parser.add_argument("--patch_size",      type=int,   default=13)
+    parser.add_argument("--test_ratio",      type=float, default=0.15)
+    parser.add_argument("--val_ratio",       type=float, default=0.15)
+    parser.add_argument("--batch_size",      type=int,   default=64)
+    parser.add_argument("--random_state",    type=int,   default=345)
+    parser.add_argument("--fit_max_pixels",  type=int,   default=500_000)
+    parser.add_argument("--num_workers",     type=int,   default=4)
+    parser.add_argument("--bg_ratio",        type=float, default=1.5)
+    parser.add_argument("--cache_dir",       default="indices_cache")
+    parser.add_argument("--force_recompute", action="store_true")
+    parser.add_argument("--balance_train",   action="store_true", default=False)
+    parser.add_argument("--cache_maxsize",   type=int,   default=4,
+                        help="Nombre de cubes gardés en RAM par worker DataLoader")
+    args = parser.parse_args()
+
+    if args.real_dir is None and args.aug_dir is None:
+        parser.error("Au moins --real_dir ou --aug_dir est requis")
+
+    train_loader, val_loader, test_loader, meta = build_loaders(
+        real_dir=args.real_dir,        aug_dir=args.aug_dir,
+        mapping_path=args.mapping_path, split_mode=args.split_mode,
+        use_pca=args.use_pca,          pca_components=args.pca_components,
+        patch_size=args.patch_size,    test_ratio=args.test_ratio,
+        val_ratio=args.val_ratio,      batch_size=args.batch_size,
+        random_state=args.random_state, fit_max_pixels=args.fit_max_pixels,
+        num_workers=args.num_workers,  bg_ratio=args.bg_ratio,
+        cache_dir=args.cache_dir,      force_recompute=args.force_recompute,
+        balance_train=args.balance_train, cache_maxsize=args.cache_maxsize,
+    )
+
+    X_b, y_b = next(iter(train_loader))
+    print(f"Batch shape: {X_b.shape}  labels: {y_b.shape}")
+    print("Prêt pour SSFTTnet ✓")

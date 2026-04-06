@@ -1,8 +1,0 @@
-Résoudre le problème de préparation des patches pour l’ensemble de la base de données
-Entraîner trois modèles basés sur ResNet, ViT et Mamba, avec différentes configurations
-Sélectionner le modèle le plus performant, puis
-optimiser le modèle,
-ajouter des briques de prétraitement,
-de post-traitement,
-et de traitement en temps réel (live)
-afin d’améliorer les performances et viser les meilleurs résultats possibles
