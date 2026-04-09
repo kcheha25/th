@@ -2196,3 +2196,330 @@ if __name__ == '__main__':
     test(net, test_loader, criterion, device, meta, save_dir=args.save_dir)
     print(f"Test terminé en {time.perf_counter()-t2:.1f}s")
     print(f"\nTemps total : {(time.perf_counter()-t0)/60:.1f} min")
+
+
+    #################
+    import os
+import gc
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.cuda.amp import GradScaler, autocast
+from sklearn.metrics import confusion_matrix, accuracy_score, classification_report, cohen_kappa_score
+from operator import truediv
+import time
+import sys
+import argparse
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent))
+from dataset_v4 import build_loaders
+import SSFTTnet
+
+def is_main():
+    return int(os.environ.get("RANK", 0)) == 0
+
+def setup_ddp():
+    dist.init_process_group(backend="nccl")
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+    return rank, local_rank, world_size, device
+
+def cleanup_ddp():
+    dist.destroy_process_group()
+
+def log(msg):
+    if is_main():
+        print(msg, flush=True)
+
+def AA_andEachClassAccuracy(cm):
+    diag = np.diag(cm)
+    row_sum = np.sum(cm, axis=1)
+    each_acc = np.nan_to_num(truediv(diag, row_sum))
+    return each_acc, np.mean(each_acc)
+
+def acc_reports(y_test, y_pred, class_names):
+    report = classification_report(y_test, y_pred, digits=4, target_names=class_names)
+    oa = accuracy_score(y_test, y_pred) * 100
+    cm = confusion_matrix(y_test, y_pred)
+    each_acc, aa = AA_andEachClassAccuracy(cm)
+    kappa = cohen_kappa_score(y_test, y_pred) * 100
+    return report, oa, cm, each_acc * 100, aa * 100, kappa
+
+def build_ddp_loaders(train_dataset, val_dataset, test_dataset,
+                      rank, world_size, batch_size, num_workers):
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=rank,
+        shuffle=True, drop_last=True)
+    val_sampler = DistributedSampler(
+        val_dataset, num_replicas=world_size, rank=rank,
+        shuffle=False, drop_last=False)
+    kw = dict(num_workers=num_workers, pin_memory=True,
+              persistent_workers=(num_workers > 0))
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size,
+        sampler=train_sampler, **kw)
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size,
+        sampler=val_sampler, **kw)
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size,
+        shuffle=False, **kw)
+    return train_loader, val_loader, test_loader, train_sampler
+
+def train_one_epoch(net, loader, sampler, criterion, optimizer,
+                    scaler, scheduler, device, epoch, epochs, accum_steps):
+    net.train()
+    sampler.set_epoch(epoch)
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    optimizer.zero_grad(set_to_none=True)
+    for i, (data, target) in enumerate(loader):
+        data = data.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+        with autocast(dtype=torch.bfloat16):
+            outputs = net(data)
+            loss = criterion(outputs, target) / accum_steps
+        scaler.scale(loss).backward()
+        if (i + 1) % accum_steps == 0 or (i + 1) == len(loader):
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+        total_loss += loss.item() * accum_steps
+        preds = outputs.detach().argmax(dim=1)
+        correct += (preds == target).sum().item()
+        total += target.size(0)
+        if is_main() and (i + 1) % 500 == 0:
+            print(f"  Epoch [{epoch+1}/{epochs}] "
+                  f"Step [{i+1}/{len(loader)}] "
+                  f"Loss={total_loss/(i+1):.4f} "
+                  f"Acc={100*correct/total:.2f}% "
+                  f"LR={scheduler.get_last_lr()[0]:.2e}",
+                  flush=True)
+    avg_loss = total_loss / len(loader)
+    avg_acc = 100.0 * correct / total
+    loss_t = torch.tensor([avg_loss], device=device)
+    acc_t = torch.tensor([avg_acc], device=device)
+    dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
+    dist.all_reduce(acc_t, op=dist.ReduceOp.AVG)
+    return loss_t.item(), acc_t.item()
+
+@torch.no_grad()
+def evaluate(net, loader, criterion, device):
+    net.eval()
+    total_loss = 0.0
+    y_pred_list = []
+    y_true_list = []
+    for data, target in loader:
+        data = data.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+        with autocast(dtype=torch.bfloat16):
+            outputs = net(data)
+            loss = criterion(outputs, target)
+        total_loss += loss.item()
+        y_pred_list.append(outputs.argmax(dim=1).cpu())
+        y_true_list.append(target.cpu())
+    y_pred = torch.cat(y_pred_list).numpy()
+    y_true = torch.cat(y_true_list).numpy()
+    avg_loss = torch.tensor([total_loss / len(loader)], device=device)
+    dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
+    y_pred_gathered = [None] * dist.get_world_size()
+    y_true_gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(y_pred_gathered, y_pred)
+    dist.all_gather_object(y_true_gathered, y_true)
+    y_pred_all = np.concatenate(y_pred_gathered)
+    y_true_all = np.concatenate(y_true_gathered)
+    oa = accuracy_score(y_true_all, y_pred_all) * 100
+    cm = confusion_matrix(y_true_all, y_pred_all)
+    each_acc, aa = AA_andEachClassAccuracy(cm)
+    kappa = cohen_kappa_score(y_true_all, y_pred_all) * 100
+    return avg_loss.item(), oa, aa * 100, kappa, y_pred_all, y_true_all
+
+def compute_effective_batch(batch_size, world_size, accum_steps):
+    return batch_size * world_size * accum_steps
+
+def train(args, rank, local_rank, world_size, device,
+          train_dataset, val_dataset, test_dataset, meta):
+    save_dir = Path(args.save_dir)
+    if is_main():
+        save_dir.mkdir(parents=True, exist_ok=True)
+    dist.barrier()
+    train_loader, val_loader, test_loader, train_sampler = build_ddp_loaders(
+        train_dataset, val_dataset, test_dataset,
+        rank, world_size, args.batch_size, args.num_workers)
+    net = SSFTTnet.SSFTTnet(
+        n_bands=meta['num_bands'],
+        n_classes=meta['num_classes'],
+        patch_size=meta['patch_size']
+    ).to(device)
+    net = DDP(net, device_ids=[local_rank], output_device=local_rank,
+              find_unused_parameters=False)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
+    steps_per_epoch = len(train_loader) // args.accum_steps
+    total_steps = steps_per_epoch * args.epochs
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=args.lr,
+        total_steps=total_steps,
+        pct_start=0.1,
+        anneal_strategy='cos',
+        div_factor=25.0,
+        final_div_factor=1e4,
+    )
+    scaler = GradScaler()
+    best_oa = 0.0
+    history = []
+    eff_batch = compute_effective_batch(args.batch_size, world_size, args.accum_steps)
+    log(f"\nDDP  : {world_size} GPUs")
+    log(f"Batch/GPU      : {args.batch_size}")
+    log(f"Batch effectif : {eff_batch:,} samples")
+    log(f"Steps/epoch    : {steps_per_epoch:,}")
+    log(f"Total steps    : {total_steps:,}")
+    log(f"Mixed precision: bfloat16")
+    log(f"VRAM/GPU estimé: {(meta['num_bands'] * args.batch_size * meta['patch_size']**2 * 4) / 1e9:.2f} GB données")
+    log("=" * 60)
+    for epoch in range(args.epochs):
+        t0 = time.perf_counter()
+        train_loss, train_acc = train_one_epoch(
+            net, train_loader, train_sampler, criterion,
+            optimizer, scaler, scheduler, device,
+            epoch, args.epochs, args.accum_steps)
+        val_loss, val_oa, val_aa, val_kappa, _, _ = evaluate(
+            net, val_loader, criterion, device)
+        elapsed = time.perf_counter() - t0
+        eta_min = elapsed * (args.epochs - epoch - 1) / 60
+        log(f"[{epoch+1:3d}/{args.epochs}] "
+            f"Train loss={train_loss:.4f} acc={train_acc:.2f}% | "
+            f"Val loss={val_loss:.4f} OA={val_oa:.2f}% "
+            f"AA={val_aa:.2f}% K={val_kappa:.2f}% | "
+            f"{elapsed:.0f}s | ETA {eta_min:.0f}min")
+        if is_main():
+            history.append({
+                'epoch': epoch + 1,
+                'train_loss': train_loss, 'train_acc': train_acc,
+                'val_loss': val_loss, 'val_oa': val_oa,
+                'val_aa': val_aa, 'val_kappa': val_kappa,
+                'elapsed_s': elapsed,
+            })
+            if val_oa > best_oa:
+                best_oa = val_oa
+                torch.save(net.module.state_dict(), save_dir / "best.pth")
+                print(f"  → Meilleur modèle (OA={best_oa:.2f}%)", flush=True)
+        dist.barrier()
+    if is_main():
+        torch.save(net.module.state_dict(), save_dir / "final.pth")
+        _save_history(history, save_dir)
+        log(f"\nEntraînement terminé. Meilleur OA val : {best_oa:.2f}%")
+    dist.barrier()
+    return net, test_loader, criterion
+
+def _save_history(history, save_dir):
+    path = Path(save_dir) / "history.csv"
+    keys = list(history[0].keys())
+    with open(path, 'w') as f:
+        f.write(','.join(keys) + '\n')
+        for row in history:
+            f.write(','.join(str(row[k]) for k in keys) + '\n')
+    print(f"Historique : {path}", flush=True)
+
+def run_test(net, test_loader, criterion, device, meta, save_dir):
+    save_dir = Path(save_dir)
+    log("\nTest avec le meilleur modèle...")
+    state = torch.load(save_dir / "best.pth", map_location=device)
+    net.module.load_state_dict(state)
+    _, oa, aa, kappa, y_pred, y_true = evaluate(net, test_loader, criterion, device)
+    if is_main():
+        report, oa, cm, each_acc, aa, kappa = acc_reports(y_true, y_pred, meta['class_names'])
+        print(f"\nTest OA    : {oa:.2f}%")
+        print(f"Test AA    : {aa:.2f}%")
+        print(f"Test Kappa : {kappa:.2f}%")
+        print("\nPar classe :")
+        for name, acc in zip(meta['class_names'], each_acc):
+            print(f"  {name:25}: {acc:.2f}%")
+        print(f"\n{report}")
+        out = save_dir / "classification_report.txt"
+        with open(out, 'w') as f:
+            f.write(f"OA: {oa}\nAA: {aa}\nKappa: {kappa}\n\n")
+            f.write(f"Par classe: {each_acc}\n\n")
+            f.write(f"{report}\n\nMatrice de confusion:\n{cm}\n")
+        print(f"Résultats : {out}", flush=True)
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--real_dir", default=None)
+    p.add_argument("--aug_dir", default=None)
+    p.add_argument("--mapping_path", default="mapping.json")
+    p.add_argument("--split_mode", default="aug_real", choices=["aug_real", "shuffle"])
+    p.add_argument("--use_pca", action="store_true", default=True)
+    p.add_argument("--no_pca", action="store_false", dest="use_pca")
+    p.add_argument("--pca_components", type=int, default=30)
+    p.add_argument("--patch_size", type=int, default=13)
+    p.add_argument("--test_ratio", type=float, default=0.15)
+    p.add_argument("--val_ratio", type=float, default=0.15)
+    p.add_argument("--batch_size", type=int, default=512)
+    p.add_argument("--random_state", type=int, default=345)
+    p.add_argument("--bg_ratio", type=float, default=2.0)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--accum_steps", type=int, default=2)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--cache_dir", default="cache")
+    p.add_argument("--save_dir", default="cls_params")
+    p.add_argument("--force_recompute", action="store_true")
+    p.add_argument("--balance_train", action="store_true")
+    args = p.parse_args()
+    if not args.real_dir and not args.aug_dir:
+        p.error("--real_dir ou --aug_dir requis")
+    rank, local_rank, world_size, device = setup_ddp()
+    if is_main():
+        print(f"DDP initialisé : rank={rank} local_rank={local_rank} world_size={world_size}")
+        print(f"GPU : {torch.cuda.get_device_name(local_rank)}")
+    t0 = time.perf_counter()
+    train_loader_tmp, val_loader_tmp, test_loader_tmp, meta = build_loaders(
+        real_dir=args.real_dir,
+        aug_dir=args.aug_dir,
+        mapping_path=args.mapping_path,
+        split_mode=args.split_mode,
+        use_pca=args.use_pca,
+        pca_components=args.pca_components,
+        patch_size=args.patch_size,
+        test_ratio=args.test_ratio,
+        val_ratio=args.val_ratio,
+        batch_size=args.batch_size,
+        random_state=args.random_state,
+        num_workers=args.num_workers,
+        bg_ratio=args.bg_ratio,
+        cache_dir=args.cache_dir,
+        force_recompute=args.force_recompute,
+        balance_train=args.balance_train,
+    )
+    train_dataset = train_loader_tmp.dataset
+    val_dataset = val_loader_tmp.dataset
+    test_dataset = test_loader_tmp.dataset
+    del train_loader_tmp, val_loader_tmp, test_loader_tmp
+    gc.collect()
+    log(f"Données prêtes en {time.perf_counter()-t0:.1f}s")
+    log(f"Train={len(train_dataset):,} | Val={len(val_dataset):,} | Test={len(test_dataset):,}")
+    log(f"Classes ({meta['num_classes']}) : {meta['class_names']}")
+    t1 = time.perf_counter()
+    net, test_loader, criterion = train(
+        args, rank, local_rank, world_size, device,
+        train_dataset, val_dataset, test_dataset, meta)
+    log(f"\nEntraînement : {(time.perf_counter()-t1)/60:.1f} min")
+    run_test(net, test_loader, criterion, device, meta, args.save_dir)
+    log(f"Temps total : {(time.perf_counter()-t0)/60:.1f} min")
+    cleanup_ddp()
+
+if __name__ == '__main__':
+    main()
