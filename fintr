@@ -2665,3 +2665,9 @@ def setup_ddp():
     os.environ["NCCL_BLOCKING_WAIT"] = "1"
     os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
     return rank, local_rank, world_size, device
+
+for r in range(world_size):
+    if rank == r:
+        print(f"rank={rank} local_rank={local_rank} world_size={world_size} "
+              f"GPU={torch.cuda.get_device_name(local_rank)}", flush=True)
+    dist.barrier()
