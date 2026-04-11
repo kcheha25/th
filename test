@@ -598,10 +598,52 @@ if __name__ == "__main__":
     print_cache_stats(meta, 0)
 
 
-    if hasattr(train_loader, 'dataset'):
-        train_len = len(train_loader.dataset)
-    elif hasattr(train_loader, 'loader'):
-        train_len = len(train_loader.loader.dataset)
-    else:
-        train_len = 0
-    print(f"  Train   : {train_len:,} patches\n")
+class PrefetchingDataLoader:
+    def __init__(self, loader, prefetch_queue_size=PREFETCH_BATCHES):
+        self.loader = loader
+        self.dataset = loader.dataset
+        self.batch_size = loader.batch_size
+        self.prefetch_queue = queue.Queue(maxsize=prefetch_queue_size)
+        self.stop_event = threading.Event()
+        self.prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
+        self.prefetch_thread.start()
+        self._iterator = None
+
+    def _prefetch_worker(self):
+        while not self.stop_event.is_set():
+            try:
+                if self._iterator is None: 
+                    self._iterator = iter(self.loader)
+                for _ in range(self.prefetch_queue.maxsize - self.prefetch_queue.qsize()):
+                    try:
+                        batch = next(self._iterator)
+                        self.prefetch_queue.put(batch, timeout=0.1)
+                    except StopIteration:
+                        self._iterator = iter(self.loader)
+                        batch = next(self._iterator)
+                        self.prefetch_queue.put(batch)
+            except Exception as e:
+                print(f"Prefetch error: {e}")
+                break
+            if self.prefetch_queue.qsize() > self.prefetch_queue.maxsize * 0.8: 
+                time.sleep(0.005)
+
+    def __iter__(self): 
+        self._iterator = iter(self.loader)
+        return self
+
+    def __next__(self):
+        if self.stop_event.is_set(): 
+            raise StopIteration
+        batch = self.prefetch_queue.get(timeout=60)
+        if batch is None: 
+            raise StopIteration
+        return batch
+
+    def __len__(self): 
+        return len(self.loader)
+
+    def stop(self):
+        self.stop_event.set()
+        if self.prefetch_thread.is_alive(): 
+            self.prefetch_thread.join(timeout=5)
