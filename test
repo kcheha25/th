@@ -192,13 +192,10 @@ def main():
 if __name__ == "__main__":
     main()
 
-
 ################333
 import gc
 import json
 import random
-import threading
-import queue
 from pathlib import Path
 
 import h5py
@@ -223,27 +220,35 @@ class FastHDF5Dataset(Dataset):
             self.length  = f[f"{split_name}/y"].shape[0]
             self.x_shape = f[f"{split_name}/X"].shape[1:]
 
-        self._h5_local = threading.local()
+        self._h5_file = None
 
     def _get_h5(self):
-        if not hasattr(self._h5_local, 'f') or not self._h5_local.f.id.valid:
-            self._h5_local.f = h5py.File(self.h5_path, 'r', swmr=True)
-        return self._h5_local.f
+        if self._h5_file is None or not self._h5_file.id.valid:
+            self._h5_file = h5py.File(self.h5_path, 'r', swmr=True)
+        return self._h5_file
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        f  = self._get_h5()
-        X  = torch.from_numpy(f[f"{self.split_name}/X"][idx].astype(self.dtype_x))
-        y  = int(f[f"{self.split_name}/y"][idx])
-        X  = X.unsqueeze(0)
-        return X, torch.tensor(y, dtype=torch.long)
+        f = self._get_h5()
+        X = torch.from_numpy(f[f"{self.split_name}/X"][idx].astype(self.dtype_x))
+        y = int(f[f"{self.split_name}/y"][idx])
+        return X.unsqueeze(0), torch.tensor(y, dtype=torch.long)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_h5_file"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._h5_file = None
 
     def __del__(self):
-        if hasattr(self._h5_local, 'f'):
+        if self._h5_file is not None:
             try:
-                self._h5_local.f.close()
+                self._h5_file.close()
             except Exception:
                 pass
 
