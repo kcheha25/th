@@ -55,7 +55,6 @@ for class_name in real_class_folders:
 
     aug_folder = os.path.join(AUG_DIR, class_name)
     if not os.path.exists(aug_folder):
-        print(f"Pas de données augmentées pour {class_name}")
         continue
 
     aug_spectra_list = []
@@ -66,7 +65,6 @@ for class_name in real_class_folders:
         aug_spectra_list.append(spectra)
 
     if len(aug_spectra_list) == 0:
-        print(f"Aucune donnée augmentée pour {class_name}")
         continue
 
     aug_spectra = np.vstack(aug_spectra_list)
@@ -79,8 +77,8 @@ for class_name in real_class_folders:
     aug_pca = pca.transform(aug_spectra)
 
     plt.figure()
-    plt.scatter(real_pca[:, 0], real_pca[:, 1], s=1, alpha=0.3, label="Real")
-    plt.scatter(aug_pca[:, 0], aug_pca[:, 1], s=1, alpha=0.3, label="Augmented")
+    plt.scatter(aug_pca[:, 0], aug_pca[:, 1], s=1, alpha=0.1, label="Augmented")
+    plt.scatter(real_pca[:, 0], real_pca[:, 1], s=5, alpha=1.0, label="Real")
     plt.legend()
     plt.title(f"PCA - Classe {class_name}")
     plt.savefig(os.path.join(OUTPUT_DIR, f"PCA_{class_name}.png"), dpi=300)
@@ -91,6 +89,34 @@ for class_name in real_class_folders:
 
     nn = NearestNeighbors(n_neighbors=1, metric="cosine")
     nn.fit(real_norm)
+
+    dist_all, idx_all = nn.kneighbors(aug_norm)
+
+    threshold = 1e-6
+
+    overlap_count = 0
+
+    for i in range(len(aug_spectra)):
+        if dist_all[i][0] < threshold:
+            overlap_count += 1
+            real_idx = idx_all[i][0]
+            aug_spec = aug_spectra[i]
+            real_spec = real_spectra[real_idx]
+
+            cos_sim = 1 - dist_all[i][0]
+            sam = np.arccos(np.clip(cos_sim, -1, 1))
+
+            print(f"Overlap détecté classe {class_name} | SAM: {sam:.8f}")
+
+            plt.figure()
+            plt.plot(aug_spec, label="Augmenté")
+            plt.plot(real_spec, label="Réel")
+            plt.legend()
+            plt.title(f"{class_name} overlap SAM: {sam:.8f}")
+            plt.savefig(os.path.join(OUTPUT_DIR, f"{class_name}_overlap_{overlap_count}.png"), dpi=300)
+            plt.close()
+
+    print(f"Nombre de superpositions détectées: {overlap_count}")
 
     selected_indices = random.sample(range(len(aug_spectra)), min(3, len(aug_spectra)))
 
