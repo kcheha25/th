@@ -1,0 +1,350 @@
+import argparse
+import time
+import torch
+import torch.nn as nn
+from torch.cuda.amp import autocast, GradScaler
+
+from fast_dataset import make_loaders_fast
+from ssfnet import SSFTTnet
+
+N_BATCHES = 50
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--h5_path",    required=True)
+    p.add_argument("--batch_size", type=int, default=512)
+    p.add_argument("--num_workers",type=int, default=8)
+    p.add_argument("--amp_dtype",  default="float16", choices=["float16","bfloat16","none"])
+    return p.parse_args()
+
+def timer(label, fn, n_warmup=2, n_repeat=10):
+    device = next(iter([].__class__.__mro__))
+    for _ in range(n_warmup):
+        fn()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(n_repeat):
+        fn()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed = (time.perf_counter() - t0) / n_repeat * 1000
+    print(f"  {label:<30s}: {elapsed:7.2f} ms/batch")
+    return elapsed
+
+def main():
+    args   = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"\n{'═'*55}")
+    print(f"  Profiling bottleneck — device: {device}")
+    print(f"  batch_size={args.batch_size}  workers={args.num_workers}")
+    print(f"{'═'*55}\n")
+
+    train_loader, _, _, meta, _ = make_loaders_fast(
+        h5_path     = args.h5_path,
+        batch_size  = args.batch_size,
+        num_workers = args.num_workers,
+    )
+    loader_iter = iter(train_loader)
+
+    print("── 1. Débit DataLoader pur (CPU uniquement) ─────────────────")
+    times = []
+    for i in range(N_BATCHES + 2):
+        t0 = time.perf_counter()
+        try:
+            X, y = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(train_loader)
+            X, y = next(loader_iter)
+        dt = (time.perf_counter() - t0) * 1000
+        if i >= 2:
+            times.append(dt)
+
+    import statistics
+    print(f"  mean  : {statistics.mean(times):.2f} ms")
+    print(f"  median: {statistics.median(times):.2f} ms")
+    print(f"  min   : {min(times):.2f} ms")
+    print(f"  max   : {max(times):.2f} ms")
+    throughput = args.batch_size / (statistics.mean(times) / 1000)
+    print(f"  → Débit loader : {throughput:,.0f} patches/s\n")
+
+    if not torch.cuda.is_available():
+        print("Pas de GPU détecté — profiling GPU ignoré.")
+        return
+
+    print("── 2. Transfert CPU→GPU (H2D) ───────────────────────────────")
+    X_cpu, y_cpu = X, y
+    times_h2d = []
+    for _ in range(N_BATCHES):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        X_gpu = X_cpu.to(device, non_blocking=False)
+        y_gpu = y_cpu.to(device, non_blocking=False)
+        torch.cuda.synchronize()
+        times_h2d.append((time.perf_counter() - t0) * 1000)
+    print(f"  mean H2D : {statistics.mean(times_h2d):.2f} ms")
+    size_mb = X_cpu.nbytes / 1e6
+    bw = size_mb / (statistics.mean(times_h2d) / 1000) / 1e3
+    print(f"  batch size: {size_mb:.1f} MB → BW effective: {bw:.1f} GB/s\n")
+
+    num_classes = meta["num_classes"]
+    model = SSFTTnet(
+        in_channels=1, num_classes=num_classes,
+        num_tokens=4, dim=64, depth=1, heads=8, mlp_dim=8,
+    ).to(device)
+    model.train()
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scaler    = GradScaler()
+
+    amp_dtype = None
+    if args.amp_dtype == "float16":
+        amp_dtype = torch.float16
+    elif args.amp_dtype == "bfloat16":
+        amp_dtype = torch.bfloat16
+
+    X_gpu = X_cpu.to(device)
+    y_gpu = y_cpu.to(device)
+
+    print("── 3. Forward pass ──────────────────────────────────────────")
+    times_fwd = []
+    for _ in range(N_BATCHES):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        if amp_dtype:
+            with autocast(device_type="cuda", dtype=amp_dtype):
+                logits = model(X_gpu)
+        else:
+            logits = model(X_gpu)
+        torch.cuda.synchronize()
+        times_fwd.append((time.perf_counter() - t0) * 1000)
+    print(f"  mean forward : {statistics.mean(times_fwd):.2f} ms")
+    print(f"  → {args.batch_size / (statistics.mean(times_fwd)/1000):,.0f} patches/s\n")
+
+    print("── 4. Backward pass ─────────────────────────────────────────")
+    times_bwd = []
+    for _ in range(N_BATCHES):
+        if amp_dtype:
+            with autocast(device_type="cuda", dtype=amp_dtype):
+                logits = model(X_gpu)
+                loss   = criterion(logits, y_gpu)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            scaler.scale(loss).backward()
+        else:
+            logits = model(X_gpu)
+            loss   = criterion(logits, y_gpu)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            loss.backward()
+        torch.cuda.synchronize()
+        times_bwd.append((time.perf_counter() - t0) * 1000)
+        optimizer.zero_grad(set_to_none=True)
+    print(f"  mean backward: {statistics.mean(times_bwd):.2f} ms\n")
+
+    print("── 5. Optimizer step ────────────────────────────────────────")
+    times_opt = []
+    for _ in range(N_BATCHES):
+        if amp_dtype:
+            with autocast(device_type="cuda", dtype=amp_dtype):
+                logits = model(X_gpu)
+                loss   = criterion(logits, y_gpu)
+            scaler.scale(loss).backward()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model(X_gpu)
+            loss   = criterion(logits, y_gpu)
+            loss.backward()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            optimizer.step()
+        torch.cuda.synchronize()
+        times_opt.append((time.perf_counter() - t0) * 1000)
+        optimizer.zero_grad(set_to_none=True)
+    print(f"  mean opt step: {statistics.mean(times_opt):.2f} ms\n")
+
+    t_load  = statistics.mean(times)
+    t_h2d   = statistics.mean(times_h2d)
+    t_fwd   = statistics.mean(times_fwd)
+    t_bwd   = statistics.mean(times_bwd)
+    t_opt   = statistics.mean(times_opt)
+    t_total = t_load + t_h2d + t_fwd + t_bwd + t_opt
+
+    print(f"{'═'*55}")
+    print(f"  RÉSUMÉ (ms/batch, batch={args.batch_size})")
+    print(f"{'─'*55}")
+    for label, t in [("DataLoader",t_load),("H2D transfer",t_h2d),
+                     ("Forward",t_fwd),("Backward",t_bwd),("Optim step",t_opt)]:
+        bar = "█" * int(t / t_total * 30)
+        print(f"  {label:<15s} {t:7.2f} ms  {t/t_total*100:5.1f}%  {bar}")
+    print(f"{'─'*55}")
+    print(f"  TOTAL estimé : {t_total:.2f} ms/batch")
+    print(f"  Throughput   : {args.batch_size/(t_total/1000):,.0f} patches/s")
+    print(f"  Époque (66M) : {66_000_000/(args.batch_size/(t_total/1000))/60:.1f} min")
+    print(f"{'═'*55}\n")
+    print("→ La colonne % indique LE goulot réel à optimiser.")
+
+if __name__ == "__main__":
+    main()
+
+
+################333
+import gc
+import json
+import random
+import threading
+import queue
+from pathlib import Path
+
+import h5py
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader, DistributedSampler, RandomSampler
+import torch.distributed as dist
+
+CHUNK_READ   = 2_048
+PREFETCH_Q   = 8
+
+class FastHDF5Dataset(Dataset):
+    def __init__(self, h5_path: str, split_name: str,
+                 chunk_read: int = CHUNK_READ,
+                 dtype_x: np.dtype = np.float32):
+        self.h5_path    = h5_path
+        self.split_name = split_name
+        self.chunk_read = chunk_read
+        self.dtype_x    = dtype_x
+
+        with h5py.File(h5_path, 'r', swmr=True) as f:
+            self.length  = f[f"{split_name}/y"].shape[0]
+            self.x_shape = f[f"{split_name}/X"].shape[1:]
+
+        self._h5_local = threading.local()
+
+    def _get_h5(self):
+        if not hasattr(self._h5_local, 'f') or not self._h5_local.f.id.valid:
+            self._h5_local.f = h5py.File(self.h5_path, 'r', swmr=True)
+        return self._h5_local.f
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        f  = self._get_h5()
+        X  = torch.from_numpy(f[f"{self.split_name}/X"][idx].astype(self.dtype_x))
+        y  = int(f[f"{self.split_name}/y"][idx])
+        X  = X.unsqueeze(0)
+        return X, torch.tensor(y, dtype=torch.long)
+
+    def __del__(self):
+        if hasattr(self._h5_local, 'f'):
+            try:
+                self._h5_local.f.close()
+            except Exception:
+                pass
+
+class SlabHDF5Dataset(Dataset):
+    def __init__(self, h5_path: str, split_name: str, slab_size: int = 200_000,
+                 shuffle: bool = True, seed: int = 0):
+        self.h5_path    = h5_path
+        self.split_name = split_name
+        self.slab_size  = slab_size
+        self.shuffle    = shuffle
+        self.seed       = seed
+
+        with h5py.File(h5_path, 'r', swmr=True) as f:
+            self.length  = f[f"{split_name}/y"].shape[0]
+            self.x_shape = f[f"{split_name}/X"].shape[1:]
+
+        self._build_index()
+
+    def _build_index(self):
+        rng = np.random.default_rng(self.seed)
+        slab_ids = np.arange(0, self.length, self.slab_size)
+        if self.shuffle:
+            rng.shuffle(slab_ids)
+        self._index = np.concatenate([
+            np.arange(s, min(s + self.slab_size, self.length))
+            for s in slab_ids
+        ]).astype(np.int64)
+
+    def reshuffle(self, epoch: int):
+        rng = np.random.default_rng(self.seed + epoch * 1_000_003)
+        slab_ids = np.arange(0, self.length, self.slab_size)
+        rng.shuffle(slab_ids)
+        self._index = np.concatenate([
+            np.arange(s, min(s + self.slab_size, self.length))
+            for s in slab_ids
+        ]).astype(np.int64)
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, pos):
+        idx = int(self._index[pos])
+        with h5py.File(self.h5_path, 'r', swmr=True) as f:
+            X = torch.from_numpy(f[f"{self.split_name}/X"][idx].astype(np.float32))
+            y = int(f[f"{self.split_name}/y"][idx])
+        return X.unsqueeze(0), torch.tensor(y, dtype=torch.long)
+
+def make_loaders_fast(h5_path: str,
+                      batch_size: int      = 512,
+                      num_workers: int     = 8,
+                      rank: int            = 0,
+                      world_size: int      = 1,
+                      seed: int            = 42,
+                      chunk_read: int      = CHUNK_READ,
+                      pin_memory: bool     = True,
+                      prefetch_factor: int = 4):
+    train_ds = FastHDF5Dataset(h5_path, 'train', chunk_read=chunk_read)
+    val_ds   = FastHDF5Dataset(h5_path, 'val',   chunk_read=chunk_read)
+    test_ds  = FastHDF5Dataset(h5_path, 'test',  chunk_read=chunk_read)
+
+    def _worker_init(wid):
+        s = (torch.initial_seed() + wid) % (2**32)
+        np.random.seed(s)
+        random.seed(s)
+
+    common = dict(
+        num_workers    = num_workers,
+        pin_memory     = pin_memory,
+        worker_init_fn = _worker_init,
+        persistent_workers = (num_workers > 0),
+        prefetch_factor    = prefetch_factor if num_workers > 0 else None,
+    )
+
+    if world_size > 1:
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size,
+                                           rank=rank, shuffle=True, seed=seed)
+        val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size,
+                                           rank=rank, shuffle=False)
+        test_sampler  = DistributedSampler(test_ds,  num_replicas=world_size,
+                                           rank=rank, shuffle=False)
+        shuffle_train = False
+    else:
+        train_sampler = None
+        val_sampler   = None
+        test_sampler  = None
+        shuffle_train = True
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size,
+                              sampler=train_sampler, shuffle=shuffle_train, **common)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size * 2,
+                              sampler=val_sampler,   shuffle=False, **common)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size * 2,
+                              sampler=test_sampler,  shuffle=False, **common)
+
+    with h5py.File(h5_path, 'r') as f:
+        meta = {
+            "class_names": json.loads(f.attrs.get("class_names", "[]")),
+            "label2idx":   json.loads(f.attrs.get("label2idx",   "{}")),
+            "num_classes": len(json.loads(f.attrs.get("class_names", "[]"))),
+            "num_bands":   int(f['train/X'].shape[1]),
+            "patch_size":  int(f.attrs.get("patch_size", 13)),
+        }
+
+    return train_loader, val_loader, test_loader, meta, train_sampler

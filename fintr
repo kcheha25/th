@@ -1841,6 +1841,7 @@ class HDF5Dataset(Dataset):
         self._open()
         X = torch.from_numpy(self._h5[f"{self.split_name}/X"][idx]).float()
         y = int(self._h5[f"{self.split_name}/y"][idx])
+        X=X.unsqueeze(0)
         return X, torch.tensor(y, dtype=torch.long)
     def __del__(self):
         if self._h5 is not None:
