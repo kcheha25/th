@@ -596,3 +596,12 @@ if __name__ == "__main__":
     X_b, y_b = next(iter(train_loader))
     print(f"Batch shape: {X_b.shape} | Labels shape: {y_b.shape}")
     print_cache_stats(meta, 0)
+
+
+    if hasattr(train_loader, 'dataset'):
+        train_len = len(train_loader.dataset)
+    elif hasattr(train_loader, 'loader'):
+        train_len = len(train_loader.loader.dataset)
+    else:
+        train_len = 0
+    print(f"  Train   : {train_len:,} patches\n")
