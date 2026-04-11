@@ -2,7 +2,7 @@ import os
 import numpy as np
 import random
 import matplotlib.pyplot as plt
-from spectral import open_image
+from spectral import envi
 from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 from glob import glob
@@ -14,9 +14,17 @@ OUTPUT_DIR = "results"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def load_cube(hdr_path):
-    img = open_image(hdr_path)
-    cube = img.load()
-    return np.array(cube)
+    img = envi.open(hdr_path)
+    cube = np.array(img.load())
+    if cube.shape[-1] != 272:
+        for i, dim in enumerate(cube.shape):
+            if dim == 272:
+                if i == 0:
+                    cube = np.transpose(cube, (1, 2, 0))
+                elif i == 1:
+                    cube = np.transpose(cube, (0, 2, 1))
+                break
+    return cube
 
 def extract_non_zero_spectra(cube):
     spectra = cube.reshape(-1, cube.shape[-1])
@@ -57,6 +65,10 @@ for class_name in real_class_folders:
         spectra = extract_non_zero_spectra(cube)
         aug_spectra_list.append(spectra)
 
+    if len(aug_spectra_list) == 0:
+        print(f"Aucune donnée augmentée pour {class_name}")
+        continue
+
     aug_spectra = np.vstack(aug_spectra_list)
 
     pca = PCA(n_components=2)
@@ -71,8 +83,7 @@ for class_name in real_class_folders:
     plt.scatter(aug_pca[:, 0], aug_pca[:, 1], s=1, alpha=0.3, label="Augmented")
     plt.legend()
     plt.title(f"PCA - Classe {class_name}")
-    pca_path = os.path.join(OUTPUT_DIR, f"PCA_{class_name}.png")
-    plt.savefig(pca_path, dpi=300)
+    plt.savefig(os.path.join(OUTPUT_DIR, f"PCA_{class_name}.png"), dpi=300)
     plt.close()
 
     real_norm = real_spectra / np.linalg.norm(real_spectra, axis=1, keepdims=True)
@@ -97,7 +108,5 @@ for class_name in real_class_folders:
         plt.plot(nearest_real, label="Réel (plus proche)")
         plt.legend()
         plt.title(f"{class_name} - SAM: {sam:.6f}")
-
-        comp_path = os.path.join(OUTPUT_DIR, f"{class_name}_spec_{i+1}_SAM.png")
-        plt.savefig(comp_path, dpi=300)
+        plt.savefig(os.path.join(OUTPUT_DIR, f"{class_name}_spec_{i+1}_SAM.png"), dpi=300)
         plt.close()
