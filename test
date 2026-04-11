@@ -195,105 +195,49 @@ if __name__ == "__main__":
 ################333
 import gc
 import json
+import os
 import random
 from pathlib import Path
 
 import h5py
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, DistributedSampler, RandomSampler
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import torch.distributed as dist
 
-CHUNK_READ   = 2_048
-PREFETCH_Q   = 8
+CHUNK_READ = 2_048
+PREFETCH_Q = 8
+
+_H5_REGISTRY: dict = {}
+
+def _get_h5_handle(h5_path: str) -> h5py.File:
+    key = (os.getpid(), h5_path)
+    f = _H5_REGISTRY.get(key)
+    if f is None or not f.id.valid:
+        f = h5py.File(h5_path, 'r', swmr=True)
+        _H5_REGISTRY[key] = f
+    return f
 
 class FastHDF5Dataset(Dataset):
     def __init__(self, h5_path: str, split_name: str,
-                 chunk_read: int = CHUNK_READ,
-                 dtype_x: np.dtype = np.float32):
-        self.h5_path    = h5_path
+                 dtype_x=np.float32):
+        self.h5_path    = str(h5_path)
         self.split_name = split_name
-        self.chunk_read = chunk_read
         self.dtype_x    = dtype_x
 
-        with h5py.File(h5_path, 'r', swmr=True) as f:
-            self.length  = f[f"{split_name}/y"].shape[0]
-            self.x_shape = f[f"{split_name}/X"].shape[1:]
-
-        self._h5_file = None
-
-    def _get_h5(self):
-        if self._h5_file is None or not self._h5_file.id.valid:
-            self._h5_file = h5py.File(self.h5_path, 'r', swmr=True)
-        return self._h5_file
+        with h5py.File(self.h5_path, 'r') as f:
+            self.length  = int(f[f"{split_name}/y"].shape[0])
+            self.x_shape = tuple(f[f"{split_name}/X"].shape[1:])
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        f = self._get_h5()
-        X = torch.from_numpy(f[f"{self.split_name}/X"][idx].astype(self.dtype_x))
+        f = _get_h5_handle(self.h5_path)
+        X = torch.from_numpy(
+            f[f"{self.split_name}/X"][idx].astype(self.dtype_x)
+        )
         y = int(f[f"{self.split_name}/y"][idx])
-        return X.unsqueeze(0), torch.tensor(y, dtype=torch.long)
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        state["_h5_file"] = None
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self._h5_file = None
-
-    def __del__(self):
-        if self._h5_file is not None:
-            try:
-                self._h5_file.close()
-            except Exception:
-                pass
-
-class SlabHDF5Dataset(Dataset):
-    def __init__(self, h5_path: str, split_name: str, slab_size: int = 200_000,
-                 shuffle: bool = True, seed: int = 0):
-        self.h5_path    = h5_path
-        self.split_name = split_name
-        self.slab_size  = slab_size
-        self.shuffle    = shuffle
-        self.seed       = seed
-
-        with h5py.File(h5_path, 'r', swmr=True) as f:
-            self.length  = f[f"{split_name}/y"].shape[0]
-            self.x_shape = f[f"{split_name}/X"].shape[1:]
-
-        self._build_index()
-
-    def _build_index(self):
-        rng = np.random.default_rng(self.seed)
-        slab_ids = np.arange(0, self.length, self.slab_size)
-        if self.shuffle:
-            rng.shuffle(slab_ids)
-        self._index = np.concatenate([
-            np.arange(s, min(s + self.slab_size, self.length))
-            for s in slab_ids
-        ]).astype(np.int64)
-
-    def reshuffle(self, epoch: int):
-        rng = np.random.default_rng(self.seed + epoch * 1_000_003)
-        slab_ids = np.arange(0, self.length, self.slab_size)
-        rng.shuffle(slab_ids)
-        self._index = np.concatenate([
-            np.arange(s, min(s + self.slab_size, self.length))
-            for s in slab_ids
-        ]).astype(np.int64)
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, pos):
-        idx = int(self._index[pos])
-        with h5py.File(self.h5_path, 'r', swmr=True) as f:
-            X = torch.from_numpy(f[f"{self.split_name}/X"][idx].astype(np.float32))
-            y = int(f[f"{self.split_name}/y"][idx])
         return X.unsqueeze(0), torch.tensor(y, dtype=torch.long)
 
 def make_loaders_fast(h5_path: str,
@@ -305,35 +249,34 @@ def make_loaders_fast(h5_path: str,
                       chunk_read: int      = CHUNK_READ,
                       pin_memory: bool     = True,
                       prefetch_factor: int = 4):
-    train_ds = FastHDF5Dataset(h5_path, 'train', chunk_read=chunk_read)
-    val_ds   = FastHDF5Dataset(h5_path, 'val',   chunk_read=chunk_read)
-    test_ds  = FastHDF5Dataset(h5_path, 'test',  chunk_read=chunk_read)
+    train_ds = FastHDF5Dataset(h5_path, 'train')
+    val_ds   = FastHDF5Dataset(h5_path, 'val')
+    test_ds  = FastHDF5Dataset(h5_path, 'test')
 
     def _worker_init(wid):
-        s = (torch.initial_seed() + wid) % (2**32)
+        s = (torch.initial_seed() + wid) % (2 ** 32)
         np.random.seed(s)
         random.seed(s)
 
+    pf = prefetch_factor if num_workers > 0 else None
     common = dict(
-        num_workers    = num_workers,
-        pin_memory     = pin_memory,
-        worker_init_fn = _worker_init,
+        num_workers        = num_workers,
+        pin_memory         = pin_memory,
+        worker_init_fn     = _worker_init,
         persistent_workers = (num_workers > 0),
-        prefetch_factor    = prefetch_factor if num_workers > 0 else None,
+        prefetch_factor    = pf,
     )
 
     if world_size > 1:
-        train_sampler = DistributedSampler(train_ds, num_replicas=world_size,
-                                           rank=rank, shuffle=True, seed=seed)
-        val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size,
-                                           rank=rank, shuffle=False)
-        test_sampler  = DistributedSampler(test_ds,  num_replicas=world_size,
-                                           rank=rank, shuffle=False)
+        train_sampler = DistributedSampler(
+            train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=seed)
+        val_sampler   = DistributedSampler(
+            val_ds,   num_replicas=world_size, rank=rank, shuffle=False)
+        test_sampler  = DistributedSampler(
+            test_ds,  num_replicas=world_size, rank=rank, shuffle=False)
         shuffle_train = False
     else:
-        train_sampler = None
-        val_sampler   = None
-        test_sampler  = None
+        train_sampler = val_sampler = test_sampler = None
         shuffle_train = True
 
     train_loader = DataLoader(train_ds, batch_size=batch_size,
