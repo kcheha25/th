@@ -1,55 +1,76 @@
 import argparse
+import statistics
 import time
+
 import torch
 import torch.nn as nn
 from torch.cuda.amp import autocast, GradScaler
 
-from fast_dataset import make_loaders_fast
+from dataset import build_loaders
 from ssfnet import SSFTTnet
 
 N_BATCHES = 50
 
+
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--h5_path",    required=True)
-    p.add_argument("--batch_size", type=int, default=512)
-    p.add_argument("--num_workers",type=int, default=8)
-    p.add_argument("--amp_dtype",  default="float16", choices=["float16","bfloat16","none"])
+    p.add_argument("--real_dir",       default=None)
+    p.add_argument("--aug_dir",        default=None)
+    p.add_argument("--mapping_path",   default="mapping.json")
+    p.add_argument("--cache_dir",      default="cache")
+    p.add_argument("--split_mode",     default="aug_real", choices=["aug_real", "shuffle"])
+    p.add_argument("--use_pca",        action="store_true", default=True)
+    p.add_argument("--no_pca",         action="store_false", dest="use_pca")
+    p.add_argument("--pca_components", type=int,   default=30)
+    p.add_argument("--patch_size",     type=int,   default=13)
+    p.add_argument("--val_ratio",      type=float, default=0.15)
+    p.add_argument("--test_ratio",     type=float, default=0.15)
+    p.add_argument("--bg_ratio",       type=float, default=1.5)
+    p.add_argument("--random_state",   type=int,   default=345)
+    p.add_argument("--fit_max_pixels", type=int,   default=500_000)
+    p.add_argument("--balance_train",  action="store_true")
+    p.add_argument("--batch_size",     type=int,   default=64)
+    p.add_argument("--num_workers",    type=int,   default=4)
+    p.add_argument("--amp",            action="store_true", default=False)
     return p.parse_args()
 
-def timer(label, fn, n_warmup=2, n_repeat=10):
-    device = next(iter([].__class__.__mro__))
-    for _ in range(n_warmup):
-        fn()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(n_repeat):
-        fn()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    elapsed = (time.perf_counter() - t0) / n_repeat * 1000
-    print(f"  {label:<30s}: {elapsed:7.2f} ms/batch")
-    return elapsed
 
 def main():
     args   = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"\n{'═'*55}")
-    print(f"  Profiling bottleneck — device: {device}")
-    print(f"  batch_size={args.batch_size}  workers={args.num_workers}")
-    print(f"{'═'*55}\n")
+    if not args.real_dir and not args.aug_dir:
+        raise ValueError("Fournir au moins --real_dir ou --aug_dir")
 
-    train_loader, _, _, meta, _ = make_loaders_fast(
-        h5_path     = args.h5_path,
-        batch_size  = args.batch_size,
-        num_workers = args.num_workers,
+    print(f"\n{'='*55}")
+    print(f"  Profiling — device : {device}")
+    print(f"  batch_size={args.batch_size}  workers={args.num_workers}  amp={args.amp}")
+    print(f"{'='*55}\n")
+
+    train_loader, val_loader, test_loader, meta = build_loaders(
+        real_dir       = args.real_dir,
+        aug_dir        = args.aug_dir,
+        mapping_path   = args.mapping_path,
+        split_mode     = args.split_mode,
+        use_pca        = args.use_pca,
+        pca_components = args.pca_components,
+        patch_size     = args.patch_size,
+        test_ratio     = args.test_ratio,
+        val_ratio      = args.val_ratio,
+        batch_size     = args.batch_size,
+        random_state   = args.random_state,
+        fit_max_pixels = args.fit_max_pixels,
+        num_workers    = args.num_workers,
+        bg_ratio       = args.bg_ratio,
+        cache_dir      = args.cache_dir,
+        balance_train  = args.balance_train,
     )
-    loader_iter = iter(train_loader)
 
-    print("── 1. Débit DataLoader pur (CPU uniquement) ─────────────────")
-    times = []
+    print(f"  Classes : {meta['num_classes']}  |  Bandes : {meta['num_bands']}")
+    print(f"  Train   : {len(train_loader.dataset):,} patches\n")
+
+    loader_iter = iter(train_loader)
+    times_load  = []
     for i in range(N_BATCHES + 2):
         t0 = time.perf_counter()
         try:
@@ -59,22 +80,23 @@ def main():
             X, y = next(loader_iter)
         dt = (time.perf_counter() - t0) * 1000
         if i >= 2:
-            times.append(dt)
+            times_load.append(dt)
 
-    import statistics
-    print(f"  mean  : {statistics.mean(times):.2f} ms")
-    print(f"  median: {statistics.median(times):.2f} ms")
-    print(f"  min   : {min(times):.2f} ms")
-    print(f"  max   : {max(times):.2f} ms")
-    throughput = args.batch_size / (statistics.mean(times) / 1000)
-    print(f"  → Débit loader : {throughput:,.0f} patches/s\n")
+    t_load   = statistics.mean(times_load)
+    thr_load = args.batch_size / (t_load / 1000)
+    print(f"-- 1. DataLoader pur")
+    print(f"   mean={t_load:.2f}ms  median={statistics.median(times_load):.2f}ms  "
+          f"min={min(times_load):.2f}ms  max={max(times_load):.2f}ms")
+    print(f"   Debit : {thr_load:,.0f} patches/s")
+    print(f"   Epoque DataLoader seul : {66_000_000 / thr_load / 60:.1f} min\n")
 
     if not torch.cuda.is_available():
-        print("Pas de GPU détecté — profiling GPU ignoré.")
+        print("Pas de GPU — profiling GPU ignore.")
         return
 
-    print("── 2. Transfert CPU→GPU (H2D) ───────────────────────────────")
     X_cpu, y_cpu = X, y
+
+    print(f"-- 2. Transfert CPU->GPU")
     times_h2d = []
     for _ in range(N_BATCHES):
         torch.cuda.synchronize()
@@ -83,111 +105,89 @@ def main():
         y_gpu = y_cpu.to(device, non_blocking=False)
         torch.cuda.synchronize()
         times_h2d.append((time.perf_counter() - t0) * 1000)
-    print(f"  mean H2D : {statistics.mean(times_h2d):.2f} ms")
+    t_h2d   = statistics.mean(times_h2d)
     size_mb = X_cpu.nbytes / 1e6
-    bw = size_mb / (statistics.mean(times_h2d) / 1000) / 1e3
-    print(f"  batch size: {size_mb:.1f} MB → BW effective: {bw:.1f} GB/s\n")
+    bw      = size_mb / (t_h2d / 1000) / 1e3
+    print(f"   mean={t_h2d:.2f}ms  batch={size_mb:.1f}MB  BW={bw:.1f}GB/s\n")
 
-    num_classes = meta["num_classes"]
     model = SSFTTnet(
-        in_channels=1, num_classes=num_classes,
+        in_channels=1, num_classes=meta["num_classes"],
         num_tokens=4, dim=64, depth=1, heads=8, mlp_dim=8,
     ).to(device)
     model.train()
 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    scaler    = GradScaler()
-
-    amp_dtype = None
-    if args.amp_dtype == "float16":
-        amp_dtype = torch.float16
-    elif args.amp_dtype == "bfloat16":
-        amp_dtype = torch.bfloat16
+    scaler    = GradScaler(enabled=args.amp)
 
     X_gpu = X_cpu.to(device)
     y_gpu = y_cpu.to(device)
 
-    print("── 3. Forward pass ──────────────────────────────────────────")
+    print(f"-- 3. Forward pass")
     times_fwd = []
     for _ in range(N_BATCHES):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        if amp_dtype:
-            with autocast(device_type="cuda", dtype=amp_dtype):
-                logits = model(X_gpu)
-        else:
+        with autocast(enabled=args.amp):
             logits = model(X_gpu)
         torch.cuda.synchronize()
         times_fwd.append((time.perf_counter() - t0) * 1000)
-    print(f"  mean forward : {statistics.mean(times_fwd):.2f} ms")
-    print(f"  → {args.batch_size / (statistics.mean(times_fwd)/1000):,.0f} patches/s\n")
+    t_fwd = statistics.mean(times_fwd)
+    print(f"   mean={t_fwd:.2f}ms  ->  {args.batch_size/(t_fwd/1000):,.0f} patches/s\n")
 
-    print("── 4. Backward pass ─────────────────────────────────────────")
+    print(f"-- 4. Backward pass")
     times_bwd = []
     for _ in range(N_BATCHES):
-        if amp_dtype:
-            with autocast(device_type="cuda", dtype=amp_dtype):
-                logits = model(X_gpu)
-                loss   = criterion(logits, y_gpu)
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            scaler.scale(loss).backward()
-        else:
-            logits = model(X_gpu)
-            loss   = criterion(logits, y_gpu)
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            loss.backward()
+        with autocast(enabled=args.amp):
+            loss = criterion(model(X_gpu), y_gpu)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        scaler.scale(loss).backward()
         torch.cuda.synchronize()
         times_bwd.append((time.perf_counter() - t0) * 1000)
         optimizer.zero_grad(set_to_none=True)
-    print(f"  mean backward: {statistics.mean(times_bwd):.2f} ms\n")
+    t_bwd = statistics.mean(times_bwd)
+    print(f"   mean={t_bwd:.2f}ms\n")
 
-    print("── 5. Optimizer step ────────────────────────────────────────")
+    print(f"-- 5. Optimizer step")
     times_opt = []
     for _ in range(N_BATCHES):
-        if amp_dtype:
-            with autocast(device_type="cuda", dtype=amp_dtype):
-                logits = model(X_gpu)
-                loss   = criterion(logits, y_gpu)
-            scaler.scale(loss).backward()
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            logits = model(X_gpu)
-            loss   = criterion(logits, y_gpu)
-            loss.backward()
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            optimizer.step()
+        with autocast(enabled=args.amp):
+            loss = criterion(model(X_gpu), y_gpu)
+        scaler.scale(loss).backward()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        scaler.step(optimizer)
+        scaler.update()
         torch.cuda.synchronize()
         times_opt.append((time.perf_counter() - t0) * 1000)
         optimizer.zero_grad(set_to_none=True)
-    print(f"  mean opt step: {statistics.mean(times_opt):.2f} ms\n")
+    t_opt = statistics.mean(times_opt)
+    print(f"   mean={t_opt:.2f}ms\n")
 
-    t_load  = statistics.mean(times)
-    t_h2d   = statistics.mean(times_h2d)
-    t_fwd   = statistics.mean(times_fwd)
-    t_bwd   = statistics.mean(times_bwd)
-    t_opt   = statistics.mean(times_opt)
     t_total = t_load + t_h2d + t_fwd + t_bwd + t_opt
+    thr     = args.batch_size / (t_total / 1000)
 
-    print(f"{'═'*55}")
-    print(f"  RÉSUMÉ (ms/batch, batch={args.batch_size})")
-    print(f"{'─'*55}")
-    for label, t in [("DataLoader",t_load),("H2D transfer",t_h2d),
-                     ("Forward",t_fwd),("Backward",t_bwd),("Optim step",t_opt)]:
-        bar = "█" * int(t / t_total * 30)
+    print(f"{'='*55}")
+    print(f"  RESUME  (ms/batch, batch={args.batch_size})")
+    print(f"  {'─'*53}")
+    for label, t in [("DataLoader",   t_load),
+                     ("H2D transfer", t_h2d),
+                     ("Forward",      t_fwd),
+                     ("Backward",     t_bwd),
+                     ("Optim step",   t_opt)]:
+        bar = "#" * int(t / t_total * 30)
         print(f"  {label:<15s} {t:7.2f} ms  {t/t_total*100:5.1f}%  {bar}")
-    print(f"{'─'*55}")
-    print(f"  TOTAL estimé : {t_total:.2f} ms/batch")
-    print(f"  Throughput   : {args.batch_size/(t_total/1000):,.0f} patches/s")
-    print(f"  Époque (66M) : {66_000_000/(args.batch_size/(t_total/1000))/60:.1f} min")
-    print(f"{'═'*55}\n")
-    print("→ La colonne % indique LE goulot réel à optimiser.")
+    print(f"  {'─'*53}")
+    print(f"  TOTAL        : {t_total:.2f} ms/batch")
+    print(f"  Throughput   : {thr:,.0f} patches/s")
+    print(f"  Epoque (66M) : {66_000_000 / thr / 60:.1f} min")
+    print(f"{'='*55}")
+    if t_load / t_total > 0.3:
+        print("-> GOULOT : DataLoader — augmenter num_workers et batch_size")
+    else:
+        print("-> GOULOT : GPU (fwd+bwd) — AMP, torch.compile, batch_size plus grand, multi-GPU")
+
 
 if __name__ == "__main__":
     main()
