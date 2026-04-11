@@ -1,298 +1,598 @@
-import argparse
-import statistics
-import time
-
-import torch
-import torch.nn as nn
-from torch.cuda.amp import autocast, GradScaler
-
-from dataset import build_loaders
-from ssfnet import SSFTTnet
-
-N_BATCHES = 50
-
-
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--real_dir",       default=None)
-    p.add_argument("--aug_dir",        default=None)
-    p.add_argument("--mapping_path",   default="mapping.json")
-    p.add_argument("--cache_dir",      default="cache")
-    p.add_argument("--split_mode",     default="aug_real", choices=["aug_real", "shuffle"])
-    p.add_argument("--use_pca",        action="store_true", default=True)
-    p.add_argument("--no_pca",         action="store_false", dest="use_pca")
-    p.add_argument("--pca_components", type=int,   default=30)
-    p.add_argument("--patch_size",     type=int,   default=13)
-    p.add_argument("--val_ratio",      type=float, default=0.15)
-    p.add_argument("--test_ratio",     type=float, default=0.15)
-    p.add_argument("--bg_ratio",       type=float, default=1.5)
-    p.add_argument("--random_state",   type=int,   default=345)
-    p.add_argument("--fit_max_pixels", type=int,   default=500_000)
-    p.add_argument("--balance_train",  action="store_true")
-    p.add_argument("--batch_size",     type=int,   default=64)
-    p.add_argument("--num_workers",    type=int,   default=4)
-    p.add_argument("--amp",            action="store_true", default=False)
-    return p.parse_args()
-
-
-def main():
-    args   = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    if not args.real_dir and not args.aug_dir:
-        raise ValueError("Fournir au moins --real_dir ou --aug_dir")
-
-    print(f"\n{'='*55}")
-    print(f"  Profiling — device : {device}")
-    print(f"  batch_size={args.batch_size}  workers={args.num_workers}  amp={args.amp}")
-    print(f"{'='*55}\n")
-
-    train_loader, val_loader, test_loader, meta = build_loaders(
-        real_dir       = args.real_dir,
-        aug_dir        = args.aug_dir,
-        mapping_path   = args.mapping_path,
-        split_mode     = args.split_mode,
-        use_pca        = args.use_pca,
-        pca_components = args.pca_components,
-        patch_size     = args.patch_size,
-        test_ratio     = args.test_ratio,
-        val_ratio      = args.val_ratio,
-        batch_size     = args.batch_size,
-        random_state   = args.random_state,
-        fit_max_pixels = args.fit_max_pixels,
-        num_workers    = args.num_workers,
-        bg_ratio       = args.bg_ratio,
-        cache_dir      = args.cache_dir,
-        balance_train  = args.balance_train,
-    )
-
-    print(f"  Classes : {meta['num_classes']}  |  Bandes : {meta['num_bands']}")
-    print(f"  Train   : {len(train_loader.dataset):,} patches\n")
-
-    loader_iter = iter(train_loader)
-    times_load  = []
-    for i in range(N_BATCHES + 2):
-        t0 = time.perf_counter()
-        try:
-            X, y = next(loader_iter)
-        except StopIteration:
-            loader_iter = iter(train_loader)
-            X, y = next(loader_iter)
-        dt = (time.perf_counter() - t0) * 1000
-        if i >= 2:
-            times_load.append(dt)
-
-    t_load   = statistics.mean(times_load)
-    thr_load = args.batch_size / (t_load / 1000)
-    print(f"-- 1. DataLoader pur")
-    print(f"   mean={t_load:.2f}ms  median={statistics.median(times_load):.2f}ms  "
-          f"min={min(times_load):.2f}ms  max={max(times_load):.2f}ms")
-    print(f"   Debit : {thr_load:,.0f} patches/s")
-    print(f"   Epoque DataLoader seul : {66_000_000 / thr_load / 60:.1f} min\n")
-
-    if not torch.cuda.is_available():
-        print("Pas de GPU — profiling GPU ignore.")
-        return
-
-    X_cpu, y_cpu = X, y
-
-    print(f"-- 2. Transfert CPU->GPU")
-    times_h2d = []
-    for _ in range(N_BATCHES):
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        X_gpu = X_cpu.to(device, non_blocking=False)
-        y_gpu = y_cpu.to(device, non_blocking=False)
-        torch.cuda.synchronize()
-        times_h2d.append((time.perf_counter() - t0) * 1000)
-    t_h2d   = statistics.mean(times_h2d)
-    size_mb = X_cpu.nbytes / 1e6
-    bw      = size_mb / (t_h2d / 1000) / 1e3
-    print(f"   mean={t_h2d:.2f}ms  batch={size_mb:.1f}MB  BW={bw:.1f}GB/s\n")
-
-    model = SSFTTnet(
-        in_channels=1, num_classes=meta["num_classes"],
-        num_tokens=4, dim=64, depth=1, heads=8, mlp_dim=8,
-    ).to(device)
-    model.train()
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    scaler    = GradScaler(enabled=args.amp)
-
-    X_gpu = X_cpu.to(device)
-    y_gpu = y_cpu.to(device)
-
-    print(f"-- 3. Forward pass")
-    times_fwd = []
-    for _ in range(N_BATCHES):
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        with autocast(enabled=args.amp):
-            logits = model(X_gpu)
-        torch.cuda.synchronize()
-        times_fwd.append((time.perf_counter() - t0) * 1000)
-    t_fwd = statistics.mean(times_fwd)
-    print(f"   mean={t_fwd:.2f}ms  ->  {args.batch_size/(t_fwd/1000):,.0f} patches/s\n")
-
-    print(f"-- 4. Backward pass")
-    times_bwd = []
-    for _ in range(N_BATCHES):
-        with autocast(enabled=args.amp):
-            loss = criterion(model(X_gpu), y_gpu)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        scaler.scale(loss).backward()
-        torch.cuda.synchronize()
-        times_bwd.append((time.perf_counter() - t0) * 1000)
-        optimizer.zero_grad(set_to_none=True)
-    t_bwd = statistics.mean(times_bwd)
-    print(f"   mean={t_bwd:.2f}ms\n")
-
-    print(f"-- 5. Optimizer step")
-    times_opt = []
-    for _ in range(N_BATCHES):
-        with autocast(enabled=args.amp):
-            loss = criterion(model(X_gpu), y_gpu)
-        scaler.scale(loss).backward()
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        scaler.step(optimizer)
-        scaler.update()
-        torch.cuda.synchronize()
-        times_opt.append((time.perf_counter() - t0) * 1000)
-        optimizer.zero_grad(set_to_none=True)
-    t_opt = statistics.mean(times_opt)
-    print(f"   mean={t_opt:.2f}ms\n")
-
-    t_total = t_load + t_h2d + t_fwd + t_bwd + t_opt
-    thr     = args.batch_size / (t_total / 1000)
-
-    print(f"{'='*55}")
-    print(f"  RESUME  (ms/batch, batch={args.batch_size})")
-    print(f"  {'─'*53}")
-    for label, t in [("DataLoader",   t_load),
-                     ("H2D transfer", t_h2d),
-                     ("Forward",      t_fwd),
-                     ("Backward",     t_bwd),
-                     ("Optim step",   t_opt)]:
-        bar = "#" * int(t / t_total * 30)
-        print(f"  {label:<15s} {t:7.2f} ms  {t/t_total*100:5.1f}%  {bar}")
-    print(f"  {'─'*53}")
-    print(f"  TOTAL        : {t_total:.2f} ms/batch")
-    print(f"  Throughput   : {thr:,.0f} patches/s")
-    print(f"  Epoque (66M) : {66_000_000 / thr / 60:.1f} min")
-    print(f"{'='*55}")
-    if t_load / t_total > 0.3:
-        print("-> GOULOT : DataLoader — augmenter num_workers et batch_size")
-    else:
-        print("-> GOULOT : GPU (fwd+bwd) — AMP, torch.compile, batch_size plus grand, multi-GPU")
-
-
-if __name__ == "__main__":
-    main()
-
-################333
-import gc
-import json
-import os
-import random
+import gc, json, random, re, pickle, hashlib, threading, queue, os, time
+from collections import defaultdict, OrderedDict
 from pathlib import Path
-
-import h5py
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
-import torch.distributed as dist
+import torch.nn.functional as F
+from sklearn.decomposition import PCA
+from spectral import envi
+from torch.utils.data import DataLoader, Dataset
+import h5py
 
-CHUNK_READ = 2_048
-PREFETCH_Q = 8
+NUM_GPUS = max(1, torch.cuda.device_count())
+PATCH_EXTRACT_BATCH = 8192
+PREFETCH_QUEUE_SIZE = 4
+HDF5_CHUNK_PATCHES = 256
+HDF5_CACHE_SIZE_GB = 2
+LRU_CACHE_SIZE_GB = 20
+PREFETCH_BATCHES = 8
+CHUNK_READ_SIZE = 5000
 
-_H5_REGISTRY: dict = {}
+def load_mapping(mapping_path):
+    with open(mapping_path) as f:
+        raw = json.load(f)
+    extrude2final = {}
+    for final_class, extrude_list in raw.items():
+        for ext in extrude_list:
+            extrude2final[ext.strip()] = final_class
+    final_classes = sorted(raw.keys())
+    class_names = final_classes + ["background"]
+    label2idx = {name: i for i, name in enumerate(class_names)}
+    return extrude2final, class_names, label2idx
 
-def _get_h5_handle(h5_path: str) -> h5py.File:
-    key = (os.getpid(), h5_path)
-    f = _H5_REGISTRY.get(key)
-    if f is None or not f.id.valid:
-        f = h5py.File(h5_path, 'r', swmr=True)
-        _H5_REGISTRY[key] = f
-    return f
+def _load_envi_cube(hdr_path, source):
+    img = envi.open(str(hdr_path))
+    cube = img.load().astype(np.float32)
+    wl = [float(w) for w in img.metadata.get("wavelength", [])]
+    if cube.ndim == 3:
+        if source == "real" and wl and cube.shape[2] == len(wl):
+            cube = cube.transpose(2, 0, 1)
+        elif source != "real" and wl and cube.shape[1] == len(wl):
+            cube = cube.transpose(1, 0, 2)
+    if cube.ndim != 3:
+        raise ValueError(f"Invalid cube shape: {cube.shape}")
+    return cube, wl
 
-class FastHDF5Dataset(Dataset):
-    def __init__(self, h5_path: str, split_name: str,
-                 dtype_x=np.float32):
-        self.h5_path    = str(h5_path)
+def _load_shapes(json_path):
+    with open(json_path) as f:
+        return json.load(f).get("shapes", [])
+
+def collect_plots_meta(real_dir=None, aug_dir=None):
+    meta_list = []
+    if real_dir:
+        real_dir = Path(real_dir)
+        for hdr in sorted(real_dir.glob("plot_*_cube.hdr")):
+            m = re.match(r"plot_(\d+)_cube", hdr.stem)
+            if not m: continue
+            jsn = real_dir / f"plot_{m.group(1)}_annotations.json"
+            if jsn.exists():
+                meta_list.append({"source": "real", "name": hdr.stem, "hdr": hdr, "jsn": jsn})
+    if aug_dir:
+        aug_dir = Path(aug_dir)
+        for hdr in sorted(aug_dir.glob("*.hdr")):
+            if any(hdr.stem.endswith(s) for s in ("_ratio", "_cube")): continue
+            jsn = aug_dir / f"{hdr.stem}.json"
+            if not jsn.exists(): continue
+            source = "circle" if "circle" in hdr.stem.lower() else "aug"
+            meta_list.append({"source": source, "name": hdr.stem, "hdr": hdr, "jsn": jsn})
+    if not meta_list:
+        raise RuntimeError("No plots found.")
+    return meta_list
+
+def split_plots(plots_meta, split_mode="aug_real", val_ratio=0.15, test_ratio=0.15, random_state=345):
+    rng = random.Random(random_state)
+    if split_mode == "aug_real":
+        aug = [p for p in plots_meta if p["source"] in ("aug", "circle")]
+        real = [p for p in plots_meta if p["source"] == "real"]
+        rng.shuffle(aug)
+        n_val = max(1, int(len(aug) * val_ratio))
+        train, val, test = aug[n_val:], aug[:n_val], real
+    elif split_mode == "shuffle":
+        all_p = plots_meta[:]
+        rng.shuffle(all_p)
+        n = len(all_p)
+        n_test, n_val = max(1, int(n * test_ratio)), max(1, int(n * val_ratio))
+        test = all_p[:n_test]
+        val = all_p[n_test:n_test + n_val]
+        train = all_p[n_test + n_val:]
+    else:
+        raise ValueError(f"Unknown split_mode: {split_mode}")
+    return train, val, test
+
+def _rasterize_cpu(points, H, W):
+    pts = np.array(points, dtype=np.float32)
+    n = len(pts)
+    cols = np.arange(W, dtype=np.float32) + 0.5
+    rows = np.arange(H, dtype=np.float32) + 0.5
+    gc_, gr_ = np.meshgrid(cols, rows)
+    px, py = gc_.ravel(), gr_.ravel()
+    inside = np.zeros(len(px), dtype=bool)
+    x1, y1 = pts[:, 0], pts[:, 1]
+    x2, y2 = np.roll(x1, -1), np.roll(y1, -1)
+    for i in range(n):
+        dy = y2[i] - y1[i]
+        if abs(dy) < 1e-10: continue
+        cond = (y1[i] < py) != (y2[i] < py)
+        xi = x1[i] + (py - y1[i]) * (x2[i] - x1[i]) / dy
+        inside ^= cond & (px < xi)
+    return inside.reshape(H, W)
+
+def build_label_map(H, W, shapes, extrude2final, label2idx):
+    bg = label2idx["background"]
+    lm = np.full((H, W), bg, dtype=np.int32)
+    for shape in shapes:
+        raw = shape.get("label", "").strip()
+        stype = shape.get("shape_type", "")
+        if raw.lower() == "trou" or stype not in ("polygon", "rectangle"): continue
+        final = extrude2final.get(raw)
+        if final is None: continue
+        pts = shape["points"]
+        if len(pts) < 3: continue
+        try:
+            lm[_rasterize_cpu(pts, H, W)] = label2idx[final]
+        except Exception as e:
+            print(f"Warning rasterization '{raw}': {e}")
+    return lm
+
+def fit_or_load_pca(real_meta_list, pca_components, cache_dir, config_hash, fit_max_pixels=500_000):
+    path = Path(cache_dir) / f"pca_{config_hash}.pkl"
+    if path.exists():
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    pixels = []
+    for meta in real_meta_list:
+        try:
+            cube, _ = _load_envi_cube(meta["hdr"], meta["source"])
+            B, H, W = cube.shape
+            n = min(20_000, H * W)
+            idx = np.random.choice(H * W, n, replace=False)
+            pixels.append(cube.reshape(B, -1)[:, idx].T)
+            del cube
+            gc.collect()
+        except Exception as e:
+            print(f"Warning {meta['name']}: {e}")
+    pixels = np.concatenate(pixels)
+    if len(pixels) > fit_max_pixels:
+        pixels = pixels[np.random.choice(len(pixels), fit_max_pixels, replace=False)]
+    pca = PCA(n_components=pca_components, whiten=True)
+    pca.fit(pixels)
+    del pixels
+    gc.collect()
+    with open(path, "wb") as f:
+        pickle.dump(pca, f, protocol=pickle.HIGHEST_PROTOCOL)
+    return pca
+
+def apply_pca_chunked(cube, pca, chunk=30_000):
+    B, H, W = cube.shape
+    flat = cube.reshape(B, -1).T
+    out = np.empty((H * W, pca.n_components_), dtype=np.float32)
+    for s in range(0, len(flat), chunk):
+        out[s:s + chunk] = pca.transform(flat[s:s + chunk])
+    del flat
+    return out.T.reshape(pca.n_components_, H, W).astype(np.float32)
+
+def balance_background(labels, bg_idx, rng, bg_ratio=1.5):
+    fg = labels != bg_idx
+    keep = fg.copy()
+    n_fg = int(fg.sum())
+    if n_fg > 0:
+        bg_pool = np.where(~fg)[0]
+        n_keep = min(int(n_fg * bg_ratio), len(bg_pool))
+        if n_keep > 0:
+            keep[rng.choice(bg_pool, n_keep, replace=False)] = True
+    return keep
+
+def _extract_patches_on_gpu(cube_pca, rows_k, cols_k, patch_size, device):
+    B, H, W = cube_pca.shape
+    m = patch_size // 2
+    cube_t = torch.from_numpy(cube_pca).to(device, non_blocking=True).unsqueeze(0)
+    padded = F.pad(cube_t, (m, m, m, m), mode="constant", value=0)
+    del cube_t
+    n_patches = len(rows_k)
+    all_patches = np.empty((n_patches, B, patch_size, patch_size), dtype=np.float32)
+    for start in range(0, n_patches, PATCH_EXTRACT_BATCH):
+        end = min(start + PATCH_EXTRACT_BATCH, n_patches)
+        rs = rows_k[start:end]
+        cs = cols_k[start:end]
+        batch = torch.stack([padded[0, :, r:r + patch_size, c:c + patch_size] for r, c in zip(rs, cs)])
+        all_patches[start:end] = batch.cpu().numpy()
+        del batch
+    del padded
+    torch.cuda.empty_cache()
+    return all_patches
+
+def _gpu_worker(gpu_id, task_queue, h5_path, split_name, patch_size, extrude2final, label2idx, bg_ratio, random_state, pca, write_lock, counters):
+    device = torch.device(f"cuda:{gpu_id}")
+    bg_idx = label2idx["background"]
+    while True:
+        try:
+            meta = task_queue.get(timeout=30)
+        except queue.Empty:
+            break
+        if meta is None:
+            task_queue.task_done()
+            break
+        name = meta["name"]
+        source = meta["source"]
+        rng = np.random.default_rng(random_state + hash(name) % 10_000)
+        try:
+            cube_raw, _ = _load_envi_cube(meta["hdr"], source)
+            if pca is not None:
+                cube_pca = apply_pca_chunked(cube_raw, pca)
+                del cube_raw
+                gc.collect()
+            else:
+                cube_pca = cube_raw
+            B, H, W = cube_pca.shape
+            shapes = _load_shapes(meta["jsn"])
+            label_map = build_label_map(H, W, shapes, extrude2final, label2idx)
+            r_all, c_all = np.where(label_map >= 0)
+            labels_all = label_map[r_all, c_all]
+            del label_map
+            keep = balance_background(labels_all, bg_idx, rng, bg_ratio)
+            rows_k = r_all[keep].astype(np.int32)
+            cols_k = c_all[keep].astype(np.int32)
+            labels_k = labels_all[keep].astype(np.int32)
+            del r_all, c_all, labels_all, keep
+            gc.collect()
+            if len(rows_k) == 0:
+                del cube_pca
+                gc.collect()
+                task_queue.task_done()
+                continue
+            all_patches = _extract_patches_on_gpu(cube_pca, rows_k, cols_k, patch_size, device)
+            del cube_pca
+            gc.collect()
+            n_extracted = len(all_patches)
+            with write_lock:
+                with h5py.File(h5_path, 'a') as f:
+                    dset_x = f[f"{split_name}/X"]
+                    dset_y = f[f"{split_name}/y"]
+                    cur = dset_x.shape[0]
+                    new_n = cur + n_extracted
+                    dset_x.resize((new_n, B, patch_size, patch_size))
+                    dset_y.resize((new_n,))
+                    dset_x[cur:new_n] = all_patches
+                    dset_y[cur:new_n] = labels_k
+            del all_patches, labels_k, rows_k, cols_k
+            gc.collect()
+            with counters["lock"]:
+                counters["patches"] += n_extracted
+                counters["cubes"] += 1
+                done = counters["cubes"]
+                total = counters["total"]
+                ptch = counters["patches"]
+                if done % 10 == 0 or done == total:
+                    print(f"  GPU{gpu_id} | [{split_name}] {done}/{total} cubes | {ptch:,} patches | VRAM {torch.cuda.memory_allocated(device)/1e9:.2f} GB")
+        except Exception as e:
+            print(f"  GPU{gpu_id} | {name} : {e}")
+        finally:
+            task_queue.task_done()
+            torch.cuda.empty_cache()
+
+def extract_split_to_hdf5(meta_list, split_name, patch_size, extrude2final, label2idx, bg_ratio, random_state, pca, h5_path, balance_train=False):
+    if not meta_list:
+        return 0
+    shuffled = meta_list[:]
+    random.shuffle(shuffled)
+    if pca is not None:
+        num_bands = pca.n_components_
+    else:
+        tmp, _ = _load_envi_cube(shuffled[0]["hdr"], shuffled[0]["source"])
+        num_bands = tmp.shape[0]
+        del tmp
+        gc.collect()
+    with h5py.File(h5_path, 'a') as f:
+        if split_name in f:
+            del f[split_name]
+        f.create_dataset(f"{split_name}/X", shape=(0, num_bands, patch_size, patch_size), maxshape=(None, num_bands, patch_size, patch_size), dtype=np.float32, chunks=(HDF5_CHUNK_PATCHES, num_bands, patch_size, patch_size), compression='lzf')
+        f.create_dataset(f"{split_name}/y", shape=(0,), maxshape=(None,), dtype=np.int64, chunks=(4096,), compression='lzf')
+    task_q = queue.Queue(maxsize=PREFETCH_QUEUE_SIZE)
+    counters = {"cubes": 0, "patches": 0, "total": len(shuffled), "lock": threading.Lock()}
+    write_lock = threading.Lock()
+    workers = []
+    for gpu_id in range(NUM_GPUS):
+        t = threading.Thread(target=_gpu_worker, args=(gpu_id, task_q, h5_path, split_name, patch_size, extrude2final, label2idx, bg_ratio, random_state, pca, write_lock, counters), daemon=True)
+        t.start()
+        workers.append(t)
+    for meta in shuffled:
+        task_q.put(meta)
+    for _ in range(NUM_GPUS):
+        task_q.put(None)
+    for t in workers:
+        t.join()
+    total_patches = counters["patches"]
+    if balance_train and split_name == "train" and total_patches > 0:
+        total_patches = _balance_hdf5_streaming(h5_path, split_name, patch_size, num_bands, random_state)
+    return total_patches
+
+def _balance_hdf5_streaming(h5_path, split_name, patch_size, num_bands, random_state, read_chunk=50_000):
+    with h5py.File(h5_path, 'r') as f:
+        y_all = f[f"{split_name}/y"][:]
+        n_tot = len(y_all)
+    by_label = defaultdict(list)
+    for i, lbl in enumerate(y_all):
+        by_label[int(lbl)].append(i)
+    del y_all
+    min_count = min(len(v) for v in by_label.values())
+    rng = random.Random(random_state)
+    kept_idx = []
+    for lbl, idxs in sorted(by_label.items()):
+        rng.shuffle(idxs)
+        kept_idx.extend(idxs[:min_count])
+    rng.shuffle(kept_idx)
+    kept_idx = np.array(kept_idx, dtype=np.int64)
+    sort_order = np.argsort(kept_idx)
+    sorted_kept = kept_idx[sort_order]
+    n_new = len(kept_idx)
+    tmp_split = f"{split_name}_tmp"
+    with h5py.File(h5_path, 'a') as f:
+        if tmp_split in f: del f[tmp_split]
+        f.create_dataset(f"{tmp_split}/X", shape=(n_new, num_bands, patch_size, patch_size), dtype=np.float32, chunks=(HDF5_CHUNK_PATCHES, num_bands, patch_size, patch_size), compression='lzf')
+        f.create_dataset(f"{tmp_split}/y", shape=(n_new,), dtype=np.int64, chunks=(4096,), compression='lzf')
+    written = 0
+    for chunk_start in range(0, n_new, read_chunk):
+        chunk_end = min(chunk_start + read_chunk, n_new)
+        chunk_idx = sorted_kept[chunk_start:chunk_end]
+        with h5py.File(h5_path, 'r') as f:
+            X_chunk = f[f"{split_name}/X"][chunk_idx]
+            y_chunk = f[f"{split_name}/y"][chunk_idx]
+        with h5py.File(h5_path, 'a') as f:
+            f[f"{tmp_split}/X"][chunk_start:chunk_end] = X_chunk
+            f[f"{tmp_split}/y"][chunk_start:chunk_end] = y_chunk
+        written += len(chunk_idx)
+        del X_chunk, y_chunk
+        gc.collect()
+    with h5py.File(h5_path, 'a') as f:
+        del f[split_name]
+        f.move(tmp_split, split_name)
+    return n_new
+
+class OptimizedHDF5Dataset(Dataset):
+    def __init__(self, h5_path, split_name, cache_size_gb=LRU_CACHE_SIZE_GB, chunk_read_size=CHUNK_READ_SIZE):
+        self.h5_path = str(h5_path)
         self.split_name = split_name
-        self.dtype_x    = dtype_x
+        self.chunk_read_size = chunk_read_size
+        self._h5 = None
+        self._X_dset = None
+        self._y_dset = None
+        self.cache_size = int(cache_size_gb * 1024 * 1024 * 1024)
+        self.cache = OrderedDict()
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.current_cache_bytes = 0
+        self.access_count = 0
+        self.chunk_cache = {}
+        self._open()
+        self.length = self._y_dset.shape[0]
+        self.shape = self._X_dset.shape
+        self.patch_size_bytes = self._X_dset[0].nbytes
+        self.num_chunks = (self.length + chunk_read_size - 1) // chunk_read_size
+        self.max_cached_patches = self.cache_size // self.patch_size_bytes
+        print(f"Optimized Dataset: {split_name}")
+        print(f"  Total patches: {self.length:,}")
+        print(f"  Patch size: {self.patch_size_bytes/1024/1024:.2f} MB")
+        print(f"  LRU Cache: {cache_size_gb}GB (~{self.max_cached_patches:,} patches)")
+        print(f"  Chunk size: {chunk_read_size} patches")
+        print(f"  Number of chunks: {self.num_chunks}")
+        self.prefetch_queue = queue.Queue(maxsize=50)
+        self.stop_prefetch = threading.Event()
+        self.prefetch_thread = threading.Thread(target=self._predictive_prefetch, daemon=True)
+        self.prefetch_thread.start()
+        self.access_history = []
+        self.last_chunk = -1
 
-        with h5py.File(self.h5_path, 'r') as f:
-            self.length  = int(f[f"{split_name}/y"].shape[0])
-            self.x_shape = tuple(f[f"{split_name}/X"].shape[1:])
+    def _open(self):
+        if self._h5 is None or not self._h5.id.valid:
+            hdf5_cache_bytes = HDF5_CACHE_SIZE_GB * 1024 * 1024 * 1024
+            self._h5 = h5py.File(self.h5_path, 'r', libver='latest', rdcc_nbytes=hdf5_cache_bytes, rdcc_nslots=100003, rdcc_w0=0.75, swmr=True)
+            self._X_dset = self._h5[f"{self.split_name}/X"]
+            self._y_dset = self._h5[f"{self.split_name}/y"]
+
+    def _get_chunk_range(self, idx):
+        chunk_id = idx // self.chunk_read_size
+        start = chunk_id * self.chunk_read_size
+        end = min(start + self.chunk_read_size, self.length)
+        return start, end, chunk_id
+
+    def _read_chunk(self, start, end):
+        self._open()
+        X_chunk = self._X_dset[start:end]
+        y_chunk = self._y_dset[start:end]
+        return X_chunk, y_chunk
+
+    def _add_to_cache(self, idx, X, y):
+        X_np = X.numpy() if isinstance(X, torch.Tensor) else X
+        item_size = X_np.nbytes + 8
+        if item_size > self.cache_size: return
+        while self.current_cache_bytes + item_size > self.cache_size and self.cache:
+            _, (old_X, _) = self.cache.popitem(last=False)
+            self.current_cache_bytes -= (old_X.nbytes + 8)
+            del old_X
+        self.cache[idx] = (X_np, y)
+        self.current_cache_bytes += item_size
+        self.access_count += 1
+        if self.access_count % 10000 == 0: gc.collect()
+
+    def _predictive_prefetch(self):
+        while not self.stop_prefetch.is_set():
+            try:
+                if len(self.access_history) > 100:
+                    recent = self.access_history[-100:]
+                    diffs = np.diff(recent)
+                    if np.std(diffs) < 10:
+                        next_idx = recent[-1] + 1
+                        if next_idx < self.length:
+                            _, _, chunk_id = self._get_chunk_range(next_idx)
+                            if chunk_id != self.last_chunk: self._prefetch_chunk(chunk_id)
+                time.sleep(0.05)
+            except Exception: pass
+
+    def _prefetch_chunk(self, chunk_id):
+        if chunk_id in self.chunk_cache: return
+        start = chunk_id * self.chunk_read_size
+        end = min(start + self.chunk_read_size, self.length)
+        try:
+            X_chunk, y_chunk = self._read_chunk(start, end)
+            self.chunk_cache[chunk_id] = (X_chunk, y_chunk)
+            for i, (idx, X, y) in enumerate(zip(range(start, end), X_chunk, y_chunk)):
+                self._add_to_cache(idx, X, int(y))
+        except Exception: pass
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        f = _get_h5_handle(self.h5_path)
-        X = torch.from_numpy(
-            f[f"{self.split_name}/X"][idx].astype(self.dtype_x)
-        )
-        y = int(f[f"{self.split_name}/y"][idx])
-        return X.unsqueeze(0), torch.tensor(y, dtype=torch.long)
+        self.access_history.append(idx)
+        if len(self.access_history) > 1000: self.access_history = self.access_history[-500:]
+        if idx in self.cache:
+            self.cache_hits += 1
+            self.cache.move_to_end(idx)
+            X_np, y = self.cache[idx]
+            X = torch.from_numpy(X_np).float()
+            X = X.unsqueeze(0)
+            return X, torch.tensor(y, dtype=torch.long)
+        self.cache_misses += 1
+        start, end, chunk_id = self._get_chunk_range(idx)
+        if chunk_id in self.chunk_cache:
+            X_chunk, y_chunk = self.chunk_cache[chunk_id]
+            local_idx = idx - start
+            X_np = X_chunk[local_idx]
+            y = int(y_chunk[local_idx])
+        else:
+            self._open()
+            X_np = self._X_dset[idx]
+            y = int(self._y_dset[idx])
+            if chunk_id not in self.chunk_cache:
+                threading.Thread(target=self._prefetch_chunk, args=(chunk_id,), daemon=True).start()
+        self._add_to_cache(idx, X_np, y)
+        X = torch.from_numpy(X_np).float()
+        X = X.unsqueeze(0)
+        return X, torch.tensor(y, dtype=torch.long)
 
-def make_loaders_fast(h5_path: str,
-                      batch_size: int      = 512,
-                      num_workers: int     = 8,
-                      rank: int            = 0,
-                      world_size: int      = 1,
-                      seed: int            = 42,
-                      chunk_read: int      = CHUNK_READ,
-                      pin_memory: bool     = True,
-                      prefetch_factor: int = 4):
-    train_ds = FastHDF5Dataset(h5_path, 'train')
-    val_ds   = FastHDF5Dataset(h5_path, 'val')
-    test_ds  = FastHDF5Dataset(h5_path, 'test')
+    def get_stats(self):
+        total = self.cache_hits + self.cache_misses
+        hit_rate = self.cache_hits / total * 100 if total > 0 else 0
+        return {'cache_size': len(self.cache), 'cache_bytes': self.current_cache_bytes / (1024**3), 'cache_hits': self.cache_hits, 'cache_misses': self.cache_misses, 'hit_rate': hit_rate, 'chunks_cached': len(self.chunk_cache), 'max_capacity_gb': self.cache_size / (1024**3)}
 
-    def _worker_init(wid):
-        s = (torch.initial_seed() + wid) % (2 ** 32)
-        np.random.seed(s)
-        random.seed(s)
+    def __del__(self):
+        self.stop_prefetch.set()
+        if hasattr(self, 'prefetch_thread') and self.prefetch_thread.is_alive(): self.prefetch_thread.join(timeout=1)
+        if self._h5 is not None:
+            try: self._h5.close()
+            except Exception: pass
 
-    pf = prefetch_factor if num_workers > 0 else None
-    common = dict(
-        num_workers        = num_workers,
-        pin_memory         = pin_memory,
-        worker_init_fn     = _worker_init,
-        persistent_workers = (num_workers > 0),
-        prefetch_factor    = pf,
-    )
+class PrefetchingDataLoader:
+    def __init__(self, loader, prefetch_queue_size=PREFETCH_BATCHES):
+        self.loader = loader
+        self.prefetch_queue = queue.Queue(maxsize=prefetch_queue_size)
+        self.stop_event = threading.Event()
+        self.prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
+        self.prefetch_thread.start()
+        self.iterator = None
 
-    if world_size > 1:
-        train_sampler = DistributedSampler(
-            train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=seed)
-        val_sampler   = DistributedSampler(
-            val_ds,   num_replicas=world_size, rank=rank, shuffle=False)
-        test_sampler  = DistributedSampler(
-            test_ds,  num_replicas=world_size, rank=rank, shuffle=False)
-        shuffle_train = False
-    else:
-        train_sampler = val_sampler = test_sampler = None
-        shuffle_train = True
+    def _prefetch_worker(self):
+        while not self.stop_event.is_set():
+            try:
+                if self.iterator is None: self.iterator = iter(self.loader)
+                for _ in range(self.prefetch_queue.maxsize - self.prefetch_queue.qsize()):
+                    try:
+                        batch = next(self.iterator)
+                        self.prefetch_queue.put(batch, timeout=0.1)
+                    except StopIteration:
+                        self.iterator = iter(self.loader)
+                        batch = next(self.iterator)
+                        self.prefetch_queue.put(batch)
+            except Exception as e:
+                print(f"Prefetch error: {e}")
+                break
+            if self.prefetch_queue.qsize() > self.prefetch_queue.maxsize * 0.8: time.sleep(0.005)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size,
-                              sampler=train_sampler, shuffle=shuffle_train, **common)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size * 2,
-                              sampler=val_sampler,   shuffle=False, **common)
-    test_loader  = DataLoader(test_ds,  batch_size=batch_size * 2,
-                              sampler=test_sampler,  shuffle=False, **common)
+    def __iter__(self): return self
+    def __next__(self):
+        if self.stop_event.is_set(): raise StopIteration
+        batch = self.prefetch_queue.get(timeout=60)
+        if batch is None: raise StopIteration
+        return batch
+    def __len__(self): return len(self.loader)
+    def stop(self):
+        self.stop_event.set()
+        if self.prefetch_thread.is_alive(): self.prefetch_thread.join(timeout=5)
 
-    with h5py.File(h5_path, 'r') as f:
-        meta = {
-            "class_names": json.loads(f.attrs.get("class_names", "[]")),
-            "label2idx":   json.loads(f.attrs.get("label2idx",   "{}")),
-            "num_classes": len(json.loads(f.attrs.get("class_names", "[]"))),
-            "num_bands":   int(f['train/X'].shape[1]),
-            "patch_size":  int(f.attrs.get("patch_size", 13)),
-        }
+def worker_init_fn(worker_id):
+    seed = (torch.initial_seed() + worker_id) % (2 ** 32)
+    np.random.seed(seed)
+    random.seed(seed)
 
-    return train_loader, val_loader, test_loader, meta, train_sampler
+def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json", split_mode="aug_real", use_pca=True, pca_components=30, patch_size=13, test_ratio=0.15, val_ratio=0.15, batch_size=64, random_state=345, fit_max_pixels=500_000, num_workers=4, bg_ratio=1.5, cache_dir="cache", force_recompute=False, balance_train=False, cache_size_gb=LRU_CACHE_SIZE_GB, chunk_read_size=CHUNK_READ_SIZE):
+    os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
+    os.environ['HDF5_USE_PREAD'] = '1'
+    extrude2final, class_names, label2idx = load_mapping(mapping_path)
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    config_str = f"{real_dir}_{aug_dir}_{split_mode}_{patch_size}_{random_state}_{bg_ratio}_{pca_components if use_pca else 0}_{balance_train}"
+    config_hash = hashlib.md5(config_str.encode()).hexdigest()[:12]
+    h5_path = cache_dir / f"patches_{config_hash}.h5"
+    if not force_recompute and h5_path.exists():
+        return _make_loaders_optimized(h5_path, class_names, label2idx, patch_size, pca_components if use_pca else None, balance_train, batch_size, num_workers, cache_size_gb, chunk_read_size)
+    plots_meta = collect_plots_meta(real_dir=real_dir, aug_dir=aug_dir)
+    train_meta, val_meta, test_meta = split_plots(plots_meta, split_mode, val_ratio, test_ratio, random_state)
+    pca_model = None
+    if use_pca:
+        real_meta = [m for m in plots_meta if m["source"] == "real"]
+        if real_meta: pca_model = fit_or_load_pca(real_meta, pca_components, cache_dir, config_hash, fit_max_pixels)
+    for meta_list, sname, do_balance in [(train_meta, "train", balance_train), (val_meta, "val", False), (test_meta, "test", False)]:
+        extract_split_to_hdf5(meta_list, sname, patch_size, extrude2final, label2idx, bg_ratio, random_state, pca_model, str(h5_path), balance_train=do_balance)
+    with h5py.File(h5_path, 'a') as f:
+        f.attrs['class_names'] = json.dumps(class_names)
+        f.attrs['label2idx'] = json.dumps(label2idx)
+        f.attrs['patch_size'] = patch_size
+        f.attrs['num_bands'] = pca_components if use_pca else -1
+        f.attrs['created_at'] = datetime.now().isoformat()
+    return _make_loaders_optimized(h5_path, class_names, label2idx, patch_size, pca_components if use_pca else None, balance_train, batch_size, num_workers, cache_size_gb, chunk_read_size)
+
+def _make_loaders_optimized(h5_path, class_names, label2idx, patch_size, num_bands_override, balance_train, batch_size, num_workers, cache_size_gb, chunk_read_size):
+    train_ds = OptimizedHDF5Dataset(str(h5_path), 'train', cache_size_gb=cache_size_gb, chunk_read_size=chunk_read_size)
+    val_ds = OptimizedHDF5Dataset(str(h5_path), 'val', cache_size_gb=2, chunk_read_size=chunk_read_size)
+    test_ds = OptimizedHDF5Dataset(str(h5_path), 'test', cache_size_gb=2, chunk_read_size=chunk_read_size)
+    with h5py.File(h5_path, 'r') as f: num_bands = f['train/X'].shape[1]
+    pin = torch.cuda.is_available()
+    kw = dict(num_workers=num_workers, pin_memory=pin, pin_memory_device='cuda' if pin else '', worker_init_fn=worker_init_fn, persistent_workers=True, prefetch_factor=3, multiprocessing_context='spawn')
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, **kw)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **kw)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, **kw)
+    train_loader = PrefetchingDataLoader(train_loader, prefetch_queue_size=PREFETCH_BATCHES)
+    meta = {"class_names": class_names, "label2idx": label2idx, "num_classes": len(class_names), "num_bands": num_bands, "patch_size": patch_size, "balance_train": balance_train, "dataset": train_ds}
+    return train_loader, val_loader, test_loader, meta
+
+def print_cache_stats(meta, epoch):
+    if 'dataset' in meta:
+        stats = meta['dataset'].get_stats()
+        print(f"Cache Stats - Epoch {epoch}")
+        print(f"  Cache size: {stats['cache_size']:,} patches")
+        print(f"  Memory used: {stats['cache_bytes']:.2f} GB / {stats['max_capacity_gb']:.1f} GB")
+        print(f"  Chunks cached: {stats['chunks_cached']}")
+        print(f"  Hit rate: {stats['hit_rate']:.1f}%")
+        print(f"  Hits: {stats['cache_hits']:,}, Misses: {stats['cache_misses']:,}")
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--real_dir")
+    p.add_argument("--aug_dir")
+    p.add_argument("--mapping_path", default="mapping.json")
+    p.add_argument("--split_mode", default="aug_real", choices=["aug_real", "shuffle"])
+    p.add_argument("--use_pca", action="store_true", default=True)
+    p.add_argument("--no_pca", action="store_false", dest="use_pca")
+    p.add_argument("--pca_components", type=int, default=30)
+    p.add_argument("--patch_size", type=int, default=13)
+    p.add_argument("--test_ratio", type=float, default=0.15)
+    p.add_argument("--val_ratio", type=float, default=0.15)
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--random_state", type=int, default=345)
+    p.add_argument("--fit_max_pixels", type=int, default=500_000)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--bg_ratio", type=float, default=1.5)
+    p.add_argument("--cache_dir", default="cache")
+    p.add_argument("--force_recompute", action="store_true")
+    p.add_argument("--balance_train", action="store_true")
+    p.add_argument("--cache_size_gb", type=int, default=LRU_CACHE_SIZE_GB)
+    p.add_argument("--chunk_read_size", type=int, default=CHUNK_READ_SIZE)
+    args = p.parse_args()
+    if not args.real_dir and not args.aug_dir: p.error("--real_dir or --aug_dir required")
+    train_loader, val_loader, test_loader, meta = build_loaders(**vars(args))
+    X_b, y_b = next(iter(train_loader))
+    print(f"Batch shape: {X_b.shape} | Labels shape: {y_b.shape}")
+    print_cache_stats(meta, 0)
