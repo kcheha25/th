@@ -1,0 +1,103 @@
+import os
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+from spectral import open_image
+from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
+from glob import glob
+
+REAL_DIR = "extrudes_cubes_vf"
+AUG_DIR = "aug_data"
+OUTPUT_DIR = "results"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def load_cube(hdr_path):
+    img = open_image(hdr_path)
+    cube = img.load()
+    return np.array(cube)
+
+def extract_non_zero_spectra(cube):
+    spectra = cube.reshape(-1, cube.shape[-1])
+    mask = np.any(spectra != 0, axis=1)
+    return spectra[mask]
+
+def get_class_name(folder_name):
+    return folder_name.split("_")[0]
+
+real_class_folders = {}
+for folder in os.listdir(REAL_DIR):
+    class_name = get_class_name(folder)
+    real_class_folders.setdefault(class_name, []).append(os.path.join(REAL_DIR, folder))
+
+for class_name in real_class_folders:
+
+    print(f"\n===== Classe {class_name} =====")
+
+    real_spectra_list = []
+    for folder in real_class_folders[class_name]:
+        hdr_files = glob(os.path.join(folder, "*.hdr"))
+        for hdr in hdr_files:
+            cube = load_cube(hdr)
+            spectra = extract_non_zero_spectra(cube)
+            real_spectra_list.append(spectra)
+
+    real_spectra = np.vstack(real_spectra_list)
+
+    aug_folder = os.path.join(AUG_DIR, class_name)
+    if not os.path.exists(aug_folder):
+        print(f"Pas de données augmentées pour {class_name}")
+        continue
+
+    aug_spectra_list = []
+    hdr_files = glob(os.path.join(aug_folder, "*.hdr"))
+    for hdr in hdr_files:
+        cube = load_cube(hdr)
+        spectra = extract_non_zero_spectra(cube)
+        aug_spectra_list.append(spectra)
+
+    aug_spectra = np.vstack(aug_spectra_list)
+
+    pca = PCA(n_components=2)
+    all_data = np.vstack([real_spectra, aug_spectra])
+    pca.fit(all_data)
+
+    real_pca = pca.transform(real_spectra)
+    aug_pca = pca.transform(aug_spectra)
+
+    plt.figure()
+    plt.scatter(real_pca[:, 0], real_pca[:, 1], s=1, alpha=0.3, label="Real")
+    plt.scatter(aug_pca[:, 0], aug_pca[:, 1], s=1, alpha=0.3, label="Augmented")
+    plt.legend()
+    plt.title(f"PCA - Classe {class_name}")
+    pca_path = os.path.join(OUTPUT_DIR, f"PCA_{class_name}.png")
+    plt.savefig(pca_path, dpi=300)
+    plt.close()
+
+    real_norm = real_spectra / np.linalg.norm(real_spectra, axis=1, keepdims=True)
+    aug_norm = aug_spectra / np.linalg.norm(aug_spectra, axis=1, keepdims=True)
+
+    nn = NearestNeighbors(n_neighbors=1, metric="cosine")
+    nn.fit(real_norm)
+
+    selected_indices = random.sample(range(len(aug_spectra)), min(3, len(aug_spectra)))
+
+    for i, idx_sample in enumerate(selected_indices):
+        dist, idx = nn.kneighbors(aug_norm[idx_sample].reshape(1, -1))
+        nearest_real = real_spectra[idx[0][0]]
+        cos_sim = 1 - dist[0][0]
+        sam = np.arccos(np.clip(cos_sim, -1, 1))
+
+        print(f"\nSpectre {i+1} (classe {class_name})")
+        print(f"SAM min: {sam:.6f} radians")
+
+        plt.figure()
+        plt.plot(aug_spectra[idx_sample], label="Augmenté")
+        plt.plot(nearest_real, label="Réel (plus proche)")
+        plt.legend()
+        plt.title(f"{class_name} - SAM: {sam:.6f}")
+
+        comp_path = os.path.join(OUTPUT_DIR, f"{class_name}_spec_{i+1}_SAM.png")
+        plt.savefig(comp_path, dpi=300)
+        plt.close()
