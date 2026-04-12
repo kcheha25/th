@@ -345,16 +345,22 @@ class OptimizedHDF5Dataset(Dataset):
         self.h5_path = str(h5_path)
         self.split_name = split_name
         self.chunk_read_size = chunk_read_size
+        self.cache_size = int(cache_size_gb * 1024 * 1024 * 1024)
+        self.cache_size_gb = cache_size_gb
         self._h5 = None
         self._X_dset = None
         self._y_dset = None
-        self.cache_size = int(cache_size_gb * 1024 * 1024 * 1024)
         self.cache = OrderedDict()
         self.cache_hits = 0
         self.cache_misses = 0
         self.current_cache_bytes = 0
         self.access_count = 0
         self.chunk_cache = {}
+        self.prefetch_queue = None
+        self.stop_prefetch = None
+        self.prefetch_thread = None
+        self.access_history = []
+        self.last_chunk = -1
         self._open()
         self.length = self._y_dset.shape[0]
         self.shape = self._X_dset.shape
@@ -367,12 +373,32 @@ class OptimizedHDF5Dataset(Dataset):
         print(f"  LRU Cache: {cache_size_gb}GB (~{self.max_cached_patches:,} patches)")
         print(f"  Chunk size: {chunk_read_size} patches")
         print(f"  Number of chunks: {self.num_chunks}")
-        self.prefetch_queue = queue.Queue(maxsize=50)
-        self.stop_prefetch = threading.Event()
-        self.prefetch_thread = threading.Thread(target=self._predictive_prefetch, daemon=True)
-        self.prefetch_thread.start()
+        self._close()
+        self._h5 = None
+        self._X_dset = None
+        self._y_dset = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_h5'] = None
+        state['_X_dset'] = None
+        state['_y_dset'] = None
+        state['cache'] = OrderedDict()
+        state['chunk_cache'] = {}
+        state['prefetch_queue'] = None
+        state['stop_prefetch'] = None
+        state['prefetch_thread'] = None
+        state['access_history'] = []
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.cache = OrderedDict()
+        self.chunk_cache = {}
         self.access_history = []
-        self.last_chunk = -1
+        self.current_cache_bytes = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
 
     def _open(self):
         if self._h5 is None or not self._h5.id.valid:
@@ -380,6 +406,16 @@ class OptimizedHDF5Dataset(Dataset):
             self._h5 = h5py.File(self.h5_path, 'r', libver='latest', rdcc_nbytes=hdf5_cache_bytes, rdcc_nslots=100003, rdcc_w0=0.75, swmr=True)
             self._X_dset = self._h5[f"{self.split_name}/X"]
             self._y_dset = self._h5[f"{self.split_name}/y"]
+
+    def _close(self):
+        if self._h5 is not None:
+            try:
+                self._h5.close()
+            except Exception:
+                pass
+        self._h5 = None
+        self._X_dset = None
+        self._y_dset = None
 
     def _get_chunk_range(self, idx):
         chunk_id = idx // self.chunk_read_size
@@ -406,35 +442,11 @@ class OptimizedHDF5Dataset(Dataset):
         self.access_count += 1
         if self.access_count % 10000 == 0: gc.collect()
 
-    def _predictive_prefetch(self):
-        while not self.stop_prefetch.is_set():
-            try:
-                if len(self.access_history) > 100:
-                    recent = self.access_history[-100:]
-                    diffs = np.diff(recent)
-                    if np.std(diffs) < 10:
-                        next_idx = recent[-1] + 1
-                        if next_idx < self.length:
-                            _, _, chunk_id = self._get_chunk_range(next_idx)
-                            if chunk_id != self.last_chunk: self._prefetch_chunk(chunk_id)
-                time.sleep(0.05)
-            except Exception: pass
-
-    def _prefetch_chunk(self, chunk_id):
-        if chunk_id in self.chunk_cache: return
-        start = chunk_id * self.chunk_read_size
-        end = min(start + self.chunk_read_size, self.length)
-        try:
-            X_chunk, y_chunk = self._read_chunk(start, end)
-            self.chunk_cache[chunk_id] = (X_chunk, y_chunk)
-            for i, (idx, X, y) in enumerate(zip(range(start, end), X_chunk, y_chunk)):
-                self._add_to_cache(idx, X, int(y))
-        except Exception: pass
-
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
+        self._open()
         self.access_history.append(idx)
         if len(self.access_history) > 1000: self.access_history = self.access_history[-500:]
         if idx in self.cache:
@@ -452,11 +464,8 @@ class OptimizedHDF5Dataset(Dataset):
             X_np = X_chunk[local_idx]
             y = int(y_chunk[local_idx])
         else:
-            self._open()
             X_np = self._X_dset[idx]
             y = int(self._y_dset[idx])
-            if chunk_id not in self.chunk_cache:
-                threading.Thread(target=self._prefetch_chunk, args=(chunk_id,), daemon=True).start()
         self._add_to_cache(idx, X_np, y)
         X = torch.from_numpy(X_np).float()
         X = X.unsqueeze(0)
@@ -468,11 +477,11 @@ class OptimizedHDF5Dataset(Dataset):
         return {'cache_size': len(self.cache), 'cache_bytes': self.current_cache_bytes / (1024**3), 'cache_hits': self.cache_hits, 'cache_misses': self.cache_misses, 'hit_rate': hit_rate, 'chunks_cached': len(self.chunk_cache), 'max_capacity_gb': self.cache_size / (1024**3)}
 
     def __del__(self):
-        self.stop_prefetch.set()
-        if hasattr(self, 'prefetch_thread') and self.prefetch_thread.is_alive(): self.prefetch_thread.join(timeout=1)
-        if self._h5 is not None:
-            try: self._h5.close()
-            except Exception: pass
+        if hasattr(self, 'stop_prefetch') and self.stop_prefetch is not None:
+            self.stop_prefetch.set()
+        if hasattr(self, 'prefetch_thread') and self.prefetch_thread is not None and self.prefetch_thread.is_alive():
+            self.prefetch_thread.join(timeout=1)
+        self._close()
 
 class PrefetchingDataLoader:
     def __init__(self, loader, prefetch_queue_size=PREFETCH_BATCHES):
@@ -549,11 +558,10 @@ def _make_loaders_optimized(h5_path, class_names, label2idx, patch_size, num_ban
     test_ds = OptimizedHDF5Dataset(str(h5_path), 'test', cache_size_gb=2, chunk_read_size=chunk_read_size)
     with h5py.File(h5_path, 'r') as f: num_bands = f['train/X'].shape[1]
     pin = torch.cuda.is_available()
-    kw = dict(num_workers=num_workers, pin_memory=pin, pin_memory_device='cuda' if pin else '', worker_init_fn=worker_init_fn, persistent_workers=True, prefetch_factor=3, multiprocessing_context='spawn')
+    kw = dict(num_workers=num_workers, pin_memory=pin, pin_memory_device='cuda' if pin else '', worker_init_fn=worker_init_fn, persistent_workers=True if num_workers > 0 else False, prefetch_factor=3, multiprocessing_context='spawn')
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, **kw)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **kw)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, **kw)
-    train_loader = PrefetchingDataLoader(train_loader, prefetch_queue_size=PREFETCH_BATCHES)
     meta = {"class_names": class_names, "label2idx": label2idx, "num_classes": len(class_names), "num_bands": num_bands, "patch_size": patch_size, "balance_train": balance_train, "dataset": train_ds}
     return train_loader, val_loader, test_loader, meta
 
