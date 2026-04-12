@@ -1,0 +1,44 @@
+La variabilité observée dans le diapo 3 n’est pas très inquiétante, car elle correspond à un seul pixel, et on ne prend jamais un seul pixel puisqu’il n’est pas très informatif, on utilise plutôt des zones de type 9×9, 7×7....
+
+Le GAN génère le spectre à partir d’un bruit aléatoire, et dans mon cas j’en utilise un par échantillon, ce qui fait au total 60 GAN.
+
+Pour évaluer le rapprochement et la génération des spectres augmentés, j’utilise la métrique SAM, qui évalue à quel point le spectre a une signature spectrale fidèle au spectre réel. Pour ajouter une couche supplémentaire, j’injecte le comportement du spectre réel dans le spectre GAN au niveau des longueurs d’onde sélectionnées, et je ramène le spectre augmenté à la même moyenne que le spectre réel sans changer la signature spectrale.
+
+Dans la télédétection, ils prennent des patches autour d’un pixel central, et l’objectif est la classification de ce pixel central.
+
+Le nombre de pixels entre les extrudes des différents échantillons n’est pas le même, même en équilibrant en termes de nombre d’extrudes pour les différents échantillons, et dans le cas où l’approche adoptée est la classification à l’échelle du pixel, on n’aura pas le même nombre de pixels entre les 14 différentes classes.
+
+Faut-il équilibrer le nombre de pixels entre les 14 classes ou garder la distribution telle quelle ? 
+
+Dans un premier temps, on n’a pas besoin d’entrer trop dans le détail concernant l’équilibrage des données en nombre de pixels. Il faut d’abord tester les modèles, et en fonction des résultats, on verra. On saura qu’il y a un déséquilibre si on constate un problème. On sait déjà que les données ne sont pas bien équilibrées, et la cause peut venir de cela.
+
+L’idéal pour s’assurer de ne pas avoir de fuite de données, c’est de consacrer une partie des plots ou quelques extrudes de certains échantillons, et de ne pas les utiliser ni pour l’augmentation des données ni pour l’entraînement, afin de les garder uniquement pour le test.
+
+Il faudra vérifier que le GAN n’a pas appris par cœur et qu’il ne génère pas des spectres identiques aux spectres réels présents dans la base de données.
+
+Pour les cas où je génère le spectre augmenté par bruit, il est intéressant de recalculer le SAM entre le spectre généré après ajout de bruit et le spectre réel.
+
+
+
+
+Continuer le développement avec le modèle de classification
+Prendre un spectre GAN généré et calculer, selon les métriques appropriées, la ressemblance entre le GAN et tous les spectres dans la base de données réelle (5 spectres par échantillon).
+Re réfléchir sur la fréquence des réunions pour faire des points IA plus fréquemment.
+
+
+
+Données / pixels / échelle spatiale
+La variabilité observée dans le diapo 3 n’est pas très inquiétante, car elle correspond à un seul pixel, et on ne prend jamais un seul pixel puisqu’il n’est pas très informatif, on utilise plutôt des zones de type 9×9, 7×7....
+Dans la télédétection, ils prennent des patches autour d’un pixel central, et l’objectif est la classification de ce pixel central.
+Le nombre de pixels entre les extrudes des différents échantillons n’est pas le même, même en équilibrant en termes de nombre d’extrudes pour les différents échantillons, et dans le cas où l’approche adoptée est la classification à l’échelle du pixel, on n’aura pas le même nombre de pixels entre les 14 différentes classes.
+Faut-il équilibrer le nombre de pixels entre les 14 classes ou garder la distribution telle quelle ?
+Dans un premier temps, on n’a pas besoin d’entrer trop dans le détail concernant l’équilibrage des données en nombre de pixels. Il faut d’abord tester les modèles, et en fonction des résultats, on verra. On saura qu’il y a un déséquilibre si on constate un problème. On sait déjà que les données ne sont pas bien équilibrées, et la cause peut venir de cela.
+
+GAN / génération de spectres
+Le GAN génère le spectre à partir d’un bruit aléatoire, et dans mon cas j’en utilise un par échantillon, ce qui fait au total 60 GAN.
+Pour évaluer le rapprochement et la génération des spectres augmentés, j’utilise la métrique SAM, qui évalue à quel point le spectre a une signature spectrale fidèle au spectre réel. Pour ajouter une couche supplémentaire, j’injecte le comportement du spectre réel dans le spectre GAN au niveau des longueurs d’onde sélectionnées, et je ramène le spectre augmenté à la même moyenne que le spectre réel sans changer la signature spectrale.
+Il faudra vérifier que le GAN n’a pas appris par cœur et qu’il ne génère pas des spectres identiques aux spectres réels présents dans la base de données.
+Pour les cas où je génère le spectre augmenté par bruit, il est intéressant de recalculer le SAM entre le spectre généré après ajout de bruit et le spectre réel.
+
+fuite de données
+L’idéal pour s’assurer de ne pas avoir de fuite de données, c’est de consacrer une partie des plots ou quelques extrudes de certains échantillons, et de ne pas les utiliser ni pour l’augmentation des données ni pour l’entraînement, afin de les garder uniquement pour le test.
