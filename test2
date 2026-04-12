@@ -22,9 +22,9 @@ def _get_h5(h5_path):
     key = (os.getpid(), h5_path)
     f   = _H5_REGISTRY.get(key)
     if f is None or not f.id.valid:
-        f = h5py.File(h5_path, 'r', swmr=True,
-                      rdcc_nbytes=512*1024*1024,
-                      rdcc_nslots=100003)
+        f = h5py.File(h5_path, 'r',
+                      rdcc_nbytes=128*1024*1024,
+                      rdcc_nslots=10007)
         _H5_REGISTRY[key] = f
     return f
 
@@ -52,36 +52,83 @@ def detect_server():
     print(f"    CPUs        : {cpu_count}")
     return info
 
-def auto_config(server_info, h5_path_gb=800.0):
+def auto_config(server_info):
     is_win       = server_info["is_windows"]
     ram_avail_gb = server_info["ram_avail_gb"]
-    n_gpus       = server_info["n_gpus"]
+    n_gpus       = max(server_info["n_gpus"], 1)
     min_vram     = server_info["min_vram_gb"]
     cpu_count    = server_info["cpu_count"]
+    patch_bytes  = 30 * 13 * 13 * 4
 
     if is_win:
-        usable_ram    = ram_avail_gb * 0.80
-        ram_cache_gb  = min(usable_ram, 320.0)
-        slab_size     = 65536
-        batch_size    = 2048
-        num_workers   = min(16, cpu_count)
-        prefetch       = 8
-        mp_ctx        = "spawn"
-        strategy      = "WINDOWS_L40S_LARGERAM"
+        # Windows L40s : 400 GB RAM
+        usable_ram   = ram_avail_gb * 0.80
+        ram_cache_gb = min(usable_ram, 320.0)
+        # slab_size irrelevant si RamDataset
+        slab_size    = 32768
+        batch_size   = 2048
+        # workers legers car donnees en RAM, pas besoin de beaucoup
+        num_workers  = min(8, cpu_count)
+        prefetch     = 4
+        mp_ctx       = "spawn"
+        strategy     = "WINDOWS_L40S_LARGERAM"
+
+    elif ram_avail_gb >= 200:
+        # Linux avec beaucoup de RAM (ex: 664 GB)
+        # On charge le max en RamDataset
+        usable_ram   = ram_avail_gb * 0.82
+        ram_cache_gb = min(usable_ram, 540.0)
+
+        # Nombre de workers : peu suffisent car donnees en RAM
+        # Chaque worker ne charge PAS de slab (RamDataset = tableau numpy)
+        # Le seul cout est le slicing numpy + copy vers pin_memory
+        num_workers  = min(8, cpu_count // n_gpus)
+
+        # slab_size pour SlabDataset (fallback si RamDataset depasse la RAM)
+        # Calcule pour que num_workers * n_gpus * slab ne depasse pas 20 GB
+        max_slab_ram_gb  = 20.0
+        total_workers    = num_workers * n_gpus
+        slab_size        = max(512, min(
+            16384,
+            int(max_slab_ram_gb * 1e9 / (total_workers * patch_bytes))
+        ))
+
+        if min_vram <= 10:
+            batch_size = 256
+        elif min_vram <= 16:
+            batch_size = 512
+        else:
+            batch_size = 1024
+
+        prefetch     = 4
+        mp_ctx       = None
+        strategy     = "LINUX_LARGERAM"
+
     else:
-        usable_ram    = ram_avail_gb * 0.55
-        ram_cache_gb  = min(usable_ram, 7.0)
-        slab_size     = 2048
+        # Linux RAM limitee (< 200 GB)
+        # SlabDataset avec slabs petits
+        ram_cache_gb = 0.0
+
+        # Calcule slab_size pour que chaque worker tienne dans sa RAM
+        # Budget : 1 GB par worker max
+        num_workers      = max(1, min(4, cpu_count // n_gpus))
+        total_workers    = num_workers * n_gpus
+        budget_per_worker = 0.8 * 1e9
+        slab_size        = max(128, min(
+            2048,
+            int(budget_per_worker / patch_bytes)
+        ))
+
         if min_vram <= 10:
             batch_size = 128
         elif min_vram <= 16:
             batch_size = 256
         else:
             batch_size = 512
-        num_workers   = max(2, min(4, cpu_count // max(n_gpus, 1)))
-        prefetch       = 2
-        mp_ctx        = None
-        strategy      = "LINUX_4xA16_LOWRAM"
+
+        prefetch     = 2
+        mp_ctx       = None
+        strategy     = "LINUX_LOWRAM"
 
     cfg = {
         "strategy":     strategy,
@@ -95,6 +142,13 @@ def auto_config(server_info, h5_path_gb=800.0):
     print(f"\n  Config auto ({strategy}) :")
     for k, v in cfg.items():
         print(f"    {k:<16}: {v}")
+    total_w = num_workers * n_gpus
+    print(f"\n  Verification memoire workers :")
+    print(f"    Workers totaux    : {num_workers} x {n_gpus} GPU = {total_w}")
+    slab_ram = total_w * slab_size * patch_bytes / 1e9
+    print(f"    RAM slabs actifs  : {slab_ram:.1f} GB")
+    print(f"    RAM dispo         : {ram_avail_gb:.1f} GB")
+    print(f"    Marge             : {ram_avail_gb - slab_ram:.1f} GB")
     return cfg
 
 def load_mapping(mapping_path):
@@ -255,12 +309,13 @@ def _extract_patches_on_gpu(cube_pca, rows_k, cols_k, patch_size, device):
     cube_t  = torch.from_numpy(cube_pca).to(device, non_blocking=True).unsqueeze(0)
     padded  = F.pad(cube_t, (m, m, m, m), mode="constant", value=0)
     del cube_t
-    n_patches  = len(rows_k)
+    n_patches   = len(rows_k)
     all_patches = np.empty((n_patches, B, patch_size, patch_size), dtype=np.float32)
     for start in range(0, n_patches, PATCH_EXTRACT_BATCH):
-        end   = min(start + PATCH_EXTRACT_BATCH, n_patches)
+        end    = min(start + PATCH_EXTRACT_BATCH, n_patches)
         rs, cs = rows_k[start:end], cols_k[start:end]
-        batch = torch.stack([padded[0, :, r:r+patch_size, c:c+patch_size] for r, c in zip(rs, cs)])
+        batch  = torch.stack([padded[0, :, r:r+patch_size, c:c+patch_size]
+                               for r, c in zip(rs, cs)])
         all_patches[start:end] = batch.cpu().numpy()
         del batch
     del padded; torch.cuda.empty_cache()
@@ -287,7 +342,7 @@ def _gpu_worker(gpu_id, task_queue, h5_path, split_name, patch_size,
                 del cube_raw; gc.collect()
             else:
                 cube_pca = cube_raw
-            B, H, W = cube_pca.shape
+            B, H, W   = cube_pca.shape
             shapes    = _load_shapes(meta["jsn"])
             label_map = build_label_map(H, W, shapes, extrude2final, label2idx)
             r_all, c_all = np.where(label_map >= 0)
@@ -320,7 +375,7 @@ def _gpu_worker(gpu_id, task_queue, h5_path, split_name, patch_size,
                 counters["cubes"]   += 1
                 done, total, ptch = counters["cubes"], counters["total"], counters["patches"]
                 if done % 10 == 0 or done == total:
-                    print(f"  GPU{gpu_id} | [{split_name}] {done}/{total} cubes | {ptch:,} patches")
+                    print(f"  GPU{gpu_id} | [{split_name}] {done}/{total} | {ptch:,} patches")
         except Exception as e:
             print(f"  GPU{gpu_id} | {name} : {e}")
         finally:
@@ -329,20 +384,25 @@ def _gpu_worker(gpu_id, task_queue, h5_path, split_name, patch_size,
 def extract_split_to_hdf5(meta_list, split_name, patch_size, extrude2final,
                            label2idx, bg_ratio, random_state, pca, h5_path, balance_train=False):
     if not meta_list: return 0
-    shuffled = meta_list[:]
+    shuffled  = meta_list[:]
     random.shuffle(shuffled)
-    num_bands = pca.n_components_ if pca is not None else _load_envi_cube(shuffled[0]["hdr"], shuffled[0]["source"])[0].shape[0]
+    num_bands = pca.n_components_ if pca is not None else \
+                _load_envi_cube(shuffled[0]["hdr"], shuffled[0]["source"])[0].shape[0]
     with h5py.File(h5_path, 'a') as f:
         if split_name in f: del f[split_name]
-        f.create_dataset(f"{split_name}/X", shape=(0, num_bands, patch_size, patch_size),
+        f.create_dataset(f"{split_name}/X",
+                         shape=(0, num_bands, patch_size, patch_size),
                          maxshape=(None, num_bands, patch_size, patch_size),
-                         dtype=np.float32, chunks=(HDF5_CHUNK_PATCHES, num_bands, patch_size, patch_size), compression='lzf')
-        f.create_dataset(f"{split_name}/y", shape=(0,), maxshape=(None,),
+                         dtype=np.float32,
+                         chunks=(HDF5_CHUNK_PATCHES, num_bands, patch_size, patch_size),
+                         compression='lzf')
+        f.create_dataset(f"{split_name}/y",
+                         shape=(0,), maxshape=(None,),
                          dtype=np.int64, chunks=(4096,), compression='lzf')
-    task_q   = queue.Queue(maxsize=PREFETCH_QUEUE_SIZE)
-    counters = {"cubes": 0, "patches": 0, "total": len(shuffled), "lock": threading.Lock()}
+    task_q     = queue.Queue(maxsize=PREFETCH_QUEUE_SIZE)
+    counters   = {"cubes": 0, "patches": 0, "total": len(shuffled), "lock": threading.Lock()}
     write_lock = threading.Lock()
-    workers  = []
+    workers    = []
     for gpu_id in range(NUM_GPUS):
         t = threading.Thread(target=_gpu_worker,
                              args=(gpu_id, task_q, h5_path, split_name, patch_size,
@@ -375,9 +435,13 @@ def _balance_hdf5_streaming(h5_path, split_name, patch_size, num_bands, random_s
     tmp   = f"{split_name}_tmp"
     with h5py.File(h5_path, 'a') as f:
         if tmp in f: del f[tmp]
-        f.create_dataset(f"{tmp}/X", shape=(n_new, num_bands, patch_size, patch_size),
-                         dtype=np.float32, chunks=(HDF5_CHUNK_PATCHES, num_bands, patch_size, patch_size), compression='lzf')
-        f.create_dataset(f"{tmp}/y", shape=(n_new,), dtype=np.int64, chunks=(4096,), compression='lzf')
+        f.create_dataset(f"{tmp}/X",
+                         shape=(n_new, num_bands, patch_size, patch_size),
+                         dtype=np.float32,
+                         chunks=(HDF5_CHUNK_PATCHES, num_bands, patch_size, patch_size),
+                         compression='lzf')
+        f.create_dataset(f"{tmp}/y",
+                         shape=(n_new,), dtype=np.int64, chunks=(4096,), compression='lzf')
     for cs in range(0, n_new, read_chunk):
         ce  = min(cs + read_chunk, n_new)
         idx = sorted_kept[cs:ce]
@@ -393,26 +457,67 @@ def _balance_hdf5_streaming(h5_path, split_name, patch_size, num_bands, random_s
     return n_new
 
 
+class RamDataset(Dataset):
+    """
+    Charge le HDF5 en RAM numpy au demarrage — zero acces disque ensuite.
+    Ideal pour Linux 664 GB RAM : on charge ~540 GB du train en memoire.
+    Les workers ne font que slicer un tableau numpy en RAM = tres rapide,
+    pas de slab actif = pas d'explosion memoire.
+    """
+    def __init__(self, h5_path, split_name, max_ram_gb=300.0, shuffle=True, seed=0):
+        import time as _t
+        self.shuffle = shuffle
+        self.seed    = seed
+        with h5py.File(str(h5_path), 'r') as f:
+            total       = int(f[f"{split_name}/y"].shape[0])
+            x_shape     = tuple(f[f"{split_name}/X"].shape[1:])
+            patch_bytes = int(np.prod(x_shape)) * 4
+            max_patches = int(max_ram_gb * 1e9 / patch_bytes)
+            n_load      = min(total, max_patches)
+            pct         = n_load / total * 100
+            gb_load     = n_load * patch_bytes / 1e9
+            print(f"  RamDataset [{split_name}] : {n_load:,}/{total:,} patches "
+                  f"({pct:.1f}% — {gb_load:.1f} GB) ...")
+            t0     = _t.perf_counter()
+            self.X = f[f"{split_name}/X"][:n_load]
+            self.y = f[f"{split_name}/y"][:n_load]
+            print(f"  RamDataset [{split_name}] : charge en {_t.perf_counter()-t0:.1f}s")
+        self.length  = len(self.y)
+        self._order  = self._make_order(seed)
+
+    def _make_order(self, seed):
+        order = list(range(self.length))
+        if self.shuffle: random.Random(seed).shuffle(order)
+        return order
+
+    def reshuffle(self, epoch):
+        random.Random(self.seed + epoch * 1_000_003).shuffle(self._order)
+
+    def __len__(self): return self.length
+
+    def __getitem__(self, pos):
+        idx = self._order[pos]
+        X   = torch.from_numpy(self.X[idx].astype(np.float32)).unsqueeze(0)
+        y   = int(self.y[idx])
+        return X, torch.tensor(y, dtype=torch.long)
+
+
 class SlabDataset(Dataset):
     """
-    Lit le HDF5 par blocs contigus (slabs).
-    Chaque slab est decompresse en une seule operation HDF5 (LZF).
-    Les patches du meme slab sont servis depuis le numpy array en RAM.
-
-    Sur Linux  15GB RAM : slab_size=2048  -> ~40MB/slab  -> tient dans les workers
-    Sur Windows 400GB RAM : slab_size=65536 -> ~1.3GB/slab -> prefetch agressif possible
+    Lit le HDF5 par blocs contigus.
+    Chaque worker ouvre son handle HDF5 via _get_h5 (registre par PID).
+    Pas de swmr pour eviter les conflits sur Linux.
+    Utilise quand la RAM ne suffit pas pour tout charger.
     """
-    def __init__(self, h5_path, split_name, slab_size=4096, shuffle=True, seed=0):
+    def __init__(self, h5_path, split_name, slab_size=512, shuffle=True, seed=0):
         self.h5_path    = str(h5_path)
         self.split_name = split_name
         self.slab_size  = slab_size
         self.shuffle    = shuffle
         self.seed       = seed
-
         with h5py.File(self.h5_path, 'r') as f:
             self.length  = int(f[f"{split_name}/y"].shape[0])
             self.x_shape = tuple(f[f"{split_name}/X"].shape[1:])
-
         self._order      = self._make_order(seed)
         self._slab_X     = None
         self._slab_y     = None
@@ -421,8 +526,7 @@ class SlabDataset(Dataset):
     def _make_order(self, seed):
         n_slabs  = math.ceil(self.length / self.slab_size)
         slab_ids = list(range(n_slabs))
-        if self.shuffle:
-            random.Random(seed).shuffle(slab_ids)
+        if self.shuffle: random.Random(seed).shuffle(slab_ids)
         order = []
         for sid in slab_ids:
             s = sid * self.slab_size
@@ -437,10 +541,10 @@ class SlabDataset(Dataset):
         self._slab_y     = None
 
     def _load_slab(self, slab_start):
-        slab_end     = min(slab_start + self.slab_size, self.length)
-        f            = _get_h5(self.h5_path)
-        self._slab_X = f[f"{self.split_name}/X"][slab_start:slab_end]
-        self._slab_y = f[f"{self.split_name}/y"][slab_start:slab_end]
+        slab_end         = min(slab_start + self.slab_size, self.length)
+        f                = _get_h5(self.h5_path)
+        self._slab_X     = f[f"{self.split_name}/X"][slab_start:slab_end]
+        self._slab_y     = f[f"{self.split_name}/y"][slab_start:slab_end]
         self._slab_start = slab_start
 
     def __len__(self): return self.length
@@ -456,58 +560,6 @@ class SlabDataset(Dataset):
         return X, torch.tensor(y, dtype=torch.long)
 
 
-class RamDataset(Dataset):
-    """
-    Charge un bloc du HDF5 en RAM numpy au demarrage
-    et ne fait plus aucun acces disque pendant l'entrainement.
-
-    Utilise sur Windows L40s avec 400 GB RAM :
-    on charge autant de patches que possible (ex: 300 GB).
-    Le reste est servi par SlabDataset en fallback.
-    """
-    def __init__(self, h5_path, split_name, max_ram_gb=300.0, shuffle=True, seed=0):
-        self.h5_path    = str(h5_path)
-        self.split_name = split_name
-        self.shuffle    = shuffle
-        self.seed       = seed
-
-        with h5py.File(self.h5_path, 'r') as f:
-            total        = int(f[f"{split_name}/y"].shape[0])
-            x_shape      = tuple(f[f"{split_name}/X"].shape[1:])
-            patch_bytes  = np.prod(x_shape) * 4
-            max_patches  = int(max_ram_gb * 1e9 / patch_bytes)
-            n_load       = min(total, max_patches)
-            pct          = n_load / total * 100
-            print(f"  RamDataset [{split_name}]: chargement {n_load:,}/{total:,} patches ({pct:.1f}%) en RAM ...")
-            t0 = __import__("time").perf_counter()
-            self.X = f[f"{split_name}/X"][:n_load]
-            self.y = f[f"{split_name}/y"][:n_load]
-            elapsed = __import__("time").perf_counter() - t0
-            ram_used = self.X.nbytes / 1e9
-            print(f"  RamDataset [{split_name}]: {ram_used:.1f} GB charges en {elapsed:.1f}s")
-
-        self.length  = len(self.y)
-        self._order  = self._make_order(seed)
-
-    def _make_order(self, seed):
-        order = list(range(self.length))
-        if self.shuffle:
-            random.Random(seed).shuffle(order)
-        return order
-
-    def reshuffle(self, epoch):
-        rng = random.Random(self.seed + epoch * 1_000_003)
-        rng.shuffle(self._order)
-
-    def __len__(self): return self.length
-
-    def __getitem__(self, pos):
-        idx = self._order[pos]
-        X   = torch.from_numpy(self.X[idx].astype(np.float32)).unsqueeze(0)
-        y   = int(self.y[idx])
-        return X, torch.tensor(y, dtype=torch.long)
-
-
 def worker_init_fn(worker_id):
     seed = (torch.initial_seed() + worker_id) % (2**32)
     np.random.seed(seed); random.seed(seed)
@@ -518,40 +570,45 @@ def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json",
                   batch_size=None, random_state=345, fit_max_pixels=500_000,
                   num_workers=None, bg_ratio=1.5, cache_dir="cache",
                   force_recompute=False, balance_train=False,
-                  slab_size=None, rank=0, world_size=1,
-                  auto=True, ram_cache_gb=None):
+                  slab_size=None, rank=0, world_size=1, ram_cache_gb=None):
 
-    server  = detect_server()
-    cfg     = auto_config(server, h5_path_gb=800.0)
+    server = detect_server()
+    cfg    = auto_config(server)
 
-    if batch_size  is None: batch_size  = cfg["batch_size"]
-    if num_workers is None: num_workers = cfg["num_workers"]
-    if slab_size   is None: slab_size   = cfg["slab_size"]
+    if batch_size   is None: batch_size   = cfg["batch_size"]
+    if num_workers  is None: num_workers  = cfg["num_workers"]
+    if slab_size    is None: slab_size    = cfg["slab_size"]
     if ram_cache_gb is None: ram_cache_gb = cfg["ram_cache_gb"]
 
     extrude2final, class_names, label2idx = load_mapping(mapping_path)
-    cache_dir = Path(cache_dir)
+    cache_dir   = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    config_str  = f"{real_dir}_{aug_dir}_{split_mode}_{patch_size}_{random_state}_{bg_ratio}_{pca_components if use_pca else 0}_{balance_train}"
+    config_str  = (f"{real_dir}_{aug_dir}_{split_mode}_{patch_size}_{random_state}"
+                   f"_{bg_ratio}_{pca_components if use_pca else 0}_{balance_train}")
     config_hash = hashlib.md5(config_str.encode()).hexdigest()[:12]
     h5_path     = cache_dir / f"patches_{config_hash}.h5"
 
     if not force_recompute and h5_path.exists():
         return _make_loaders(h5_path, class_names, label2idx, patch_size,
                              balance_train, batch_size, num_workers,
-                             slab_size, rank, world_size,
-                             server, cfg, ram_cache_gb)
+                             slab_size, rank, world_size, server, cfg, ram_cache_gb)
 
     plots_meta = collect_plots_meta(real_dir=real_dir, aug_dir=aug_dir)
-    train_meta, val_meta, test_meta = split_plots(plots_meta, split_mode, val_ratio, test_ratio, random_state)
+    train_meta, val_meta, test_meta = split_plots(
+        plots_meta, split_mode, val_ratio, test_ratio, random_state)
     pca_model = None
     if use_pca:
         real_meta = [m for m in plots_meta if m["source"] == "real"]
         if real_meta:
             pca_model = fit_or_load_pca(real_meta, pca_components, cache_dir, config_hash, fit_max_pixels)
-    for meta_list, sname, do_balance in [(train_meta, "train", balance_train), (val_meta, "val", False), (test_meta, "test", False)]:
+    for meta_list, sname, do_balance in [
+        (train_meta, "train", balance_train),
+        (val_meta,   "val",   False),
+        (test_meta,  "test",  False),
+    ]:
         extract_split_to_hdf5(meta_list, sname, patch_size, extrude2final, label2idx,
-                              bg_ratio, random_state, pca_model, str(h5_path), balance_train=do_balance)
+                              bg_ratio, random_state, pca_model, str(h5_path),
+                              balance_train=do_balance)
     with h5py.File(h5_path, 'a') as f:
         f.attrs['class_names'] = json.dumps(class_names)
         f.attrs['label2idx']   = json.dumps(label2idx)
@@ -561,23 +618,23 @@ def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json",
 
     return _make_loaders(h5_path, class_names, label2idx, patch_size,
                          balance_train, batch_size, num_workers,
-                         slab_size, rank, world_size,
-                         server, cfg, ram_cache_gb)
+                         slab_size, rank, world_size, server, cfg, ram_cache_gb)
 
 def _make_loaders(h5_path, class_names, label2idx, patch_size,
                   balance_train, batch_size, num_workers,
-                  slab_size, rank, world_size,
-                  server, cfg, ram_cache_gb):
+                  slab_size, rank, world_size, server, cfg, ram_cache_gb):
 
     is_win = server["is_windows"]
 
-    if is_win and ram_cache_gb >= 50.0:
-        print(f"\n  Mode RAM : chargement HDF5 en memoire ({ram_cache_gb:.0f} GB max) ...")
+    if ram_cache_gb >= 50.0:
+        print(f"\n  Mode RamDataset ({ram_cache_gb:.0f} GB max) ...")
+        val_gb  = min(ram_cache_gb * 0.08, 40.0)
+        test_gb = min(ram_cache_gb * 0.08, 40.0)
         train_ds = RamDataset(str(h5_path), 'train', max_ram_gb=ram_cache_gb, shuffle=True,  seed=42)
-        val_ds   = RamDataset(str(h5_path), 'val',   max_ram_gb=min(ram_cache_gb*0.1, 30.0), shuffle=False, seed=0)
-        test_ds  = RamDataset(str(h5_path), 'test',  max_ram_gb=min(ram_cache_gb*0.1, 30.0), shuffle=False, seed=0)
+        val_ds   = RamDataset(str(h5_path), 'val',   max_ram_gb=val_gb,        shuffle=False, seed=0)
+        test_ds  = RamDataset(str(h5_path), 'test',  max_ram_gb=test_gb,       shuffle=False, seed=0)
     else:
-        print(f"\n  Mode Slab : slab_size={slab_size}")
+        print(f"\n  Mode SlabDataset (slab_size={slab_size}) ...")
         train_ds = SlabDataset(str(h5_path), 'train', slab_size=slab_size, shuffle=True,  seed=42)
         val_ds   = SlabDataset(str(h5_path), 'val',   slab_size=slab_size, shuffle=False, seed=0)
         test_ds  = SlabDataset(str(h5_path), 'test',  slab_size=slab_size, shuffle=False, seed=0)
@@ -587,7 +644,7 @@ def _make_loaders(h5_path, class_names, label2idx, patch_size,
 
     pin    = torch.cuda.is_available()
     mp_ctx = cfg["mp_ctx"]
-    pf     = cfg["prefetch"]
+    pf     = cfg["prefetch"] if num_workers > 0 else None
 
     if world_size > 1:
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=False)
@@ -603,24 +660,22 @@ def _make_loaders(h5_path, class_names, label2idx, patch_size,
         pin_memory         = pin,
         worker_init_fn     = worker_init_fn,
         persistent_workers = (num_workers > 0),
-        prefetch_factor    = pf if num_workers > 0 else None,
+        prefetch_factor    = pf,
     )
     if mp_ctx is not None:
         kw["multiprocessing_context"] = mp_ctx
 
     train_loader = DataLoader(train_ds, batch_size=batch_size,
-                              sampler=train_sampler, shuffle=shuffle_train, drop_last=True, **kw)
+                              sampler=train_sampler, shuffle=shuffle_train,
+                              drop_last=True, **kw)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size * 2,
                               sampler=val_sampler,   shuffle=False, **kw)
     test_loader  = DataLoader(test_ds,  batch_size=batch_size * 2,
                               sampler=test_sampler,  shuffle=False, **kw)
 
-    print(f"\n  DataLoaders prets :")
-    print(f"    batch/GPU  : {batch_size}  (val/test : {batch_size*2})")
-    print(f"    num_workers: {num_workers}  prefetch: {pf}")
-    print(f"    Train      : {len(train_ds):,} patches  ({len(train_loader)} steps/epoch)")
-    print(f"    Val        : {len(val_ds):,} patches")
-    print(f"    Test       : {len(test_ds):,} patches\n")
+    print(f"  batch/GPU={batch_size}  workers={num_workers}  prefetch={pf}")
+    print(f"  Train: {len(train_ds):,}  Val: {len(val_ds):,}  Test: {len(test_ds):,}")
+    print(f"  Steps/epoch: {len(train_loader)}\n")
 
     meta = {
         "class_names":   class_names,
@@ -658,7 +713,8 @@ if __name__ == "__main__":
     p.add_argument("--balance_train", action="store_true")
     args = p.parse_args()
     if not args.real_dir and not args.aug_dir: p.error("--real_dir ou --aug_dir requis")
-    train_loader, val_loader, test_loader, meta = build_loaders(**{k: v for k, v in vars(args).items() if v is not None})
+    train_loader, val_loader, test_loader, meta = build_loaders(
+        **{k: v for k, v in vars(args).items() if v is not None})
     X_b, y_b = next(iter(train_loader))
     print(f"Batch: {X_b.shape} | Labels: {y_b.shape}")
 
