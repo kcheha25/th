@@ -1097,3 +1097,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+        dist.init_process_group(backend="nccl", timeout=torch.distributed.timedelta(seconds=args.timeout))
