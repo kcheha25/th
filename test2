@@ -49,41 +49,30 @@ def auto_config(server_info, world_size=1):
     min_vram     = server_info["min_vram_gb"]
     cpu_count    = server_info["cpu_count"]
 
+    usable_ram   = ram_avail_gb * 0.78
+    ram_per_rank = usable_ram / max(world_size, 1)
+
     if is_win:
-        ram_per_rank = ram_avail_gb * 0.80
-        batch_size   = 2048
-        num_workers  = min(8, cpu_count)
-        prefetch     = 4
-        mp_ctx       = "spawn"
-        slab_size    = 32768
-        strategy     = "WINDOWS_L40S"
-    elif ram_avail_gb >= 200:
-        # Chaque rank charge ram_avail_gb/world_size * 0.80
-        ram_per_rank = (ram_avail_gb / max(world_size, 1)) * 0.80
-        if min_vram <= 10:
-            batch_size = 256
-        elif min_vram <= 16:
-            batch_size = 512
-        else:
-            batch_size = 1024
-        num_workers  = min(4, cpu_count // max(n_gpus, 1))
-        prefetch     = 4
-        mp_ctx       = None
-        slab_size    = 8192
-        strategy     = "LINUX_LARGERAM"
+        batch_size  = 2048
+        num_workers = min(8, cpu_count)
+        prefetch    = 4
+        mp_ctx      = "spawn"
+        strategy    = "WINDOWS"
+    elif ram_avail_gb >= 100:
+        batch_size  = 512 if min_vram <= 16 else 1024
+        num_workers = min(4, cpu_count // max(n_gpus, 1))
+        prefetch    = 4
+        mp_ctx      = None
+        strategy    = "LINUX_LARGERAM"
     else:
-        ram_per_rank = 0.0
-        patch_bytes  = 30 * 13 * 13 * 4
-        num_workers  = max(1, min(2, cpu_count // max(n_gpus, 1)))
-        slab_size    = max(128, min(1024, int(0.5e9 / patch_bytes)))
-        batch_size   = 256 if min_vram <= 16 else 512
-        prefetch     = 2
-        mp_ctx       = None
-        strategy     = "LINUX_LOWRAM"
+        batch_size  = 256 if min_vram <= 16 else 512
+        num_workers = max(1, min(2, cpu_count // max(n_gpus, 1)))
+        prefetch    = 2
+        mp_ctx      = None
+        strategy    = "LINUX_LOWRAM"
 
     return {
         "strategy":     strategy,
-        "slab_size":    slab_size,
         "batch_size":   batch_size,
         "num_workers":  num_workers,
         "prefetch":     prefetch,
@@ -397,58 +386,19 @@ def _balance_hdf5_streaming(h5_path, split_name, patch_size, num_bands, random_s
     return n_new
 
 
-class EqualShardDataset(Dataset):
-    """
-    Chaque rank charge exactement la meme taille de shard.
-    La taille du shard est floor(total / world_size) pour tous les ranks.
-    Le dernier rank peut avoir moins de patches dans le HDF5 mais on
-    tronque tous les ranks au meme minimum -> meme nombre de steps -> pas de NCCL timeout.
-    Le chargement est limite par max_ram_gb pour eviter l'OOM.
-    """
-    def __init__(self, h5_path, split_name, rank, world_size,
-                 max_ram_gb=80.0, shuffle=True, seed=0):
-        import time as _t
-        self.shuffle    = shuffle
-        self.seed       = seed
-        self.rank       = rank
-        self.world_size = world_size
-
-        with h5py.File(str(h5_path), 'r') as f:
-            total       = int(f[f"{split_name}/y"].shape[0])
-            x_shape     = tuple(f[f"{split_name}/X"].shape[1:])
-            patch_bytes = int(np.prod(x_shape)) * 4
-
-            # Taille identique pour tous les ranks
-            shard_size  = total // world_size          # floor -> identique partout
-            max_by_ram  = int(max_ram_gb * 1e9 / patch_bytes)
-            n_load      = min(shard_size, max_by_ram)  # limite RAM
-
-            start = rank * shard_size
-            end   = start + n_load
-
-            gb_load = n_load * patch_bytes / 1e9
-            if rank == 0:
-                print(f"  EqualShardDataset [{split_name}]:")
-                print(f"    total={total:,}  shard={shard_size:,}/rank  "
-                      f"charge={n_load:,} ({gb_load:.1f}GB/rank)")
-
-            t0     = _t.perf_counter()
-            self.X = f[f"{split_name}/X"][start:end]
-            self.y = f[f"{split_name}/y"][start:end]
-            if rank == 0:
-                print(f"    rank 0 charge en {_t.perf_counter()-t0:.1f}s")
-
-        self.length = len(self.y)
-        self._order = self._make_order(seed)
-
-    def _make_order(self, seed):
-        order = list(range(self.length))
-        if self.shuffle:
-            random.Random(seed + self.rank).shuffle(order)
-        return order
+class RamBlock(Dataset):
+    def __init__(self, X, y, shuffle=True, seed=0):
+        self.X       = X
+        self.y       = y
+        self.length  = len(y)
+        self.shuffle = shuffle
+        self.seed    = seed
+        self._order  = list(range(self.length))
+        if shuffle:
+            random.Random(seed).shuffle(self._order)
 
     def reshuffle(self, epoch):
-        random.Random(self.seed + self.rank + epoch * 1_000_003).shuffle(self._order)
+        random.Random(self.seed + epoch * 1_000_003).shuffle(self._order)
 
     def __len__(self): return self.length
 
@@ -459,67 +409,109 @@ class EqualShardDataset(Dataset):
         return X, torch.tensor(y, dtype=torch.long)
 
 
-class SlabDataset(Dataset):
+class ChunkedHDF5Manager:
     """
-    Utilise quand RAM insuffisante pour EqualShardDataset.
-    Lit le HDF5 par blocs via registre PID (pas de swmr).
-    Associe a DistributedSampler pour partitionner entre ranks.
-    drop_last=True dans DataLoader garantit le meme nb de steps.
+    Gere le chargement sequentiel du HDF5 en blocs RAM.
+
+    Le dataset est divise en N blocs de taille max_ram_gb.
+    A chaque appel de next_block(), le bloc suivant est charge en RAM
+    et retourne sous forme de RamBlock pret pour le DataLoader.
+
+    Pour DDP : chaque rank travaille sur une tranche differente du HDF5.
+    Tous les ranks ont le meme nombre de blocs (garantit par floor division).
     """
-    def __init__(self, h5_path, split_name, slab_size=512, shuffle=True, seed=0):
+    def __init__(self, h5_path, split_name, rank, world_size, max_ram_gb, shuffle=True, seed=0):
         self.h5_path    = str(h5_path)
         self.split_name = split_name
-        self.slab_size  = slab_size
+        self.rank       = rank
+        self.world_size = world_size
         self.shuffle    = shuffle
         self.seed       = seed
+
         with h5py.File(self.h5_path, 'r') as f:
-            self.length  = int(f[f"{split_name}/y"].shape[0])
-            self.x_shape = tuple(f[f"{split_name}/X"].shape[1:])
-        self._order      = self._make_order(seed)
-        self._slab_X     = None
-        self._slab_y     = None
-        self._slab_start = -1
+            total       = int(f[f"{split_name}/y"].shape[0])
+            x_shape     = tuple(f[f"{split_name}/X"].shape[1:])
+            self.patch_bytes = int(np.prod(x_shape)) * 4
 
-    def _make_order(self, seed):
-        n_slabs  = math.ceil(self.length / self.slab_size)
-        slab_ids = list(range(n_slabs))
-        if self.shuffle: random.Random(seed).shuffle(slab_ids)
-        order = []
-        for sid in slab_ids:
-            s = sid * self.slab_size
-            e = min(s + self.slab_size, self.length)
-            order.extend(range(s, e))
-        return order
+        rank_size      = total // world_size
+        self.rank_start = rank * rank_size
+        self.rank_end   = self.rank_start + rank_size
 
-    def reshuffle(self, epoch):
-        self._order      = self._make_order(self.seed + epoch * 1_000_003)
-        self._slab_start = -1
-        self._slab_X     = None
-        self._slab_y     = None
+        self.rank_total    = rank_size
+        self.max_per_block = max(1, int(max_ram_gb * 1e9 / self.patch_bytes))
+        self.n_blocks      = math.ceil(self.rank_total / self.max_per_block)
 
-    def _load_slab(self, slab_start):
-        slab_end         = min(slab_start + self.slab_size, self.length)
-        f                = _get_h5(self.h5_path)
-        self._slab_X     = f[f"{self.split_name}/X"][slab_start:slab_end]
-        self._slab_y     = f[f"{self.split_name}/y"][slab_start:slab_end]
-        self._slab_start = slab_start
+        self._block_idx    = 0
+        self._epoch        = 0
+        self._block_order  = list(range(self.n_blocks))
 
-    def __len__(self): return self.length
+        if rank == 0:
+            gb_rank  = rank_size * self.patch_bytes / 1e9
+            gb_block = min(self.max_per_block, rank_size) * self.patch_bytes / 1e9
+            print(f"  ChunkedHDF5Manager [{split_name}]")
+            print(f"    total={total:,}  par_rank={rank_size:,} ({gb_rank:.1f}GB)")
+            print(f"    max_ram={max_ram_gb:.0f}GB -> {self.n_blocks} blocs x ~{gb_block:.1f}GB/bloc")
 
-    def __getitem__(self, pos):
-        real_idx   = self._order[pos]
-        slab_start = (real_idx // self.slab_size) * self.slab_size
-        if slab_start != self._slab_start:
-            self._load_slab(slab_start)
-        local = real_idx - self._slab_start
-        X = torch.from_numpy(self._slab_X[local].astype(np.float32)).unsqueeze(0)
-        y = int(self._slab_y[local])
-        return X, torch.tensor(y, dtype=torch.long)
+    def set_epoch(self, epoch):
+        self._epoch     = epoch
+        self._block_idx = 0
+        if self.shuffle:
+            rng = random.Random(self.seed + self.rank + epoch * 999_983)
+            rng.shuffle(self._block_order)
+
+    @property
+    def n_total_blocks(self):
+        return self.n_blocks
+
+    @property
+    def current_block_idx(self):
+        return self._block_idx
+
+    def has_next(self):
+        return self._block_idx < self.n_blocks
+
+    def next_block(self):
+        bid        = self._block_order[self._block_idx]
+        local_s    = bid * self.max_per_block
+        local_e    = min(local_s + self.max_per_block, self.rank_total)
+        global_s   = self.rank_start + local_s
+        global_e   = self.rank_start + local_e
+        n          = global_e - global_s
+
+        import time as _t
+        t0 = _t.perf_counter()
+        with h5py.File(self.h5_path, 'r') as f:
+            X = f[f"{self.split_name}/X"][global_s:global_e]
+            y = f[f"{self.split_name}/y"][global_s:global_e]
+        elapsed = _t.perf_counter() - t0
+
+        if self.rank == 0:
+            gb = n * self.patch_bytes / 1e9
+            print(f"  Bloc {self._block_idx+1}/{self.n_blocks} charge : "
+                  f"{n:,} patches ({gb:.1f}GB) en {elapsed:.1f}s")
+
+        self._block_idx += 1
+        block_seed = self.seed + self.rank + self._epoch * 999_983 + bid * 7
+        return RamBlock(X, y, shuffle=self.shuffle, seed=block_seed)
 
 
 def worker_init_fn(worker_id):
     seed = (torch.initial_seed() + worker_id) % (2**32)
     np.random.seed(seed); random.seed(seed)
+
+def make_block_loader(block_ds, batch_size, num_workers, prefetch, mp_ctx, pin):
+    kw = dict(
+        num_workers        = num_workers,
+        pin_memory         = pin,
+        worker_init_fn     = worker_init_fn,
+        persistent_workers = False,
+        prefetch_factor    = prefetch if num_workers > 0 else None,
+        drop_last          = True,
+        shuffle            = False,
+    )
+    if mp_ctx is not None:
+        kw["multiprocessing_context"] = mp_ctx
+    return DataLoader(block_ds, batch_size=batch_size, **kw)
 
 def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json",
                   split_mode="aug_real", use_pca=True, pca_components=30,
@@ -527,26 +519,19 @@ def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json",
                   batch_size=None, random_state=345, fit_max_pixels=500_000,
                   num_workers=None, bg_ratio=1.5, cache_dir="cache",
                   force_recompute=False, balance_train=False,
-                  slab_size=None, rank=0, world_size=1, ram_cache_gb=None):
+                  rank=0, world_size=1, ram_cache_gb=None):
 
     server = detect_server()
     cfg    = auto_config(server, world_size=world_size)
 
     if batch_size  is None: batch_size  = cfg["batch_size"]
     if num_workers is None: num_workers = cfg["num_workers"]
-    if slab_size   is None: slab_size   = cfg["slab_size"]
-    # ram_per_rank : combien ce rank peut charger
-    if ram_cache_gb is None:
-        ram_per_rank = cfg["ram_per_rank"]
-    else:
-        ram_per_rank = ram_cache_gb
+    if ram_cache_gb is None: ram_cache_gb = cfg["ram_per_rank"]
 
     if rank == 0:
-        print(f"\n  Serveur : {'Windows' if server['is_windows'] else 'Linux'}"
-              f"  RAM={server['ram_avail_gb']:.0f}GB"
-              f"  GPUs={server['n_gpus']}x{server['vram_list']}")
-        print(f"  Strategy={cfg['strategy']}  batch={batch_size}"
-              f"  workers={num_workers}  ram/rank={ram_per_rank:.0f}GB")
+        print(f"\n  {cfg['strategy']}  RAM={server['ram_avail_gb']:.0f}GB"
+              f"  GPUs={server['n_gpus']}  batch={batch_size}"
+              f"  workers={num_workers}  ram/rank={ram_cache_gb:.0f}GB")
 
     extrude2final, class_names, label2idx = load_mapping(mapping_path)
     cache_dir   = Path(cache_dir)
@@ -556,7 +541,6 @@ def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json",
     config_hash = hashlib.md5(config_str.encode()).hexdigest()[:12]
     h5_path     = cache_dir / f"patches_{config_hash}.h5"
 
-    # Seul rank 0 genere le HDF5
     if rank == 0 and (force_recompute or not h5_path.exists()):
         plots_meta = collect_plots_meta(real_dir=real_dir, aug_dir=aug_dir)
         train_meta, val_meta, test_meta = split_plots(
@@ -582,83 +566,19 @@ def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json",
             f.attrs['num_bands']   = pca_components if use_pca else -1
             f.attrs['created_at']  = datetime.now().isoformat()
 
-    # Barrier : tous les ranks attendent que rank 0 ait fini
     if world_size > 1:
         import torch.distributed as dist
         dist.barrier()
 
-    return _make_loaders(h5_path, class_names, label2idx, patch_size,
-                         balance_train, batch_size, num_workers,
-                         slab_size, rank, world_size, server, cfg, ram_per_rank)
-
-def _make_loaders(h5_path, class_names, label2idx, patch_size,
-                  balance_train, batch_size, num_workers,
-                  slab_size, rank, world_size, server, cfg, ram_per_rank):
-
-    use_ram = ram_per_rank >= 5.0
-
-    if use_ram:
-        val_ram  = min(ram_per_rank * 0.10, 20.0)
-        test_ram = min(ram_per_rank * 0.10, 20.0)
-        train_ds = EqualShardDataset(str(h5_path), 'train',
-                                     rank=rank, world_size=world_size,
-                                     max_ram_gb=ram_per_rank,
-                                     shuffle=True, seed=42)
-        val_ds   = EqualShardDataset(str(h5_path), 'val',
-                                     rank=rank, world_size=world_size,
-                                     max_ram_gb=val_ram,
-                                     shuffle=False, seed=0)
-        test_ds  = EqualShardDataset(str(h5_path), 'test',
-                                     rank=rank, world_size=world_size,
-                                     max_ram_gb=test_ram,
-                                     shuffle=False, seed=0)
-        train_sampler = None
-        val_sampler   = None
-        test_sampler  = None
-    else:
-        train_ds = SlabDataset(str(h5_path), 'train', slab_size=slab_size, shuffle=True,  seed=42)
-        val_ds   = SlabDataset(str(h5_path), 'val',   slab_size=slab_size, shuffle=False, seed=0)
-        test_ds  = SlabDataset(str(h5_path), 'test',  slab_size=slab_size, shuffle=False, seed=0)
-        if world_size > 1:
-            train_sampler = DistributedSampler(train_ds, num_replicas=world_size,
-                                               rank=rank, shuffle=False, drop_last=True)
-            val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size,
-                                               rank=rank, shuffle=False, drop_last=True)
-            test_sampler  = DistributedSampler(test_ds,  num_replicas=world_size,
-                                               rank=rank, shuffle=False, drop_last=True)
-        else:
-            train_sampler = val_sampler = test_sampler = None
-
     with h5py.File(h5_path, 'r') as f:
         num_bands = int(f['train/X'].shape[1])
 
-    pin    = torch.cuda.is_available()
-    mp_ctx = cfg["mp_ctx"]
-    pf     = cfg["prefetch"] if num_workers > 0 else None
-
-    kw = dict(
-        num_workers        = num_workers,
-        pin_memory         = pin,
-        worker_init_fn     = worker_init_fn,
-        persistent_workers = (num_workers > 0),
-        prefetch_factor    = pf,
-        drop_last          = True,   # CRITIQUE : meme nb de steps sur tous les ranks
-    )
-    if mp_ctx is not None:
-        kw["multiprocessing_context"] = mp_ctx
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size,
-                              sampler=train_sampler, shuffle=False, **kw)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size * 2,
-                              sampler=val_sampler,   shuffle=False, **kw)
-    test_loader  = DataLoader(test_ds,  batch_size=batch_size * 2,
-                              sampler=test_sampler,  shuffle=False, **kw)
-
-    if rank == 0:
-        mode = "EqualShard(RAM)" if use_ram else "Slab(HDF5)"
-        print(f"\n  Mode={mode}  batch={batch_size}  workers={num_workers}")
-        print(f"  Train steps/epoch={len(train_loader)}"
-              f"  Val steps={len(val_loader)}")
+    train_mgr = ChunkedHDF5Manager(h5_path, 'train', rank, world_size,
+                                   ram_cache_gb, shuffle=True, seed=random_state)
+    val_mgr   = ChunkedHDF5Manager(h5_path, 'val',   rank, world_size,
+                                   max(1.0, ram_cache_gb * 0.1), shuffle=False, seed=0)
+    test_mgr  = ChunkedHDF5Manager(h5_path, 'test',  rank, world_size,
+                                   max(1.0, ram_cache_gb * 0.1), shuffle=False, seed=0)
 
     meta = {
         "class_names":   class_names,
@@ -667,37 +587,21 @@ def _make_loaders(h5_path, class_names, label2idx, patch_size,
         "num_bands":     num_bands,
         "patch_size":    patch_size,
         "balance_train": balance_train,
-        "train_sampler": train_sampler,
+        "train_sampler": None,
+        "train_mgr":     train_mgr,
+        "val_mgr":       val_mgr,
+        "test_mgr":      test_mgr,
+        "batch_size":    batch_size,
+        "num_workers":   num_workers,
+        "prefetch":      cfg["prefetch"],
+        "mp_ctx":        cfg["mp_ctx"],
+        "pin":           torch.cuda.is_available(),
     }
-    return train_loader, val_loader, test_loader, meta
+    return meta
 
 def print_cache_stats(meta, epoch):
     pass
 
-if __name__ == "__main__":
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--real_dir"); p.add_argument("--aug_dir")
-    p.add_argument("--mapping_path", default="mapping.json")
-    p.add_argument("--split_mode", default="aug_real")
-    p.add_argument("--use_pca", action="store_true", default=True)
-    p.add_argument("--pca_components", type=int, default=30)
-    p.add_argument("--patch_size", type=int, default=13)
-    p.add_argument("--test_ratio", type=float, default=0.15)
-    p.add_argument("--val_ratio", type=float, default=0.15)
-    p.add_argument("--batch_size", type=int, default=None)
-    p.add_argument("--random_state", type=int, default=345)
-    p.add_argument("--num_workers", type=int, default=None)
-    p.add_argument("--bg_ratio", type=float, default=1.5)
-    p.add_argument("--cache_dir", default="cache")
-    p.add_argument("--force_recompute", action="store_true")
-    p.add_argument("--balance_train", action="store_true")
-    args = p.parse_args()
-    if not args.real_dir and not args.aug_dir: p.error("--real_dir ou --aug_dir requis")
-    train_loader, val_loader, test_loader, meta = build_loaders(
-        **{k: v for k, v in vars(args).items() if v is not None})
-    X_b, y_b = next(iter(train_loader))
-    print(f"Batch: {X_b.shape} | Labels: {y_b.shape}")
 
 
 
@@ -716,7 +620,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from sklearn.metrics import confusion_matrix, accuracy_score, cohen_kappa_score
 
-from dataset import build_loaders
+from dataset import build_loaders, make_block_loader
 from ssfnet import SSFTTnet
 
 
@@ -739,7 +643,6 @@ def parse_args():
     p.add_argument("--balance_train",  action="store_true")
     p.add_argument("--batch_size",     type=int,   default=None)
     p.add_argument("--num_workers",    type=int,   default=None)
-    p.add_argument("--slab_size",      type=int,   default=None)
     p.add_argument("--ram_cache_gb",   type=float, default=None)
     p.add_argument("--epochs",         type=int,   default=100)
     p.add_argument("--lr",             type=float, default=1e-3)
@@ -781,6 +684,11 @@ def init_ddp():
     return rank, world_size, local_rank, device
 
 
+def barrier(world_size):
+    if world_size > 1:
+        dist.barrier()
+
+
 def reduce_mean(t, world_size):
     if world_size > 1:
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -815,7 +723,7 @@ def build_scheduler(optimizer, warmup, total):
     return LambdaLR(optimizer, lr_lambda)
 
 
-def run_epoch(model, loader, criterion, optimizer, scaler,
+def run_block(model, loader, criterion, optimizer, scaler,
               device, use_amp, grad_accum, grad_clip, train, world_size, ema=None):
     model.train() if train else model.eval()
     total_loss = torch.zeros(1, device=device)
@@ -881,16 +789,58 @@ def load_ckpt(path, model, optimizer, scheduler, scaler, ema, device):
     return ckpt["epoch"], ckpt["val_acc"]
 
 
-def evaluate_metrics(model, loader, device, use_amp, class_names):
+def evaluate_on_manager(model, mgr, batch_size, num_workers, prefetch, mp_ctx, pin,
+                         device, use_amp, world_size):
+    model.eval()
+    total_loss_sum = torch.zeros(1, device=device)
+    correct_sum    = torch.zeros(1, device=device)
+    total_sum      = torch.zeros(1, device=device)
+    criterion      = nn.CrossEntropyLoss()
+    mgr.set_epoch(0)
+
+    while mgr.has_next():
+        block_ds = mgr.next_block()
+        loader   = make_block_loader(block_ds, batch_size * 2, num_workers, prefetch, mp_ctx, pin)
+        with torch.no_grad():
+            for X, y in loader:
+                X = X.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                with autocast(enabled=use_amp):
+                    logits = model(X)
+                loss = criterion(logits, y)
+                total_loss_sum += loss.detach() * len(y)
+                correct_sum    += (logits.argmax(1) == y).sum()
+                total_sum      += len(y)
+        del block_ds, loader; gc_collect()
+
+    reduce_mean(total_loss_sum, world_size)
+    reduce_mean(correct_sum,    world_size)
+    reduce_mean(total_sum,      world_size)
+    return (total_loss_sum / total_sum).item(), (correct_sum / total_sum).item()
+
+
+def gc_collect():
+    import gc
+    gc.collect()
+
+
+def evaluate_metrics(model, mgr, batch_size, num_workers, prefetch, mp_ctx, pin,
+                      device, use_amp, class_names):
     model.eval()
     all_pred, all_true = [], []
-    with torch.no_grad():
-        for X, y in loader:
-            X = X.to(device, non_blocking=True)
-            with autocast(enabled=use_amp):
-                logits = model(X)
-            all_pred.extend(logits.argmax(1).cpu().numpy())
-            all_true.extend(y.numpy())
+    mgr.set_epoch(0)
+    while mgr.has_next():
+        block_ds = mgr.next_block()
+        loader   = make_block_loader(block_ds, batch_size * 2, num_workers, prefetch, mp_ctx, pin)
+        with torch.no_grad():
+            for X, y in loader:
+                X = X.to(device, non_blocking=True)
+                with autocast(enabled=use_amp):
+                    logits = model(X)
+                all_pred.extend(logits.argmax(1).cpu().numpy())
+                all_true.extend(y.numpy())
+        del block_ds, loader; gc_collect()
+
     all_pred = np.array(all_pred)
     all_true = np.array(all_true)
     oa       = accuracy_score(all_true, all_pred) * 100
@@ -903,7 +853,6 @@ def evaluate_metrics(model, loader, device, use_amp, class_names):
 
 def main():
     args = parse_args()
-
     rank, world_size, local_rank, device = init_ddp()
     main_proc = (rank == 0)
 
@@ -916,13 +865,11 @@ def main():
 
     if main_proc:
         print(f"\n{'='*65}")
-        print(f"  OS      : {platform.system()}")
-        print(f"  GPUs    : {world_size}  device={device}  AMP={args.amp}")
+        print(f"  OS={platform.system()}  GPUs={world_size}  AMP={args.amp}")
 
-    if world_size > 1:
-        dist.barrier()
+    barrier(world_size)
 
-    train_loader, val_loader, test_loader, meta = build_loaders(
+    meta = build_loaders(
         real_dir       = args.real_dir,
         aug_dir        = args.aug_dir,
         mapping_path   = args.mapping_path,
@@ -939,21 +886,29 @@ def main():
         bg_ratio       = args.bg_ratio,
         cache_dir      = args.cache_dir,
         balance_train  = args.balance_train,
-        slab_size      = args.slab_size,
         rank           = rank,
         world_size     = world_size,
         ram_cache_gb   = args.ram_cache_gb,
     )
 
-    if world_size > 1:
-        dist.barrier()
+    barrier(world_size)
 
-    batch_size = train_loader.batch_size
-    eff_batch  = batch_size * world_size * (args.grad_accum or 1)
+    train_mgr    = meta["train_mgr"]
+    val_mgr      = meta["val_mgr"]
+    test_mgr     = meta["test_mgr"]
+    batch_size   = args.batch_size  if args.batch_size  else meta["batch_size"]
+    num_workers  = args.num_workers if args.num_workers else meta["num_workers"]
+    prefetch     = meta["prefetch"]
+    mp_ctx       = meta["mp_ctx"]
+    pin          = meta["pin"]
+    n_blocks     = train_mgr.n_total_blocks
 
+    eff_batch = batch_size * world_size * (args.grad_accum or 1)
     if main_proc:
-        print(f"  batch/GPU={batch_size}  grad_accum={args.grad_accum}  batch_eff={eff_batch:,}")
+        print(f"  batch/GPU={batch_size}  eff={eff_batch:,}  blocs/epoque={n_blocks}")
         print(f"{'='*65}\n")
+
+    barrier(world_size)
 
     model = SSFTTnet(
         in_channels = 1,
@@ -967,17 +922,9 @@ def main():
         emb_dropout = args.emb_dropout,
     ).to(device)
 
-    if main_proc:
-        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"  Modele : {n_params:,} parametres")
-        print(f"  Classes: {meta['num_classes']}  Bandes: {meta['num_bands']}")
-
-    if world_size > 1:
-        dist.barrier()
+    barrier(world_size)
 
     if args.compile and hasattr(torch, "compile"):
-        if main_proc:
-            print("  torch.compile active ...")
         model = torch.compile(model, mode="max-autotune")
 
     if world_size > 1:
@@ -996,35 +943,53 @@ def main():
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     if args.resume and Path(args.resume).exists():
-        if main_proc:
-            print(f"  Resume depuis {args.resume}")
         start_epoch, best_val_acc = load_ckpt(
             args.resume, model, optimizer, scheduler, scaler, ema, device)
         start_epoch += 1
 
     for epoch in range(start_epoch, args.epochs + 1):
-        train_ds = train_loader.dataset
-        if hasattr(train_ds, 'reshuffle'):
-            train_ds.reshuffle(epoch)
-        if meta.get("train_sampler") is not None:
-            meta["train_sampler"].set_epoch(epoch)
+        t_epoch = time.perf_counter()
 
-        t0 = time.perf_counter()
-        tr_loss, tr_acc = run_epoch(
-            model, train_loader, criterion, optimizer, scaler,
-            device, args.amp, args.grad_accum, args.grad_clip,
-            train=True, world_size=world_size, ema=ema)
+        # ── Phase train : parcourt tous les blocs RAM ─────────────────────────
+        train_mgr.set_epoch(epoch)
+        epoch_loss = torch.zeros(1, device=device)
+        epoch_corr = torch.zeros(1, device=device)
+        epoch_tot  = torch.zeros(1, device=device)
 
+        while train_mgr.has_next():
+            block_ds = train_mgr.next_block()
+            loader   = make_block_loader(block_ds, batch_size, num_workers,
+                                         prefetch, mp_ctx, pin)
+
+            # Tous les ranks chargent leur bloc en parallele -> pas de NCCL timeout
+            # Ils font exactement le meme nombre de steps (drop_last=True dans make_block_loader)
+            bl_loss, bl_acc = run_block(
+                model, loader, criterion, optimizer, scaler,
+                device, args.amp, args.grad_accum, args.grad_clip,
+                train=True, world_size=world_size, ema=ema)
+
+            n_bl = len(block_ds)
+            epoch_loss += bl_loss * n_bl
+            epoch_corr += bl_acc  * n_bl
+            epoch_tot  += n_bl
+
+            del block_ds, loader; gc_collect()
+
+            # Barrier apres chaque bloc : tous les ranks avancent ensemble
+            barrier(world_size)
+
+        tr_loss = (epoch_loss / epoch_tot).item() if epoch_tot.item() > 0 else 0.0
+        tr_acc  = (epoch_corr / epoch_tot).item() if epoch_tot.item() > 0 else 0.0
+
+        # ── Phase val : parcourt tous les blocs val ───────────────────────────
         raw     = model.module if hasattr(model, "module") else model
         orig_sd = deepcopy(raw.state_dict())
         if ema is not None:
             ema.apply_to(raw)
 
-        with torch.no_grad():
-            va_loss, va_acc = run_epoch(
-                model, val_loader, criterion, optimizer, scaler,
-                device, args.amp, 1, 0,
-                train=False, world_size=world_size)
+        va_loss, va_acc = evaluate_on_manager(
+            model, val_mgr, batch_size, num_workers, prefetch, mp_ctx, pin,
+            device, args.amp, world_size)
 
         if ema is not None:
             raw.load_state_dict(orig_sd)
@@ -1032,19 +997,14 @@ def main():
         scheduler.step()
 
         if main_proc:
-            elapsed    = time.perf_counter() - t0
-            lr_now     = optimizer.param_groups[0]["lr"]
-            vram       = (torch.cuda.max_memory_allocated(device) / 1e9
-                          if torch.cuda.is_available() else 0.0)
+            elapsed = time.perf_counter() - t_epoch
+            lr_now  = optimizer.param_groups[0]["lr"]
+            vram    = torch.cuda.max_memory_allocated(device) / 1e9 if torch.cuda.is_available() else 0
             torch.cuda.reset_peak_memory_stats(device)
-            throughput = len(train_loader.dataset) / elapsed
             print(f"Ep {epoch:03d}/{args.epochs}"
                   f"  tr {tr_loss:.4f}/{tr_acc*100:.2f}%"
                   f"  va {va_loss:.4f}/{va_acc*100:.2f}%"
-                  f"  lr {lr_now:.2e}"
-                  f"  VRAM {vram:.1f}GB"
-                  f"  {throughput:,.0f}p/s"
-                  f"  {elapsed:.1f}s")
+                  f"  lr {lr_now:.2e}  VRAM {vram:.1f}GB  {elapsed:.1f}s")
 
             if epoch % args.save_every == 0:
                 save_ckpt(ckpt_dir / f"ckpt_ep{epoch:03d}.pt",
@@ -1062,8 +1022,7 @@ def main():
                     print(f"  Early stopping apres {args.patience} epoques.")
                     break
 
-        if world_size > 1:
-            dist.barrier()
+        barrier(world_size)
 
     if main_proc:
         print(f"\n{'='*65}")
@@ -1075,9 +1034,9 @@ def main():
             raw.load_state_dict(ckpt["model"])
 
         oa, aa, kappa, cm, per_cls = evaluate_metrics(
-            model, test_loader, device, args.amp, meta["class_names"])
+            model, test_mgr, batch_size, num_workers, prefetch, mp_ctx, pin,
+            device, args.amp, meta["class_names"])
         print(f"  OA={oa:.2f}%  AA={aa:.2f}%  Kappa={kappa:.2f}%")
-        print(f"\n  Par classe :")
         for name, acc in zip(meta["class_names"], per_cls):
             print(f"    {name:<25}: {acc:.2f}%")
         print(f"\n  Matrice de confusion :\n{cm}")
@@ -1097,6 +1056,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-        dist.init_process_group(backend="nccl", timeout=torch.distributed.timedelta(seconds=args.timeout))
