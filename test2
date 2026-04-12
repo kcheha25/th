@@ -22,9 +22,7 @@ def _get_h5(h5_path):
     key = (os.getpid(), h5_path)
     f   = _H5_REGISTRY.get(key)
     if f is None or not f.id.valid:
-        f = h5py.File(h5_path, 'r',
-                      rdcc_nbytes=128*1024*1024,
-                      rdcc_nslots=10007)
+        f = h5py.File(h5_path, 'r', rdcc_nbytes=128*1024*1024, rdcc_nslots=10007)
         _H5_REGISTRY[key] = f
     return f
 
@@ -45,14 +43,13 @@ def detect_server():
         "min_vram_gb":  min(vram_list) if vram_list else 0,
         "cpu_count":    cpu_count,
     }
-    print(f"\n  Serveur detecte :")
-    print(f"    OS          : {'Windows' if is_win else 'Linux'}")
-    print(f"    RAM dispo   : {ram_avail_gb:.1f} GB")
-    print(f"    GPUs        : {n_gpus}x  VRAM={vram_list}")
-    print(f"    CPUs        : {cpu_count}")
+    print(f"    OS        : {'Windows' if is_win else 'Linux'}")
+    print(f"    RAM dispo : {ram_avail_gb:.1f} GB")
+    print(f"    GPUs      : {n_gpus}x  VRAM={[f'{v:.0f}' for v in vram_list]}")
+    print(f"    CPUs      : {cpu_count}")
     return info
 
-def auto_config(server_info):
+def auto_config(server_info, world_size=1):
     is_win       = server_info["is_windows"]
     ram_avail_gb = server_info["ram_avail_gb"]
     n_gpus       = max(server_info["n_gpus"], 1)
@@ -61,37 +58,23 @@ def auto_config(server_info):
     patch_bytes  = 30 * 13 * 13 * 4
 
     if is_win:
-        # Windows L40s : 400 GB RAM
+        # Windows L40s : 400 GB RAM, 1 GPU, pas de torchrun multi-proc
         usable_ram   = ram_avail_gb * 0.80
         ram_cache_gb = min(usable_ram, 320.0)
-        # slab_size irrelevant si RamDataset
         slab_size    = 32768
         batch_size   = 2048
-        # workers legers car donnees en RAM, pas besoin de beaucoup
         num_workers  = min(8, cpu_count)
         prefetch     = 4
         mp_ctx       = "spawn"
-        strategy     = "WINDOWS_L40S_LARGERAM"
+        strategy     = "WINDOWS_L40S"
 
     elif ram_avail_gb >= 200:
-        # Linux avec beaucoup de RAM (ex: 664 GB)
-        # On charge le max en RamDataset
-        usable_ram   = ram_avail_gb * 0.82
-        ram_cache_gb = min(usable_ram, 540.0)
-
-        # Nombre de workers : peu suffisent car donnees en RAM
-        # Chaque worker ne charge PAS de slab (RamDataset = tableau numpy)
-        # Le seul cout est le slicing numpy + copy vers pin_memory
-        num_workers  = min(8, cpu_count // n_gpus)
-
-        # slab_size pour SlabDataset (fallback si RamDataset depasse la RAM)
-        # Calcule pour que num_workers * n_gpus * slab ne depasse pas 20 GB
-        max_slab_ram_gb  = 20.0
-        total_workers    = num_workers * n_gpus
-        slab_size        = max(512, min(
-            16384,
-            int(max_slab_ram_gb * 1e9 / (total_workers * patch_bytes))
-        ))
+        # Linux grande RAM (664 GB)
+        # IMPORTANT : world_size processus torchrun tournent en parallele
+        # Chaque processus ne peut utiliser que ram_avail_gb / world_size
+        ram_per_rank = ram_avail_gb / max(world_size, 1)
+        # On prend 80% de la part de ce rank
+        ram_cache_gb = ram_per_rank * 0.80
 
         if min_vram <= 10:
             batch_size = 256
@@ -100,32 +83,25 @@ def auto_config(server_info):
         else:
             batch_size = 1024
 
+        # Peu de workers : les donnees sont en RAM, pas besoin de beaucoup
+        num_workers  = min(4, cpu_count // max(n_gpus, 1))
         prefetch     = 4
         mp_ctx       = None
+        slab_size    = 8192
         strategy     = "LINUX_LARGERAM"
 
     else:
-        # Linux RAM limitee (< 200 GB)
-        # SlabDataset avec slabs petits
+        # Linux RAM limitee
         ram_cache_gb = 0.0
-
-        # Calcule slab_size pour que chaque worker tienne dans sa RAM
-        # Budget : 1 GB par worker max
-        num_workers      = max(1, min(4, cpu_count // n_gpus))
-        total_workers    = num_workers * n_gpus
-        budget_per_worker = 0.8 * 1e9
-        slab_size        = max(128, min(
-            2048,
-            int(budget_per_worker / patch_bytes)
-        ))
-
+        num_workers  = max(1, min(2, cpu_count // max(n_gpus, 1)))
+        budget_b     = 0.5 * 1e9
+        slab_size    = max(128, min(1024, int(budget_b / patch_bytes)))
         if min_vram <= 10:
             batch_size = 128
         elif min_vram <= 16:
             batch_size = 256
         else:
             batch_size = 512
-
         prefetch     = 2
         mp_ctx       = None
         strategy     = "LINUX_LOWRAM"
@@ -139,16 +115,6 @@ def auto_config(server_info):
         "mp_ctx":       mp_ctx,
         "ram_cache_gb": ram_cache_gb,
     }
-    print(f"\n  Config auto ({strategy}) :")
-    for k, v in cfg.items():
-        print(f"    {k:<16}: {v}")
-    total_w = num_workers * n_gpus
-    print(f"\n  Verification memoire workers :")
-    print(f"    Workers totaux    : {num_workers} x {n_gpus} GPU = {total_w}")
-    slab_ram = total_w * slab_size * patch_bytes / 1e9
-    print(f"    RAM slabs actifs  : {slab_ram:.1f} GB")
-    print(f"    RAM dispo         : {ram_avail_gb:.1f} GB")
-    print(f"    Marge             : {ram_avail_gb - slab_ram:.1f} GB")
     return cfg
 
 def load_mapping(mapping_path):
@@ -457,41 +423,68 @@ def _balance_hdf5_streaming(h5_path, split_name, patch_size, num_bands, random_s
     return n_new
 
 
-class RamDataset(Dataset):
+class RamShardDataset(Dataset):
     """
-    Charge le HDF5 en RAM numpy au demarrage — zero acces disque ensuite.
-    Ideal pour Linux 664 GB RAM : on charge ~540 GB du train en memoire.
-    Les workers ne font que slicer un tableau numpy en RAM = tres rapide,
-    pas de slab actif = pas d'explosion memoire.
+    Chaque rank DDP charge uniquement sa fraction du dataset en RAM.
+
+    Avec 4 ranks et 66M patches a 342 GB :
+      rank 0 -> patches [0      .. 16.5M]  ~85 GB
+      rank 1 -> patches [16.5M  .. 33M  ]  ~85 GB
+      rank 2 -> patches [33M    .. 49.5M]  ~85 GB
+      rank 3 -> patches [49.5M  .. 66M  ]  ~85 GB
+    Total : 340 GB repartis, pas 4x340 GB.
+
+    DistributedSampler n'est PAS utilise : chaque rank a deja
+    sa propre portion du dataset, pas besoin de le re-partitionner.
     """
-    def __init__(self, h5_path, split_name, max_ram_gb=300.0, shuffle=True, seed=0):
+    def __init__(self, h5_path, split_name, rank, world_size,
+                 max_ram_gb=80.0, shuffle=True, seed=0):
         import time as _t
-        self.shuffle = shuffle
-        self.seed    = seed
+        self.shuffle    = shuffle
+        self.seed       = seed
+        self.rank       = rank
+        self.world_size = world_size
+
         with h5py.File(str(h5_path), 'r') as f:
             total       = int(f[f"{split_name}/y"].shape[0])
             x_shape     = tuple(f[f"{split_name}/X"].shape[1:])
             patch_bytes = int(np.prod(x_shape)) * 4
+
+            shard_size  = math.ceil(total / world_size)
+            start       = rank * shard_size
+            end         = min(start + shard_size, total)
+
             max_patches = int(max_ram_gb * 1e9 / patch_bytes)
-            n_load      = min(total, max_patches)
-            pct         = n_load / total * 100
-            gb_load     = n_load * patch_bytes / 1e9
-            print(f"  RamDataset [{split_name}] : {n_load:,}/{total:,} patches "
-                  f"({pct:.1f}% — {gb_load:.1f} GB) ...")
+            end         = min(end, start + max_patches)
+
+            n_load  = end - start
+            gb_load = n_load * patch_bytes / 1e9
+            pct     = n_load / total * 100
+
+            if rank == 0:
+                print(f"  RamShardDataset [{split_name}] : "
+                      f"{world_size} ranks x ~{gb_load:.1f} GB = "
+                      f"~{gb_load*world_size:.0f} GB total")
+
+            print(f"    rank {rank} : patches [{start:,}..{end:,}] "
+                  f"({n_load:,} patches — {gb_load:.1f} GB) ...")
+
             t0     = _t.perf_counter()
-            self.X = f[f"{split_name}/X"][:n_load]
-            self.y = f[f"{split_name}/y"][:n_load]
-            print(f"  RamDataset [{split_name}] : charge en {_t.perf_counter()-t0:.1f}s")
-        self.length  = len(self.y)
-        self._order  = self._make_order(seed)
+            self.X = f[f"{split_name}/X"][start:end]
+            self.y = f[f"{split_name}/y"][start:end]
+            print(f"    rank {rank} : charge en {_t.perf_counter()-t0:.1f}s")
+
+        self.length = len(self.y)
+        self._order = self._make_order(seed)
 
     def _make_order(self, seed):
         order = list(range(self.length))
-        if self.shuffle: random.Random(seed).shuffle(order)
+        if self.shuffle:
+            random.Random(seed + self.rank).shuffle(order)
         return order
 
     def reshuffle(self, epoch):
-        random.Random(self.seed + epoch * 1_000_003).shuffle(self._order)
+        random.Random(self.seed + self.rank + epoch * 1_000_003).shuffle(self._order)
 
     def __len__(self): return self.length
 
@@ -504,10 +497,9 @@ class RamDataset(Dataset):
 
 class SlabDataset(Dataset):
     """
-    Lit le HDF5 par blocs contigus.
-    Chaque worker ouvre son handle HDF5 via _get_h5 (registre par PID).
-    Pas de swmr pour eviter les conflits sur Linux.
-    Utilise quand la RAM ne suffit pas pour tout charger.
+    Lit le HDF5 par blocs contigus via registre PID.
+    Utilise quand la RAM ne suffit pas pour RamShardDataset.
+    Chaque rank recoit sa portion via DistributedSampler.
     """
     def __init__(self, h5_path, split_name, slab_size=512, shuffle=True, seed=0):
         self.h5_path    = str(h5_path)
@@ -573,12 +565,19 @@ def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json",
                   slab_size=None, rank=0, world_size=1, ram_cache_gb=None):
 
     server = detect_server()
-    cfg    = auto_config(server)
+    cfg    = auto_config(server, world_size=world_size)
 
     if batch_size   is None: batch_size   = cfg["batch_size"]
     if num_workers  is None: num_workers  = cfg["num_workers"]
     if slab_size    is None: slab_size    = cfg["slab_size"]
     if ram_cache_gb is None: ram_cache_gb = cfg["ram_cache_gb"]
+
+    if rank == 0:
+        print(f"\n  Config ({cfg['strategy']}) :")
+        for k, v in cfg.items():
+            print(f"    {k:<16}: {v}")
+        print(f"    ram_cache/rank  : {ram_cache_gb:.1f} GB  "
+              f"(total ~{ram_cache_gb*world_size:.0f} GB sur {world_size} ranks)")
 
     extrude2final, class_names, label2idx = load_mapping(mapping_path)
     cache_dir   = Path(cache_dir)
@@ -593,28 +592,33 @@ def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json",
                              balance_train, batch_size, num_workers,
                              slab_size, rank, world_size, server, cfg, ram_cache_gb)
 
-    plots_meta = collect_plots_meta(real_dir=real_dir, aug_dir=aug_dir)
-    train_meta, val_meta, test_meta = split_plots(
-        plots_meta, split_mode, val_ratio, test_ratio, random_state)
-    pca_model = None
-    if use_pca:
-        real_meta = [m for m in plots_meta if m["source"] == "real"]
-        if real_meta:
-            pca_model = fit_or_load_pca(real_meta, pca_components, cache_dir, config_hash, fit_max_pixels)
-    for meta_list, sname, do_balance in [
-        (train_meta, "train", balance_train),
-        (val_meta,   "val",   False),
-        (test_meta,  "test",  False),
-    ]:
-        extract_split_to_hdf5(meta_list, sname, patch_size, extrude2final, label2idx,
-                              bg_ratio, random_state, pca_model, str(h5_path),
-                              balance_train=do_balance)
-    with h5py.File(h5_path, 'a') as f:
-        f.attrs['class_names'] = json.dumps(class_names)
-        f.attrs['label2idx']   = json.dumps(label2idx)
-        f.attrs['patch_size']  = patch_size
-        f.attrs['num_bands']   = pca_components if use_pca else -1
-        f.attrs['created_at']  = datetime.now().isoformat()
+    if rank == 0:
+        plots_meta = collect_plots_meta(real_dir=real_dir, aug_dir=aug_dir)
+        train_meta, val_meta, test_meta = split_plots(
+            plots_meta, split_mode, val_ratio, test_ratio, random_state)
+        pca_model = None
+        if use_pca:
+            real_meta = [m for m in plots_meta if m["source"] == "real"]
+            if real_meta:
+                pca_model = fit_or_load_pca(real_meta, pca_components, cache_dir, config_hash, fit_max_pixels)
+        for meta_list, sname, do_balance in [
+            (train_meta, "train", balance_train),
+            (val_meta,   "val",   False),
+            (test_meta,  "test",  False),
+        ]:
+            extract_split_to_hdf5(meta_list, sname, patch_size, extrude2final, label2idx,
+                                  bg_ratio, random_state, pca_model, str(h5_path),
+                                  balance_train=do_balance)
+        with h5py.File(h5_path, 'a') as f:
+            f.attrs['class_names'] = json.dumps(class_names)
+            f.attrs['label2idx']   = json.dumps(label2idx)
+            f.attrs['patch_size']  = patch_size
+            f.attrs['num_bands']   = pca_components if use_pca else -1
+            f.attrs['created_at']  = datetime.now().isoformat()
+
+    if world_size > 1:
+        import torch.distributed as dist
+        dist.barrier()
 
     return _make_loaders(h5_path, class_names, label2idx, patch_size,
                          balance_train, batch_size, num_workers,
@@ -625,19 +629,38 @@ def _make_loaders(h5_path, class_names, label2idx, patch_size,
                   slab_size, rank, world_size, server, cfg, ram_cache_gb):
 
     is_win = server["is_windows"]
+    use_ram = ram_cache_gb >= 10.0
 
-    if ram_cache_gb >= 50.0:
-        print(f"\n  Mode RamDataset ({ram_cache_gb:.0f} GB max) ...")
-        val_gb  = min(ram_cache_gb * 0.08, 40.0)
-        test_gb = min(ram_cache_gb * 0.08, 40.0)
-        train_ds = RamDataset(str(h5_path), 'train', max_ram_gb=ram_cache_gb, shuffle=True,  seed=42)
-        val_ds   = RamDataset(str(h5_path), 'val',   max_ram_gb=val_gb,        shuffle=False, seed=0)
-        test_ds  = RamDataset(str(h5_path), 'test',  max_ram_gb=test_gb,       shuffle=False, seed=0)
+    if use_ram:
+        train_ds = RamShardDataset(str(h5_path), 'train',
+                                   rank=rank, world_size=world_size,
+                                   max_ram_gb=ram_cache_gb,
+                                   shuffle=True, seed=42)
+        val_gb   = min(ram_cache_gb * 0.15, 30.0)
+        test_gb  = min(ram_cache_gb * 0.15, 30.0)
+        val_ds   = RamShardDataset(str(h5_path), 'val',
+                                   rank=rank, world_size=world_size,
+                                   max_ram_gb=val_gb,
+                                   shuffle=False, seed=0)
+        test_ds  = RamShardDataset(str(h5_path), 'test',
+                                   rank=rank, world_size=world_size,
+                                   max_ram_gb=test_gb,
+                                   shuffle=False, seed=0)
+        train_sampler = None
+        val_sampler   = None
+        test_sampler  = None
+        shuffle_train = False
     else:
-        print(f"\n  Mode SlabDataset (slab_size={slab_size}) ...")
         train_ds = SlabDataset(str(h5_path), 'train', slab_size=slab_size, shuffle=True,  seed=42)
         val_ds   = SlabDataset(str(h5_path), 'val',   slab_size=slab_size, shuffle=False, seed=0)
         test_ds  = SlabDataset(str(h5_path), 'test',  slab_size=slab_size, shuffle=False, seed=0)
+        if world_size > 1:
+            train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=False)
+            val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=rank, shuffle=False)
+            test_sampler  = DistributedSampler(test_ds,  num_replicas=world_size, rank=rank, shuffle=False)
+        else:
+            train_sampler = val_sampler = test_sampler = None
+        shuffle_train = False
 
     with h5py.File(h5_path, 'r') as f:
         num_bands = int(f['train/X'].shape[1])
@@ -645,15 +668,6 @@ def _make_loaders(h5_path, class_names, label2idx, patch_size,
     pin    = torch.cuda.is_available()
     mp_ctx = cfg["mp_ctx"]
     pf     = cfg["prefetch"] if num_workers > 0 else None
-
-    if world_size > 1:
-        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=False)
-        val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=rank, shuffle=False)
-        test_sampler  = DistributedSampler(test_ds,  num_replicas=world_size, rank=rank, shuffle=False)
-        shuffle_train = False
-    else:
-        train_sampler = val_sampler = test_sampler = None
-        shuffle_train = False
 
     kw = dict(
         num_workers        = num_workers,
@@ -673,9 +687,12 @@ def _make_loaders(h5_path, class_names, label2idx, patch_size,
     test_loader  = DataLoader(test_ds,  batch_size=batch_size * 2,
                               sampler=test_sampler,  shuffle=False, **kw)
 
-    print(f"  batch/GPU={batch_size}  workers={num_workers}  prefetch={pf}")
-    print(f"  Train: {len(train_ds):,}  Val: {len(val_ds):,}  Test: {len(test_ds):,}")
-    print(f"  Steps/epoch: {len(train_loader)}\n")
+    if rank == 0:
+        print(f"\n  DataLoaders prets :")
+        print(f"    mode         : {'RamShard' if use_ram else 'Slab'}")
+        print(f"    batch/GPU    : {batch_size}  workers/GPU : {num_workers}")
+        print(f"    Train/rank   : {len(train_ds):,}  Steps/epoch : {len(train_loader)}")
+        print(f"    Val/rank     : {len(val_ds):,}")
 
     meta = {
         "class_names":   class_names,
