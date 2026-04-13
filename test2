@@ -1,4 +1,4 @@
-import gc, json, random, re, pickle, hashlib, threading, queue, os, math, platform
+import gc,json,random,re,pickle,hashlib,os,math,platform,threading,queue
 from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
@@ -7,1052 +7,762 @@ import torch
 import torch.nn.functional as F
 from sklearn.decomposition import PCA
 from spectral import envi
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader,Dataset
 import h5py
 import psutil
 
-NUM_GPUS            = max(1, torch.cuda.device_count())
-PATCH_EXTRACT_BATCH = 8192
-PREFETCH_QUEUE_SIZE = 4
-HDF5_CHUNK_PATCHES  = 256
-
-_H5_REGISTRY = {}
+NUM_GPUS=max(1,torch.cuda.device_count())
+PATCH_EXTRACT_BATCH=8192
+PREFETCH_QUEUE_SIZE=4
+HDF5_CHUNK_PATCHES=256
+_H5_REGISTRY={}
 
 def _get_h5(h5_path):
-    key = (os.getpid(), h5_path)
-    f   = _H5_REGISTRY.get(key)
+    key=(os.getpid(),h5_path)
+    f=_H5_REGISTRY.get(key)
     if f is None or not f.id.valid:
-        f = h5py.File(h5_path, 'r', rdcc_nbytes=128*1024*1024, rdcc_nslots=10007)
-        _H5_REGISTRY[key] = f
+        f=h5py.File(h5_path,'r',rdcc_nbytes=256*1024*1024,rdcc_nslots=10007)
+        _H5_REGISTRY[key]=f
     return f
 
-def detect_server():
-    is_win       = platform.system() == "Windows"
-    ram_avail_gb = psutil.virtual_memory().available / 1e9
-    n_gpus       = torch.cuda.device_count()
-    vram_list    = [torch.cuda.get_device_properties(i).total_memory / 1e9
-                    for i in range(n_gpus)] if n_gpus > 0 else []
-    cpu_count    = os.cpu_count() or 4
-    return {
-        "is_windows":   is_win,
-        "ram_avail_gb": ram_avail_gb,
-        "n_gpus":       n_gpus,
-        "vram_list":    vram_list,
-        "min_vram_gb":  min(vram_list) if vram_list else 0,
-        "cpu_count":    cpu_count,
-    }
-
-def auto_config(server_info, world_size=1):
-    is_win       = server_info["is_windows"]
-    ram_avail_gb = server_info["ram_avail_gb"]
-    n_gpus       = max(server_info["n_gpus"], 1)
-    min_vram     = server_info["min_vram_gb"]
-    cpu_count    = server_info["cpu_count"]
-
-    usable_ram   = ram_avail_gb * 0.78
-    ram_per_rank = usable_ram / max(world_size, 1)
-
+def server_config(n_gpus,patch_bytes,total_patches):
+    is_win=platform.system()=="Windows"
+    ram_avail_gb=psutil.virtual_memory().available/1e9
+    cpu_count=os.cpu_count() or 4
+    vram_list=[torch.cuda.get_device_properties(i).total_memory/1e9 for i in range(n_gpus)] if n_gpus>0 else [0]
+    min_vram=min(vram_list)
+    usable_ram_gb=ram_avail_gb*0.78
+    ram_bytes=usable_ram_gb*1e9
+    n_in_ram=min(total_patches,int(ram_bytes/patch_bytes))
     if is_win:
-        batch_size  = 2048
-        num_workers = min(8, cpu_count)
-        prefetch    = 4
-        mp_ctx      = "spawn"
-        strategy    = "WINDOWS"
-    elif ram_avail_gb >= 100:
-        batch_size  = 512 if min_vram <= 16 else 1024
-        num_workers = min(4, cpu_count // max(n_gpus, 1))
-        prefetch    = 4
-        mp_ctx      = None
-        strategy    = "LINUX_LARGERAM"
+        num_workers=min(16,cpu_count)
+        prefetch=8
+        mp_ctx="spawn"
     else:
-        batch_size  = 256 if min_vram <= 16 else 512
-        num_workers = max(1, min(2, cpu_count // max(n_gpus, 1)))
-        prefetch    = 2
-        mp_ctx      = None
-        strategy    = "LINUX_LOWRAM"
-
-    return {
-        "strategy":     strategy,
-        "batch_size":   batch_size,
-        "num_workers":  num_workers,
-        "prefetch":     prefetch,
-        "mp_ctx":       mp_ctx,
-        "ram_per_rank": ram_per_rank,
-    }
+        num_workers=min(8,max(2,cpu_count//max(n_gpus,1)))
+        prefetch=4
+        mp_ctx=None
+    if min_vram<=10:
+        batch_per_gpu=128
+    elif min_vram<=16:
+        batch_per_gpu=256
+    elif min_vram<=24:
+        batch_per_gpu=512
+    else:
+        batch_per_gpu=1024
+    batch_size=batch_per_gpu*max(n_gpus,1)
+    cfg={"is_win":is_win,"ram_avail_gb":ram_avail_gb,"usable_ram_gb":usable_ram_gb,
+         "n_in_ram":n_in_ram,"batch_size":batch_size,"num_workers":num_workers,
+         "prefetch":prefetch,"mp_ctx":mp_ctx,"vram_list":vram_list}
+    print(f"  OS={'Windows' if is_win else 'Linux'}  RAM={ram_avail_gb:.0f}GB  usable={usable_ram_gb:.0f}GB")
+    print(f"  GPUs={n_gpus}x{[f'{v:.0f}GB' for v in vram_list]}  batch_total={batch_size}  workers={num_workers}")
+    gb_ram=n_in_ram*patch_bytes/1e9
+    gb_total=total_patches*patch_bytes/1e9
+    print(f"  Dataset train: {total_patches:,} patches ({gb_total:.0f}GB) -> RAM: {n_in_ram:,} ({gb_ram:.0f}GB) HDF5: {total_patches-n_in_ram:,}")
+    return cfg
 
 def load_mapping(mapping_path):
     with open(mapping_path) as f:
-        raw = json.load(f)
-    extrude2final = {}
-    for final_class, extrude_list in raw.items():
+        raw=json.load(f)
+    extrude2final={}
+    for final_class,extrude_list in raw.items():
         for ext in extrude_list:
-            extrude2final[ext.strip()] = final_class
-    final_classes = sorted(raw.keys())
-    class_names   = final_classes + ["background"]
-    label2idx     = {name: i for i, name in enumerate(class_names)}
-    return extrude2final, class_names, label2idx
+            extrude2final[ext.strip()]=final_class
+    final_classes=sorted(raw.keys())
+    class_names=final_classes+["background"]
+    label2idx={name:i for i,name in enumerate(class_names)}
+    return extrude2final,class_names,label2idx
 
-def _load_envi_cube(hdr_path, source):
-    img  = envi.open(str(hdr_path))
-    cube = img.load().astype(np.float32)
-    wl   = [float(w) for w in img.metadata.get("wavelength", [])]
-    if cube.ndim == 3:
-        if source == "real" and wl and cube.shape[2] == len(wl):
-            cube = cube.transpose(2, 0, 1)
-        elif source != "real" and wl and cube.shape[1] == len(wl):
-            cube = cube.transpose(1, 0, 2)
-    if cube.ndim != 3:
+def _load_envi_cube(hdr_path,source):
+    img=envi.open(str(hdr_path))
+    cube=img.load().astype(np.float32)
+    wl=[float(w) for w in img.metadata.get("wavelength",[])]
+    if cube.ndim==3:
+        if source=="real" and wl and cube.shape[2]==len(wl):
+            cube=cube.transpose(2,0,1)
+        elif source!="real" and wl and cube.shape[1]==len(wl):
+            cube=cube.transpose(1,0,2)
+    if cube.ndim!=3:
         raise ValueError(f"Invalid cube shape: {cube.shape}")
-    return cube, wl
+    return cube,wl
 
 def _load_shapes(json_path):
     with open(json_path) as f:
-        return json.load(f).get("shapes", [])
+        return json.load(f).get("shapes",[])
 
-def collect_plots_meta(real_dir=None, aug_dir=None):
-    meta_list = []
+def collect_plots_meta(real_dir=None,aug_dir=None):
+    meta_list=[]
     if real_dir:
-        real_dir = Path(real_dir)
+        real_dir=Path(real_dir)
         for hdr in sorted(real_dir.glob("plot_*_cube.hdr")):
-            m = re.match(r"plot_(\d+)_cube", hdr.stem)
+            m=re.match(r"plot_(\d+)_cube",hdr.stem)
             if not m: continue
-            jsn = real_dir / f"plot_{m.group(1)}_annotations.json"
+            jsn=real_dir/f"plot_{m.group(1)}_annotations.json"
             if jsn.exists():
-                meta_list.append({"source": "real", "name": hdr.stem, "hdr": hdr, "jsn": jsn})
+                meta_list.append({"source":"real","name":hdr.stem,"hdr":hdr,"jsn":jsn})
     if aug_dir:
-        aug_dir = Path(aug_dir)
+        aug_dir=Path(aug_dir)
         for hdr in sorted(aug_dir.glob("*.hdr")):
-            if any(hdr.stem.endswith(s) for s in ("_ratio", "_cube")): continue
-            jsn = aug_dir / f"{hdr.stem}.json"
+            if any(hdr.stem.endswith(s) for s in ("_ratio","_cube")): continue
+            jsn=aug_dir/f"{hdr.stem}.json"
             if not jsn.exists(): continue
-            source = "circle" if "circle" in hdr.stem.lower() else "aug"
-            meta_list.append({"source": source, "name": hdr.stem, "hdr": hdr, "jsn": jsn})
+            source="circle" if "circle" in hdr.stem.lower() else "aug"
+            meta_list.append({"source":source,"name":hdr.stem,"hdr":hdr,"jsn":jsn})
     if not meta_list:
         raise RuntimeError("No plots found.")
     return meta_list
 
-def split_plots(plots_meta, split_mode="aug_real", val_ratio=0.15, test_ratio=0.15, random_state=345):
-    rng = random.Random(random_state)
-    if split_mode == "aug_real":
-        aug  = [p for p in plots_meta if p["source"] in ("aug", "circle")]
-        real = [p for p in plots_meta if p["source"] == "real"]
+def split_plots(plots_meta,split_mode="aug_real",val_ratio=0.15,test_ratio=0.15,random_state=345):
+    rng=random.Random(random_state)
+    if split_mode=="aug_real":
+        aug=[p for p in plots_meta if p["source"] in ("aug","circle")]
+        real=[p for p in plots_meta if p["source"]=="real"]
         rng.shuffle(aug)
-        n_val = max(1, int(len(aug) * val_ratio))
-        train, val, test = aug[n_val:], aug[:n_val], real
-    elif split_mode == "shuffle":
-        all_p = plots_meta[:]
+        n_val=max(1,int(len(aug)*val_ratio))
+        train,val,test=aug[n_val:],aug[:n_val],real
+    elif split_mode=="shuffle":
+        all_p=plots_meta[:]
         rng.shuffle(all_p)
-        n = len(all_p)
-        n_test, n_val = max(1, int(n * test_ratio)), max(1, int(n * val_ratio))
-        test  = all_p[:n_test]
-        val   = all_p[n_test:n_test + n_val]
-        train = all_p[n_test + n_val:]
+        n=len(all_p)
+        n_test,n_val=max(1,int(n*test_ratio)),max(1,int(n*val_ratio))
+        test=all_p[:n_test]
+        val=all_p[n_test:n_test+n_val]
+        train=all_p[n_test+n_val:]
     else:
         raise ValueError(f"Unknown split_mode: {split_mode}")
-    return train, val, test
+    return train,val,test
 
-def _rasterize_cpu(points, H, W):
-    pts  = np.array(points, dtype=np.float32)
-    n    = len(pts)
-    cols = np.arange(W, dtype=np.float32) + 0.5
-    rows = np.arange(H, dtype=np.float32) + 0.5
-    gc_, gr_ = np.meshgrid(cols, rows)
-    px, py   = gc_.ravel(), gr_.ravel()
-    inside   = np.zeros(len(px), dtype=bool)
-    x1, y1   = pts[:, 0], pts[:, 1]
-    x2, y2   = np.roll(x1, -1), np.roll(y1, -1)
+def _rasterize_cpu(points,H,W):
+    pts=np.array(points,dtype=np.float32)
+    n=len(pts)
+    cols=np.arange(W,dtype=np.float32)+0.5
+    rows=np.arange(H,dtype=np.float32)+0.5
+    gc_,gr_=np.meshgrid(cols,rows)
+    px,py=gc_.ravel(),gr_.ravel()
+    inside=np.zeros(len(px),dtype=bool)
+    x1,y1=pts[:,0],pts[:,1]
+    x2,y2=np.roll(x1,-1),np.roll(y1,-1)
     for i in range(n):
-        dy = y2[i] - y1[i]
-        if abs(dy) < 1e-10: continue
-        cond    = (y1[i] < py) != (y2[i] < py)
-        xi      = x1[i] + (py - y1[i]) * (x2[i] - x1[i]) / dy
-        inside ^= cond & (px < xi)
-    return inside.reshape(H, W)
+        dy=y2[i]-y1[i]
+        if abs(dy)<1e-10: continue
+        cond=(y1[i]<py)!=(y2[i]<py)
+        xi=x1[i]+(py-y1[i])*(x2[i]-x1[i])/dy
+        inside^=cond&(px<xi)
+    return inside.reshape(H,W)
 
-def build_label_map(H, W, shapes, extrude2final, label2idx):
-    bg = label2idx["background"]
-    lm = np.full((H, W), bg, dtype=np.int32)
+def build_label_map(H,W,shapes,extrude2final,label2idx):
+    bg=label2idx["background"]
+    lm=np.full((H,W),bg,dtype=np.int32)
     for shape in shapes:
-        raw   = shape.get("label", "").strip()
-        stype = shape.get("shape_type", "")
-        if raw.lower() == "trou" or stype not in ("polygon", "rectangle"): continue
-        final = extrude2final.get(raw)
+        raw=shape.get("label","").strip()
+        stype=shape.get("shape_type","")
+        if raw.lower()=="trou" or stype not in ("polygon","rectangle"): continue
+        final=extrude2final.get(raw)
         if final is None: continue
-        pts = shape["points"]
-        if len(pts) < 3: continue
+        pts=shape["points"]
+        if len(pts)<3: continue
         try:
-            lm[_rasterize_cpu(pts, H, W)] = label2idx[final]
+            lm[_rasterize_cpu(pts,H,W)]=label2idx[final]
         except Exception as e:
             print(f"Warning rasterization '{raw}': {e}")
     return lm
 
-def fit_or_load_pca(real_meta_list, pca_components, cache_dir, config_hash, fit_max_pixels=500_000):
-    path = Path(cache_dir) / f"pca_{config_hash}.pkl"
+def fit_or_load_pca(real_meta_list,pca_components,cache_dir,config_hash,fit_max_pixels=500_000):
+    path=Path(cache_dir)/f"pca_{config_hash}.pkl"
     if path.exists():
-        with open(path, "rb") as f:
+        with open(path,"rb") as f:
             return pickle.load(f)
-    pixels = []
+    pixels=[]
     for meta in real_meta_list:
         try:
-            cube, _ = _load_envi_cube(meta["hdr"], meta["source"])
-            B, H, W = cube.shape
-            n   = min(20_000, H * W)
-            idx = np.random.choice(H * W, n, replace=False)
-            pixels.append(cube.reshape(B, -1)[:, idx].T)
+            cube,_=_load_envi_cube(meta["hdr"],meta["source"])
+            B,H,W=cube.shape
+            n=min(20_000,H*W)
+            idx=np.random.choice(H*W,n,replace=False)
+            pixels.append(cube.reshape(B,-1)[:,idx].T)
             del cube; gc.collect()
         except Exception as e:
             print(f"Warning {meta['name']}: {e}")
-    pixels = np.concatenate(pixels)
-    if len(pixels) > fit_max_pixels:
-        pixels = pixels[np.random.choice(len(pixels), fit_max_pixels, replace=False)]
-    pca = PCA(n_components=pca_components, whiten=True)
+    pixels=np.concatenate(pixels)
+    if len(pixels)>fit_max_pixels:
+        pixels=pixels[np.random.choice(len(pixels),fit_max_pixels,replace=False)]
+    pca=PCA(n_components=pca_components,whiten=True)
     pca.fit(pixels)
     del pixels; gc.collect()
-    with open(path, "wb") as f:
-        pickle.dump(pca, f, protocol=pickle.HIGHEST_PROTOCOL)
+    with open(path,"wb") as f:
+        pickle.dump(pca,f,protocol=pickle.HIGHEST_PROTOCOL)
     return pca
 
-def apply_pca_chunked(cube, pca, chunk=30_000):
-    B, H, W = cube.shape
-    flat = cube.reshape(B, -1).T
-    out  = np.empty((H * W, pca.n_components_), dtype=np.float32)
-    for s in range(0, len(flat), chunk):
-        out[s:s + chunk] = pca.transform(flat[s:s + chunk])
+def apply_pca_chunked(cube,pca,chunk=30_000):
+    B,H,W=cube.shape
+    flat=cube.reshape(B,-1).T
+    out=np.empty((H*W,pca.n_components_),dtype=np.float32)
+    for s in range(0,len(flat),chunk):
+        out[s:s+chunk]=pca.transform(flat[s:s+chunk])
     del flat
-    return out.T.reshape(pca.n_components_, H, W).astype(np.float32)
+    return out.T.reshape(pca.n_components_,H,W).astype(np.float32)
 
-def balance_background(labels, bg_idx, rng, bg_ratio=1.5):
-    fg   = labels != bg_idx
-    keep = fg.copy()
-    n_fg = int(fg.sum())
-    if n_fg > 0:
-        bg_pool = np.where(~fg)[0]
-        n_keep  = min(int(n_fg * bg_ratio), len(bg_pool))
-        if n_keep > 0:
-            keep[rng.choice(bg_pool, n_keep, replace=False)] = True
+def balance_background(labels,bg_idx,rng,bg_ratio=1.5):
+    fg=labels!=bg_idx
+    keep=fg.copy()
+    n_fg=int(fg.sum())
+    if n_fg>0:
+        bg_pool=np.where(~fg)[0]
+        n_keep=min(int(n_fg*bg_ratio),len(bg_pool))
+        if n_keep>0:
+            keep[rng.choice(bg_pool,n_keep,replace=False)]=True
     return keep
 
-def _extract_patches_on_gpu(cube_pca, rows_k, cols_k, patch_size, device):
-    B, H, W = cube_pca.shape
-    m       = patch_size // 2
-    cube_t  = torch.from_numpy(cube_pca).to(device, non_blocking=True).unsqueeze(0)
-    padded  = F.pad(cube_t, (m, m, m, m), mode="constant", value=0)
+def _extract_patches_on_gpu(cube_pca,rows_k,cols_k,patch_size,device):
+    B,H,W=cube_pca.shape
+    m=patch_size//2
+    cube_t=torch.from_numpy(cube_pca).to(device,non_blocking=True).unsqueeze(0)
+    padded=F.pad(cube_t,(m,m,m,m),mode="constant",value=0)
     del cube_t
-    n_patches   = len(rows_k)
-    all_patches = np.empty((n_patches, B, patch_size, patch_size), dtype=np.float32)
-    for start in range(0, n_patches, PATCH_EXTRACT_BATCH):
-        end    = min(start + PATCH_EXTRACT_BATCH, n_patches)
-        rs, cs = rows_k[start:end], cols_k[start:end]
-        batch  = torch.stack([padded[0, :, r:r+patch_size, c:c+patch_size]
-                               for r, c in zip(rs, cs)])
-        all_patches[start:end] = batch.cpu().numpy()
+    n_patches=len(rows_k)
+    all_patches=np.empty((n_patches,B,patch_size,patch_size),dtype=np.float32)
+    for start in range(0,n_patches,PATCH_EXTRACT_BATCH):
+        end=min(start+PATCH_EXTRACT_BATCH,n_patches)
+        rs,cs=rows_k[start:end],cols_k[start:end]
+        batch=torch.stack([padded[0,:,r:r+patch_size,c:c+patch_size] for r,c in zip(rs,cs)])
+        all_patches[start:end]=batch.cpu().numpy()
         del batch
     del padded; torch.cuda.empty_cache()
     return all_patches
 
-def _gpu_worker(gpu_id, task_queue, h5_path, split_name, patch_size,
-                extrude2final, label2idx, bg_ratio, random_state,
-                pca, write_lock, counters):
-    device = torch.device(f"cuda:{gpu_id}")
-    bg_idx = label2idx["background"]
+def _gpu_worker(gpu_id,task_queue,h5_path,split_name,patch_size,extrude2final,label2idx,bg_ratio,random_state,pca,write_lock,counters):
+    device=torch.device(f"cuda:{gpu_id}")
+    bg_idx=label2idx["background"]
     while True:
         try:
-            meta = task_queue.get(timeout=30)
+            meta=task_queue.get(timeout=30)
         except queue.Empty:
             break
         if meta is None:
             task_queue.task_done(); break
-        name, source = meta["name"], meta["source"]
-        rng = np.random.default_rng(random_state + hash(name) % 10_000)
+        name,source=meta["name"],meta["source"]
+        rng=np.random.default_rng(random_state+hash(name)%10_000)
         try:
-            cube_raw, _ = _load_envi_cube(meta["hdr"], source)
+            cube_raw,_=_load_envi_cube(meta["hdr"],source)
             if pca is not None:
-                cube_pca = apply_pca_chunked(cube_raw, pca)
+                cube_pca=apply_pca_chunked(cube_raw,pca)
                 del cube_raw; gc.collect()
             else:
-                cube_pca = cube_raw
-            B, H, W   = cube_pca.shape
-            shapes    = _load_shapes(meta["jsn"])
-            label_map = build_label_map(H, W, shapes, extrude2final, label2idx)
-            r_all, c_all = np.where(label_map >= 0)
-            labels_all   = label_map[r_all, c_all]
+                cube_pca=cube_raw
+            B,H,W=cube_pca.shape
+            shapes=_load_shapes(meta["jsn"])
+            label_map=build_label_map(H,W,shapes,extrude2final,label2idx)
+            r_all,c_all=np.where(label_map>=0)
+            labels_all=label_map[r_all,c_all]
             del label_map
-            keep     = balance_background(labels_all, bg_idx, rng, bg_ratio)
-            rows_k   = r_all[keep].astype(np.int32)
-            cols_k   = c_all[keep].astype(np.int32)
-            labels_k = labels_all[keep].astype(np.int32)
-            del r_all, c_all, labels_all, keep; gc.collect()
-            if len(rows_k) == 0:
+            keep=balance_background(labels_all,bg_idx,rng,bg_ratio)
+            rows_k=r_all[keep].astype(np.int32)
+            cols_k=c_all[keep].astype(np.int32)
+            labels_k=labels_all[keep].astype(np.int32)
+            del r_all,c_all,labels_all,keep; gc.collect()
+            if len(rows_k)==0:
                 del cube_pca; gc.collect()
                 task_queue.task_done(); continue
-            all_patches = _extract_patches_on_gpu(cube_pca, rows_k, cols_k, patch_size, device)
+            all_patches=_extract_patches_on_gpu(cube_pca,rows_k,cols_k,patch_size,device)
             del cube_pca; gc.collect()
-            n_extracted = len(all_patches)
+            n_extracted=len(all_patches)
             with write_lock:
-                with h5py.File(h5_path, 'a') as f:
-                    dset_x = f[f"{split_name}/X"]
-                    dset_y = f[f"{split_name}/y"]
-                    cur    = dset_x.shape[0]
-                    new_n  = cur + n_extracted
-                    dset_x.resize((new_n, B, patch_size, patch_size))
+                with h5py.File(h5_path,'a') as f:
+                    dset_x=f[f"{split_name}/X"]
+                    dset_y=f[f"{split_name}/y"]
+                    cur=dset_x.shape[0]
+                    new_n=cur+n_extracted
+                    dset_x.resize((new_n,B,patch_size,patch_size))
                     dset_y.resize((new_n,))
-                    dset_x[cur:new_n] = all_patches
-                    dset_y[cur:new_n] = labels_k
-            del all_patches, labels_k, rows_k, cols_k; gc.collect()
+                    dset_x[cur:new_n]=all_patches
+                    dset_y[cur:new_n]=labels_k
+            del all_patches,labels_k,rows_k,cols_k; gc.collect()
             with counters["lock"]:
-                counters["patches"] += n_extracted
-                counters["cubes"]   += 1
-                done, total, ptch = counters["cubes"], counters["total"], counters["patches"]
-                if done % 10 == 0 or done == total:
+                counters["patches"]+=n_extracted
+                counters["cubes"]+=1
+                done,total,ptch=counters["cubes"],counters["total"],counters["patches"]
+                if done%10==0 or done==total:
                     print(f"  GPU{gpu_id} | [{split_name}] {done}/{total} | {ptch:,} patches")
         except Exception as e:
             print(f"  GPU{gpu_id} | {name} : {e}")
         finally:
             task_queue.task_done(); torch.cuda.empty_cache()
 
-def extract_split_to_hdf5(meta_list, split_name, patch_size, extrude2final,
-                           label2idx, bg_ratio, random_state, pca, h5_path, balance_train=False):
+def extract_split_to_hdf5(meta_list,split_name,patch_size,extrude2final,label2idx,bg_ratio,random_state,pca,h5_path,balance_train=False):
     if not meta_list: return 0
-    shuffled  = meta_list[:]
+    shuffled=meta_list[:]
     random.shuffle(shuffled)
-    num_bands = pca.n_components_ if pca is not None else \
-                _load_envi_cube(shuffled[0]["hdr"], shuffled[0]["source"])[0].shape[0]
-    with h5py.File(h5_path, 'a') as f:
+    num_bands=pca.n_components_ if pca is not None else _load_envi_cube(shuffled[0]["hdr"],shuffled[0]["source"])[0].shape[0]
+    with h5py.File(h5_path,'a') as f:
         if split_name in f: del f[split_name]
-        f.create_dataset(f"{split_name}/X",
-                         shape=(0, num_bands, patch_size, patch_size),
-                         maxshape=(None, num_bands, patch_size, patch_size),
-                         dtype=np.float32,
-                         chunks=(HDF5_CHUNK_PATCHES, num_bands, patch_size, patch_size),
-                         compression='lzf')
-        f.create_dataset(f"{split_name}/y",
-                         shape=(0,), maxshape=(None,),
-                         dtype=np.int64, chunks=(4096,), compression='lzf')
-    task_q     = queue.Queue(maxsize=PREFETCH_QUEUE_SIZE)
-    counters   = {"cubes": 0, "patches": 0, "total": len(shuffled), "lock": threading.Lock()}
-    write_lock = threading.Lock()
-    workers    = []
+        f.create_dataset(f"{split_name}/X",shape=(0,num_bands,patch_size,patch_size),maxshape=(None,num_bands,patch_size,patch_size),dtype=np.float32,chunks=(HDF5_CHUNK_PATCHES,num_bands,patch_size,patch_size),compression='lzf')
+        f.create_dataset(f"{split_name}/y",shape=(0,),maxshape=(None,),dtype=np.int64,chunks=(4096,),compression='lzf')
+    task_q=queue.Queue(maxsize=PREFETCH_QUEUE_SIZE)
+    counters={"cubes":0,"patches":0,"total":len(shuffled),"lock":threading.Lock()}
+    write_lock=threading.Lock()
+    workers=[]
     for gpu_id in range(NUM_GPUS):
-        t = threading.Thread(target=_gpu_worker,
-                             args=(gpu_id, task_q, h5_path, split_name, patch_size,
-                                   extrude2final, label2idx, bg_ratio, random_state,
-                                   pca, write_lock, counters), daemon=True)
+        t=threading.Thread(target=_gpu_worker,args=(gpu_id,task_q,h5_path,split_name,patch_size,extrude2final,label2idx,bg_ratio,random_state,pca,write_lock,counters),daemon=True)
         t.start(); workers.append(t)
     for meta in shuffled: task_q.put(meta)
     for _ in range(NUM_GPUS): task_q.put(None)
     for t in workers: t.join()
-    total_patches = counters["patches"]
-    if balance_train and split_name == "train" and total_patches > 0:
-        total_patches = _balance_hdf5_streaming(h5_path, split_name, patch_size, num_bands, random_state)
+    total_patches=counters["patches"]
+    if balance_train and split_name=="train" and total_patches>0:
+        total_patches=_balance_hdf5_streaming(h5_path,split_name,patch_size,num_bands,random_state)
     return total_patches
 
-def _balance_hdf5_streaming(h5_path, split_name, patch_size, num_bands, random_state, read_chunk=50_000):
-    with h5py.File(h5_path, 'r') as f:
-        y_all = f[f"{split_name}/y"][:]
-    by_label = defaultdict(list)
-    for i, lbl in enumerate(y_all): by_label[int(lbl)].append(i)
+def _balance_hdf5_streaming(h5_path,split_name,patch_size,num_bands,random_state,read_chunk=50_000):
+    with h5py.File(h5_path,'r') as f:
+        y_all=f[f"{split_name}/y"][:]
+    by_label=defaultdict(list)
+    for i,lbl in enumerate(y_all): by_label[int(lbl)].append(i)
     del y_all
-    min_count = min(len(v) for v in by_label.values())
-    rng = random.Random(random_state)
-    kept_idx = []
-    for lbl, idxs in sorted(by_label.items()):
+    min_count=min(len(v) for v in by_label.values())
+    rng=random.Random(random_state)
+    kept_idx=[]
+    for lbl,idxs in sorted(by_label.items()):
         rng.shuffle(idxs); kept_idx.extend(idxs[:min_count])
     rng.shuffle(kept_idx)
-    kept_idx    = np.array(kept_idx, dtype=np.int64)
-    sorted_kept = kept_idx[np.argsort(kept_idx)]
-    n_new = len(kept_idx)
-    tmp   = f"{split_name}_tmp"
-    with h5py.File(h5_path, 'a') as f:
+    kept_idx=np.array(kept_idx,dtype=np.int64)
+    sorted_kept=kept_idx[np.argsort(kept_idx)]
+    n_new=len(kept_idx)
+    tmp=f"{split_name}_tmp"
+    with h5py.File(h5_path,'a') as f:
         if tmp in f: del f[tmp]
-        f.create_dataset(f"{tmp}/X",
-                         shape=(n_new, num_bands, patch_size, patch_size),
-                         dtype=np.float32,
-                         chunks=(HDF5_CHUNK_PATCHES, num_bands, patch_size, patch_size),
-                         compression='lzf')
-        f.create_dataset(f"{tmp}/y",
-                         shape=(n_new,), dtype=np.int64, chunks=(4096,), compression='lzf')
-    for cs in range(0, n_new, read_chunk):
-        ce  = min(cs + read_chunk, n_new)
-        idx = sorted_kept[cs:ce]
-        with h5py.File(h5_path, 'r') as f:
-            Xc = f[f"{split_name}/X"][idx]
-            yc = f[f"{split_name}/y"][idx]
-        with h5py.File(h5_path, 'a') as f:
-            f[f"{tmp}/X"][cs:ce] = Xc
-            f[f"{tmp}/y"][cs:ce] = yc
-        del Xc, yc; gc.collect()
-    with h5py.File(h5_path, 'a') as f:
-        del f[split_name]; f.move(tmp, split_name)
+        f.create_dataset(f"{tmp}/X",shape=(n_new,num_bands,patch_size,patch_size),dtype=np.float32,chunks=(HDF5_CHUNK_PATCHES,num_bands,patch_size,patch_size),compression='lzf')
+        f.create_dataset(f"{tmp}/y",shape=(n_new,),dtype=np.int64,chunks=(4096,),compression='lzf')
+    for cs in range(0,n_new,read_chunk):
+        ce=min(cs+read_chunk,n_new)
+        idx=sorted_kept[cs:ce]
+        with h5py.File(h5_path,'r') as f:
+            Xc=f[f"{split_name}/X"][idx]
+            yc=f[f"{split_name}/y"][idx]
+        with h5py.File(h5_path,'a') as f:
+            f[f"{tmp}/X"][cs:ce]=Xc
+            f[f"{tmp}/y"][cs:ce]=yc
+        del Xc,yc; gc.collect()
+    with h5py.File(h5_path,'a') as f:
+        del f[split_name]; f.move(tmp,split_name)
     return n_new
 
 
-class RamBlock(Dataset):
-    def __init__(self, X, y, shuffle=True, seed=0):
-        self.X       = X
-        self.y       = y
-        self.length  = len(y)
-        self.shuffle = shuffle
-        self.seed    = seed
-        self._order  = list(range(self.length))
+class HybridDataset(Dataset):
+    def __init__(self,h5_path,split_name,n_in_ram,shuffle=True,seed=0):
+        import time as _t
+        self.h5_path=str(h5_path)
+        self.split_name=split_name
+        self.shuffle=shuffle
+        self.seed=seed
+        with h5py.File(self.h5_path,'r') as f:
+            self.total=int(f[f"{split_name}/y"].shape[0])
+            self.n_ram=min(self.total,n_in_ram)
+            self.n_disk=self.total-self.n_ram
+            if self.n_ram>0:
+                t0=_t.perf_counter()
+                self.X_ram=f[f"{split_name}/X"][:self.n_ram]
+                self.y_ram=f[f"{split_name}/y"][:self.n_ram]
+                print(f"  [{split_name}] RAM={self.n_ram:,} HDF5={self.n_disk:,} charge={_t.perf_counter()-t0:.1f}s")
+            else:
+                self.X_ram=None
+                self.y_ram=None
+                print(f"  [{split_name}] RAM=0 HDF5={self.n_disk:,}")
+        self._order=list(range(self.total))
         if shuffle:
             random.Random(seed).shuffle(self._order)
 
-    def reshuffle(self, epoch):
-        random.Random(self.seed + epoch * 1_000_003).shuffle(self._order)
+    def reshuffle(self,epoch):
+        random.Random(self.seed+epoch*1_000_003).shuffle(self._order)
 
-    def __len__(self): return self.length
+    def __len__(self):
+        return self.total
 
-    def __getitem__(self, pos):
-        idx = self._order[pos]
-        X   = torch.from_numpy(self.X[idx].astype(np.float32)).unsqueeze(0)
-        y   = int(self.y[idx])
-        return X, torch.tensor(y, dtype=torch.long)
-
-
-class ChunkedHDF5Manager:
-    """
-    Gere le chargement sequentiel du HDF5 en blocs RAM.
-
-    Le dataset est divise en N blocs de taille max_ram_gb.
-    A chaque appel de next_block(), le bloc suivant est charge en RAM
-    et retourne sous forme de RamBlock pret pour le DataLoader.
-
-    Pour DDP : chaque rank travaille sur une tranche differente du HDF5.
-    Tous les ranks ont le meme nombre de blocs (garantit par floor division).
-    """
-    def __init__(self, h5_path, split_name, rank, world_size, max_ram_gb, shuffle=True, seed=0):
-        self.h5_path    = str(h5_path)
-        self.split_name = split_name
-        self.rank       = rank
-        self.world_size = world_size
-        self.shuffle    = shuffle
-        self.seed       = seed
-
-        with h5py.File(self.h5_path, 'r') as f:
-            total       = int(f[f"{split_name}/y"].shape[0])
-            x_shape     = tuple(f[f"{split_name}/X"].shape[1:])
-            self.patch_bytes = int(np.prod(x_shape)) * 4
-
-        rank_size      = total // world_size
-        self.rank_start = rank * rank_size
-        self.rank_end   = self.rank_start + rank_size
-
-        self.rank_total    = rank_size
-        self.max_per_block = max(1, int(max_ram_gb * 1e9 / self.patch_bytes))
-        self.n_blocks      = math.ceil(self.rank_total / self.max_per_block)
-
-        self._block_idx    = 0
-        self._epoch        = 0
-        self._block_order  = list(range(self.n_blocks))
-
-        if rank == 0:
-            gb_rank  = rank_size * self.patch_bytes / 1e9
-            gb_block = min(self.max_per_block, rank_size) * self.patch_bytes / 1e9
-            print(f"  ChunkedHDF5Manager [{split_name}]")
-            print(f"    total={total:,}  par_rank={rank_size:,} ({gb_rank:.1f}GB)")
-            print(f"    max_ram={max_ram_gb:.0f}GB -> {self.n_blocks} blocs x ~{gb_block:.1f}GB/bloc")
-
-    def set_epoch(self, epoch):
-        self._epoch     = epoch
-        self._block_idx = 0
-        if self.shuffle:
-            rng = random.Random(self.seed + self.rank + epoch * 999_983)
-            rng.shuffle(self._block_order)
-
-    @property
-    def n_total_blocks(self):
-        return self.n_blocks
-
-    @property
-    def current_block_idx(self):
-        return self._block_idx
-
-    def has_next(self):
-        return self._block_idx < self.n_blocks
-
-    def next_block(self):
-        bid        = self._block_order[self._block_idx]
-        local_s    = bid * self.max_per_block
-        local_e    = min(local_s + self.max_per_block, self.rank_total)
-        global_s   = self.rank_start + local_s
-        global_e   = self.rank_start + local_e
-        n          = global_e - global_s
-
-        import time as _t
-        t0 = _t.perf_counter()
-        with h5py.File(self.h5_path, 'r') as f:
-            X = f[f"{self.split_name}/X"][global_s:global_e]
-            y = f[f"{self.split_name}/y"][global_s:global_e]
-        elapsed = _t.perf_counter() - t0
-
-        if self.rank == 0:
-            gb = n * self.patch_bytes / 1e9
-            print(f"  Bloc {self._block_idx+1}/{self.n_blocks} charge : "
-                  f"{n:,} patches ({gb:.1f}GB) en {elapsed:.1f}s")
-
-        self._block_idx += 1
-        block_seed = self.seed + self.rank + self._epoch * 999_983 + bid * 7
-        return RamBlock(X, y, shuffle=self.shuffle, seed=block_seed)
+    def __getitem__(self,pos):
+        real_idx=self._order[pos]
+        if real_idx<self.n_ram:
+            X=torch.from_numpy(self.X_ram[real_idx].astype(np.float32)).unsqueeze(0)
+            y=int(self.y_ram[real_idx])
+        else:
+            f=_get_h5(self.h5_path)
+            X=torch.from_numpy(f[f"{self.split_name}/X"][real_idx].astype(np.float32)).unsqueeze(0)
+            y=int(f[f"{self.split_name}/y"][real_idx])
+        return X,torch.tensor(y,dtype=torch.long)
 
 
 def worker_init_fn(worker_id):
-    seed = (torch.initial_seed() + worker_id) % (2**32)
+    seed=(torch.initial_seed()+worker_id)%(2**32)
     np.random.seed(seed); random.seed(seed)
 
-def make_block_loader(block_ds, batch_size, num_workers, prefetch, mp_ctx, pin):
-    kw = dict(
-        num_workers        = num_workers,
-        pin_memory         = pin,
-        worker_init_fn     = worker_init_fn,
-        persistent_workers = False,
-        prefetch_factor    = prefetch if num_workers > 0 else None,
-        drop_last          = True,
-        shuffle            = False,
-    )
+def build_loaders(real_dir=None,aug_dir=None,mapping_path="mapping.json",
+                  split_mode="aug_real",use_pca=True,pca_components=30,
+                  patch_size=13,test_ratio=0.15,val_ratio=0.15,
+                  batch_size=None,random_state=345,fit_max_pixels=500_000,
+                  num_workers=None,bg_ratio=1.5,cache_dir="cache",
+                  force_recompute=False,balance_train=False,max_ram_gb=None):
+
+    extrude2final,class_names,label2idx=load_mapping(mapping_path)
+    cache_dir=Path(cache_dir)
+    cache_dir.mkdir(parents=True,exist_ok=True)
+    config_str=(f"{real_dir}_{aug_dir}_{split_mode}_{patch_size}_{random_state}"
+                f"_{bg_ratio}_{pca_components if use_pca else 0}_{balance_train}")
+    config_hash=hashlib.md5(config_str.encode()).hexdigest()[:12]
+    h5_path=cache_dir/f"patches_{config_hash}.h5"
+
+    if not force_recompute and h5_path.exists():
+        with h5py.File(h5_path,'r') as f:
+            total_train=int(f['train/y'].shape[0])
+            x_shape=tuple(f['train/X'].shape[1:])
+            num_bands=int(f['train/X'].shape[1])
+        patch_bytes=int(np.prod(x_shape))*4
+        cfg=server_config(NUM_GPUS,patch_bytes,total_train)
+        if max_ram_gb is not None:
+            cfg["n_in_ram"]=min(total_train,int(max_ram_gb*1e9/patch_bytes))
+        if batch_size is not None: cfg["batch_size"]=batch_size
+        if num_workers is not None: cfg["num_workers"]=num_workers
+        return _make_loaders(h5_path,class_names,label2idx,patch_size,num_bands,
+                             balance_train,cfg,random_state)
+
+    plots_meta=collect_plots_meta(real_dir=real_dir,aug_dir=aug_dir)
+    train_meta,val_meta,test_meta=split_plots(plots_meta,split_mode,val_ratio,test_ratio,random_state)
+    pca_model=None
+    if use_pca:
+        real_meta=[m for m in plots_meta if m["source"]=="real"]
+        if real_meta:
+            pca_model=fit_or_load_pca(real_meta,pca_components,cache_dir,config_hash,fit_max_pixels)
+    for meta_list,sname,do_balance in [(train_meta,"train",balance_train),(val_meta,"val",False),(test_meta,"test",False)]:
+        extract_split_to_hdf5(meta_list,sname,patch_size,extrude2final,label2idx,bg_ratio,random_state,pca_model,str(h5_path),balance_train=do_balance)
+    with h5py.File(h5_path,'a') as f:
+        f.attrs['class_names']=json.dumps(class_names)
+        f.attrs['label2idx']=json.dumps(label2idx)
+        f.attrs['patch_size']=patch_size
+        f.attrs['num_bands']=pca_components if use_pca else -1
+        f.attrs['created_at']=datetime.now().isoformat()
+
+    with h5py.File(h5_path,'r') as f:
+        total_train=int(f['train/y'].shape[0])
+        x_shape=tuple(f['train/X'].shape[1:])
+        num_bands=int(f['train/X'].shape[1])
+    patch_bytes=int(np.prod(x_shape))*4
+    cfg=server_config(NUM_GPUS,patch_bytes,total_train)
+    if max_ram_gb is not None:
+        cfg["n_in_ram"]=min(total_train,int(max_ram_gb*1e9/patch_bytes))
+    if batch_size is not None: cfg["batch_size"]=batch_size
+    if num_workers is not None: cfg["num_workers"]=num_workers
+    return _make_loaders(h5_path,class_names,label2idx,patch_size,num_bands,
+                         balance_train,cfg,random_state)
+
+def _make_loaders(h5_path,class_names,label2idx,patch_size,num_bands,balance_train,cfg,random_state):
+    n_in_ram=cfg["n_in_ram"]
+    batch_size=cfg["batch_size"]
+    num_workers=cfg["num_workers"]
+    prefetch=cfg["prefetch"]
+    mp_ctx=cfg["mp_ctx"]
+    with h5py.File(h5_path,'r') as f:
+        total_val=int(f['val/y'].shape[0])
+        total_test=int(f['test/y'].shape[0])
+        x_shape=tuple(f['train/X'].shape[1:])
+    patch_bytes=int(np.prod(x_shape))*4
+    ram_avail_gb=psutil.virtual_memory().available/1e9
+    ram_left_gb=ram_avail_gb*0.78-(n_in_ram*patch_bytes/1e9)
+    n_val_ram=min(total_val,max(0,int(ram_left_gb*0.4*1e9/patch_bytes)))
+    n_test_ram=min(total_test,max(0,int(ram_left_gb*0.4*1e9/patch_bytes)))
+    train_ds=HybridDataset(str(h5_path),'train',n_in_ram,shuffle=True,seed=random_state)
+    val_ds=HybridDataset(str(h5_path),'val',n_val_ram,shuffle=False,seed=0)
+    test_ds=HybridDataset(str(h5_path),'test',n_test_ram,shuffle=False,seed=0)
+    pin=torch.cuda.is_available()
+    kw=dict(num_workers=num_workers,pin_memory=pin,worker_init_fn=worker_init_fn,
+            persistent_workers=(num_workers>0),prefetch_factor=prefetch if num_workers>0 else None,
+            drop_last=True,shuffle=False)
     if mp_ctx is not None:
-        kw["multiprocessing_context"] = mp_ctx
-    return DataLoader(block_ds, batch_size=batch_size, **kw)
+        kw["multiprocessing_context"]=mp_ctx
+    train_loader=DataLoader(train_ds,batch_size=batch_size,**kw)
+    val_loader=DataLoader(val_ds,batch_size=batch_size*2,**kw)
+    test_loader=DataLoader(test_ds,batch_size=batch_size*2,**kw)
+    print(f"  Steps/epoch={len(train_loader)}  batch_total={batch_size}  workers={num_workers}")
+    meta={"class_names":class_names,"label2idx":label2idx,"num_classes":len(class_names),
+          "num_bands":num_bands,"patch_size":patch_size,"balance_train":balance_train,"cfg":cfg}
+    return train_loader,val_loader,test_loader,meta
 
-def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json",
-                  split_mode="aug_real", use_pca=True, pca_components=30,
-                  patch_size=13, test_ratio=0.15, val_ratio=0.15,
-                  batch_size=None, random_state=345, fit_max_pixels=500_000,
-                  num_workers=None, bg_ratio=1.5, cache_dir="cache",
-                  force_recompute=False, balance_train=False,
-                  rank=0, world_size=1, ram_cache_gb=None):
-
-    server = detect_server()
-    cfg    = auto_config(server, world_size=world_size)
-
-    if batch_size  is None: batch_size  = cfg["batch_size"]
-    if num_workers is None: num_workers = cfg["num_workers"]
-    if ram_cache_gb is None: ram_cache_gb = cfg["ram_per_rank"]
-
-    if rank == 0:
-        print(f"\n  {cfg['strategy']}  RAM={server['ram_avail_gb']:.0f}GB"
-              f"  GPUs={server['n_gpus']}  batch={batch_size}"
-              f"  workers={num_workers}  ram/rank={ram_cache_gb:.0f}GB")
-
-    extrude2final, class_names, label2idx = load_mapping(mapping_path)
-    cache_dir   = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    config_str  = (f"{real_dir}_{aug_dir}_{split_mode}_{patch_size}_{random_state}"
-                   f"_{bg_ratio}_{pca_components if use_pca else 0}_{balance_train}")
-    config_hash = hashlib.md5(config_str.encode()).hexdigest()[:12]
-    h5_path     = cache_dir / f"patches_{config_hash}.h5"
-
-    if rank == 0 and (force_recompute or not h5_path.exists()):
-        plots_meta = collect_plots_meta(real_dir=real_dir, aug_dir=aug_dir)
-        train_meta, val_meta, test_meta = split_plots(
-            plots_meta, split_mode, val_ratio, test_ratio, random_state)
-        pca_model = None
-        if use_pca:
-            real_meta = [m for m in plots_meta if m["source"] == "real"]
-            if real_meta:
-                pca_model = fit_or_load_pca(real_meta, pca_components, cache_dir,
-                                            config_hash, fit_max_pixels)
-        for meta_list, sname, do_balance in [
-            (train_meta, "train", balance_train),
-            (val_meta,   "val",   False),
-            (test_meta,  "test",  False),
-        ]:
-            extract_split_to_hdf5(meta_list, sname, patch_size, extrude2final, label2idx,
-                                  bg_ratio, random_state, pca_model, str(h5_path),
-                                  balance_train=do_balance)
-        with h5py.File(h5_path, 'a') as f:
-            f.attrs['class_names'] = json.dumps(class_names)
-            f.attrs['label2idx']   = json.dumps(label2idx)
-            f.attrs['patch_size']  = patch_size
-            f.attrs['num_bands']   = pca_components if use_pca else -1
-            f.attrs['created_at']  = datetime.now().isoformat()
-
-    if world_size > 1:
-        import torch.distributed as dist
-        dist.barrier()
-
-    with h5py.File(h5_path, 'r') as f:
-        num_bands = int(f['train/X'].shape[1])
-
-    train_mgr = ChunkedHDF5Manager(h5_path, 'train', rank, world_size,
-                                   ram_cache_gb, shuffle=True, seed=random_state)
-    val_mgr   = ChunkedHDF5Manager(h5_path, 'val',   rank, world_size,
-                                   max(1.0, ram_cache_gb * 0.1), shuffle=False, seed=0)
-    test_mgr  = ChunkedHDF5Manager(h5_path, 'test',  rank, world_size,
-                                   max(1.0, ram_cache_gb * 0.1), shuffle=False, seed=0)
-
-    meta = {
-        "class_names":   class_names,
-        "label2idx":     label2idx,
-        "num_classes":   len(class_names),
-        "num_bands":     num_bands,
-        "patch_size":    patch_size,
-        "balance_train": balance_train,
-        "train_sampler": None,
-        "train_mgr":     train_mgr,
-        "val_mgr":       val_mgr,
-        "test_mgr":      test_mgr,
-        "batch_size":    batch_size,
-        "num_workers":   num_workers,
-        "prefetch":      cfg["prefetch"],
-        "mp_ctx":        cfg["mp_ctx"],
-        "pin":           torch.cuda.is_available(),
-    }
-    return meta
-
-def print_cache_stats(meta, epoch):
+def print_cache_stats(meta,epoch):
     pass
 
+if __name__=="__main__":
+    import argparse
+    p=argparse.ArgumentParser()
+    p.add_argument("--real_dir"); p.add_argument("--aug_dir")
+    p.add_argument("--mapping_path",default="mapping.json")
+    p.add_argument("--cache_dir",default="cache")
+    p.add_argument("--max_ram_gb",type=float,default=None)
+    args=p.parse_args()
+    if not args.real_dir and not args.aug_dir: p.error("requis: --real_dir ou --aug_dir")
+    train_loader,val_loader,test_loader,meta=build_loaders(
+        real_dir=args.real_dir,aug_dir=args.aug_dir,
+        mapping_path=args.mapping_path,cache_dir=args.cache_dir,
+        max_ram_gb=args.max_ram_gb)
+    X_b,y_b=next(iter(train_loader))
+    print(f"Batch: {X_b.shape} | Labels: {y_b.shape}")
 
-
-
-import argparse, math, os, time, platform
-from contextlib import nullcontext
+import argparse,math,os,time,platform
 from copy import deepcopy
 from pathlib import Path
-
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.cuda.amp import GradScaler,autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from sklearn.metrics import confusion_matrix, accuracy_score, cohen_kappa_score
-
-from dataset import build_loaders, make_block_loader
+from sklearn.metrics import confusion_matrix,accuracy_score,cohen_kappa_score
+from dataset import build_loaders
 from ssfnet import SSFTTnet
 
-
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--real_dir",       default=None)
-    p.add_argument("--aug_dir",        default=None)
-    p.add_argument("--mapping_path",   default="mapping.json")
-    p.add_argument("--cache_dir",      default="cache")
-    p.add_argument("--split_mode",     default="aug_real", choices=["aug_real","shuffle"])
-    p.add_argument("--use_pca",        action="store_true", default=True)
-    p.add_argument("--no_pca",         action="store_false", dest="use_pca")
-    p.add_argument("--pca_components", type=int,   default=30)
-    p.add_argument("--patch_size",     type=int,   default=13)
-    p.add_argument("--val_ratio",      type=float, default=0.15)
-    p.add_argument("--test_ratio",     type=float, default=0.15)
-    p.add_argument("--bg_ratio",       type=float, default=1.5)
-    p.add_argument("--random_state",   type=int,   default=345)
-    p.add_argument("--fit_max_pixels", type=int,   default=500_000)
-    p.add_argument("--balance_train",  action="store_true")
-    p.add_argument("--batch_size",     type=int,   default=None)
-    p.add_argument("--num_workers",    type=int,   default=None)
-    p.add_argument("--ram_cache_gb",   type=float, default=None)
-    p.add_argument("--epochs",         type=int,   default=100)
-    p.add_argument("--lr",             type=float, default=1e-3)
-    p.add_argument("--weight_decay",   type=float, default=1e-4)
-    p.add_argument("--grad_clip",      type=float, default=1.0)
-    p.add_argument("--warmup_epochs",  type=int,   default=3)
-    p.add_argument("--patience",       type=int,   default=15)
-    p.add_argument("--label_smooth",   type=float, default=0.05)
-    p.add_argument("--grad_accum",     type=int,   default=1)
-    p.add_argument("--amp",            action="store_true", default=True)
-    p.add_argument("--no_amp",         action="store_false", dest="amp")
-    p.add_argument("--compile",        action="store_true", default=False)
-    p.add_argument("--use_ema",        action="store_true", default=True)
-    p.add_argument("--ema_decay",      type=float, default=0.9998)
-    p.add_argument("--num_tokens",     type=int,   default=4)
-    p.add_argument("--dim",            type=int,   default=64)
-    p.add_argument("--depth",          type=int,   default=1)
-    p.add_argument("--heads",          type=int,   default=8)
-    p.add_argument("--mlp_dim",        type=int,   default=8)
-    p.add_argument("--dropout",        type=float, default=0.1)
-    p.add_argument("--emb_dropout",    type=float, default=0.1)
-    p.add_argument("--checkpoint_dir", default="checkpoints")
-    p.add_argument("--resume",         default=None)
-    p.add_argument("--save_every",     type=int,   default=5)
+    p=argparse.ArgumentParser()
+    p.add_argument("--real_dir",default=None)
+    p.add_argument("--aug_dir",default=None)
+    p.add_argument("--mapping_path",default="mapping.json")
+    p.add_argument("--cache_dir",default="cache")
+    p.add_argument("--split_mode",default="aug_real",choices=["aug_real","shuffle"])
+    p.add_argument("--use_pca",action="store_true",default=True)
+    p.add_argument("--no_pca",action="store_false",dest="use_pca")
+    p.add_argument("--pca_components",type=int,default=30)
+    p.add_argument("--patch_size",type=int,default=13)
+    p.add_argument("--val_ratio",type=float,default=0.15)
+    p.add_argument("--test_ratio",type=float,default=0.15)
+    p.add_argument("--bg_ratio",type=float,default=1.5)
+    p.add_argument("--random_state",type=int,default=345)
+    p.add_argument("--fit_max_pixels",type=int,default=500_000)
+    p.add_argument("--balance_train",action="store_true")
+    p.add_argument("--batch_size",type=int,default=None)
+    p.add_argument("--num_workers",type=int,default=None)
+    p.add_argument("--max_ram_gb",type=float,default=None)
+    p.add_argument("--epochs",type=int,default=100)
+    p.add_argument("--lr",type=float,default=1e-3)
+    p.add_argument("--weight_decay",type=float,default=1e-4)
+    p.add_argument("--grad_clip",type=float,default=1.0)
+    p.add_argument("--warmup_epochs",type=int,default=3)
+    p.add_argument("--patience",type=int,default=15)
+    p.add_argument("--label_smooth",type=float,default=0.05)
+    p.add_argument("--grad_accum",type=int,default=1)
+    p.add_argument("--amp",action="store_true",default=True)
+    p.add_argument("--no_amp",action="store_false",dest="amp")
+    p.add_argument("--compile",action="store_true",default=False)
+    p.add_argument("--use_ema",action="store_true",default=True)
+    p.add_argument("--ema_decay",type=float,default=0.9998)
+    p.add_argument("--num_tokens",type=int,default=4)
+    p.add_argument("--dim",type=int,default=64)
+    p.add_argument("--depth",type=int,default=1)
+    p.add_argument("--heads",type=int,default=8)
+    p.add_argument("--mlp_dim",type=int,default=8)
+    p.add_argument("--dropout",type=float,default=0.1)
+    p.add_argument("--emb_dropout",type=float,default=0.1)
+    p.add_argument("--checkpoint_dir",default="checkpoints")
+    p.add_argument("--resume",default=None)
+    p.add_argument("--save_every",type=int,default=5)
     return p.parse_args()
 
-
-def init_ddp():
-    if "RANK" in os.environ and int(os.environ.get("WORLD_SIZE", 1)) > 1:
-        dist.init_process_group(backend="nccl")
-        rank       = dist.get_rank()
-        world_size = dist.get_world_size()
-        local_rank = int(os.environ.get("LOCAL_RANK", rank))
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-    else:
-        rank, world_size, local_rank = 0, 1, 0
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return rank, world_size, local_rank, device
-
-
-def barrier(world_size):
-    if world_size > 1:
-        dist.barrier()
-
-
-def reduce_mean(t, world_size):
-    if world_size > 1:
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        t /= world_size
-    return t
-
-
 class ModelEMA:
-    def __init__(self, model, decay=0.9998):
-        self.decay  = decay
-        self.shadow = {k: v.detach().clone().cpu() for k, v in model.state_dict().items()}
+    def __init__(self,model,decay=0.9998):
+        self.decay=decay
+        self.shadow={k:v.detach().clone().cpu() for k,v in model.state_dict().items()}
 
     @torch.no_grad()
-    def update(self, model):
-        for k, v in model.state_dict().items():
-            self.shadow[k].mul_(self.decay).add_(v.detach().cpu(), alpha=1-self.decay)
+    def update(self,model):
+        m=model.module if hasattr(model,"module") else model
+        for k,v in m.state_dict().items():
+            self.shadow[k].mul_(self.decay).add_(v.detach().cpu(),alpha=1-self.decay)
 
-    def apply_to(self, model):
-        model.load_state_dict({k: v.to(next(model.parameters()).device)
-                               for k, v in self.shadow.items()})
+    def apply_to(self,model):
+        m=model.module if hasattr(model,"module") else model
+        dev=next(m.parameters()).device
+        m.load_state_dict({k:v.to(dev) for k,v in self.shadow.items()})
 
-    def state_dict(self):          return self.shadow
-    def load_state_dict(self, sd): self.shadow = sd
+    def state_dict(self): return self.shadow
+    def load_state_dict(self,sd): self.shadow=sd
 
-
-def build_scheduler(optimizer, warmup, total):
+def build_scheduler(optimizer,warmup,total):
     def lr_lambda(ep):
-        if ep < warmup:
-            return (ep + 1) / max(warmup, 1)
-        p = (ep - warmup) / max(total - warmup, 1)
-        return 0.5 * (1.0 + math.cos(math.pi * p))
-    return LambdaLR(optimizer, lr_lambda)
+        if ep<warmup:
+            return (ep+1)/max(warmup,1)
+        p=(ep-warmup)/max(total-warmup,1)
+        return 0.5*(1.0+math.cos(math.pi*p))
+    return LambdaLR(optimizer,lr_lambda)
 
-
-def run_block(model, loader, criterion, optimizer, scaler,
-              device, use_amp, grad_accum, grad_clip, train, world_size, ema=None):
+def run_epoch(model,loader,criterion,optimizer,scaler,device,use_amp,grad_accum,grad_clip,train,ema=None):
     model.train() if train else model.eval()
-    total_loss = torch.zeros(1, device=device)
-    correct    = torch.zeros(1, device=device)
-    total      = torch.zeros(1, device=device)
+    total_loss=0.0
+    correct=0
+    total=0
     optimizer.zero_grad(set_to_none=True)
-
-    for step, (X, y) in enumerate(loader):
-        X = X.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        is_last  = (step + 1) % grad_accum == 0 or (step + 1) == len(loader)
-        sync_ctx = (model.no_sync() if train and world_size > 1 and not is_last
-                    else nullcontext())
-        with sync_ctx:
-            with autocast(enabled=use_amp):
-                logits = model(X)
-                loss   = criterion(logits, y)
-                if grad_accum > 1:
-                    loss = loss / grad_accum
-            if train:
-                scaler.scale(loss).backward()
-
+    for step,(X,y) in enumerate(loader):
+        X=X.to(device,non_blocking=True)
+        y=y.to(device,non_blocking=True)
+        is_last=(step+1)%grad_accum==0 or (step+1)==len(loader)
+        with autocast(enabled=use_amp):
+            logits=model(X)
+            loss=criterion(logits,y)
+            if grad_accum>1:
+                loss=loss/grad_accum
+        if train:
+            scaler.scale(loss).backward()
         if train and is_last:
-            if grad_clip > 0:
+            if grad_clip>0:
                 scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                nn.utils.clip_grad_norm_(model.parameters(),grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             if ema is not None:
                 ema.update(model)
-
         with torch.no_grad():
-            total_loss += (loss.detach() * (grad_accum if train else 1)) * len(y)
-            correct    += (logits.detach().argmax(1) == y).sum()
-            total      += len(y)
+            total_loss+=loss.detach().item()*(grad_accum if train else 1)*len(y)
+            correct+=(logits.detach().argmax(1)==y).sum().item()
+            total+=len(y)
+    return total_loss/total,correct/total
 
-    reduce_mean(total_loss, world_size)
-    reduce_mean(correct,    world_size)
-    reduce_mean(total,      world_size)
-    return (total_loss / total).item(), (correct / total).item()
-
-
-def save_ckpt(path, epoch, model, optimizer, scheduler, scaler, ema, val_acc):
-    raw = model.module if hasattr(model, "module") else model
-    obj = {"epoch": epoch, "val_acc": val_acc,
-           "model": raw.state_dict(), "optimizer": optimizer.state_dict(),
-           "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict()}
+def save_ckpt(path,epoch,model,optimizer,scheduler,scaler,ema,val_acc):
+    raw=model.module if hasattr(model,"module") else model
+    obj={"epoch":epoch,"val_acc":val_acc,"model":raw.state_dict(),
+         "optimizer":optimizer.state_dict(),"scheduler":scheduler.state_dict(),
+         "scaler":scaler.state_dict()}
     if ema is not None:
-        obj["ema"] = ema.state_dict()
-    torch.save(obj, path)
+        obj["ema"]=ema.state_dict()
+    torch.save(obj,path)
 
-
-def load_ckpt(path, model, optimizer, scheduler, scaler, ema, device):
-    ckpt = torch.load(path, map_location=device)
-    raw  = model.module if hasattr(model, "module") else model
+def load_ckpt(path,model,optimizer,scheduler,scaler,ema,device):
+    ckpt=torch.load(path,map_location=device)
+    raw=model.module if hasattr(model,"module") else model
     raw.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     scaler.load_state_dict(ckpt["scaler"])
     if ema is not None and "ema" in ckpt:
         ema.load_state_dict(ckpt["ema"])
-    return ckpt["epoch"], ckpt["val_acc"]
+    return ckpt["epoch"],ckpt["val_acc"]
 
-
-def evaluate_on_manager(model, mgr, batch_size, num_workers, prefetch, mp_ctx, pin,
-                         device, use_amp, world_size):
+def evaluate_metrics(model,loader,device,use_amp,class_names):
     model.eval()
-    total_loss_sum = torch.zeros(1, device=device)
-    correct_sum    = torch.zeros(1, device=device)
-    total_sum      = torch.zeros(1, device=device)
-    criterion      = nn.CrossEntropyLoss()
-    mgr.set_epoch(0)
-
-    while mgr.has_next():
-        block_ds = mgr.next_block()
-        loader   = make_block_loader(block_ds, batch_size * 2, num_workers, prefetch, mp_ctx, pin)
-        with torch.no_grad():
-            for X, y in loader:
-                X = X.to(device, non_blocking=True)
-                y = y.to(device, non_blocking=True)
-                with autocast(enabled=use_amp):
-                    logits = model(X)
-                loss = criterion(logits, y)
-                total_loss_sum += loss.detach() * len(y)
-                correct_sum    += (logits.argmax(1) == y).sum()
-                total_sum      += len(y)
-        del block_ds, loader; gc_collect()
-
-    reduce_mean(total_loss_sum, world_size)
-    reduce_mean(correct_sum,    world_size)
-    reduce_mean(total_sum,      world_size)
-    return (total_loss_sum / total_sum).item(), (correct_sum / total_sum).item()
-
-
-def gc_collect():
-    import gc
-    gc.collect()
-
-
-def evaluate_metrics(model, mgr, batch_size, num_workers, prefetch, mp_ctx, pin,
-                      device, use_amp, class_names):
-    model.eval()
-    all_pred, all_true = [], []
-    mgr.set_epoch(0)
-    while mgr.has_next():
-        block_ds = mgr.next_block()
-        loader   = make_block_loader(block_ds, batch_size * 2, num_workers, prefetch, mp_ctx, pin)
-        with torch.no_grad():
-            for X, y in loader:
-                X = X.to(device, non_blocking=True)
-                with autocast(enabled=use_amp):
-                    logits = model(X)
-                all_pred.extend(logits.argmax(1).cpu().numpy())
-                all_true.extend(y.numpy())
-        del block_ds, loader; gc_collect()
-
-    all_pred = np.array(all_pred)
-    all_true = np.array(all_true)
-    oa       = accuracy_score(all_true, all_pred) * 100
-    kappa    = cohen_kappa_score(all_true, all_pred) * 100
-    cm       = confusion_matrix(all_true, all_pred)
-    per_cls  = np.diag(cm) / np.maximum(cm.sum(axis=1), 1) * 100
-    aa       = per_cls.mean()
-    return oa, aa, kappa, cm, per_cls
-
+    all_pred,all_true=[],[]
+    with torch.no_grad():
+        for X,y in loader:
+            X=X.to(device,non_blocking=True)
+            with autocast(enabled=use_amp):
+                logits=model(X)
+            all_pred.extend(logits.argmax(1).cpu().numpy())
+            all_true.extend(y.numpy())
+    all_pred=np.array(all_pred)
+    all_true=np.array(all_true)
+    oa=accuracy_score(all_true,all_pred)*100
+    kappa=cohen_kappa_score(all_true,all_pred)*100
+    cm=confusion_matrix(all_true,all_pred)
+    per_cls=np.diag(cm)/np.maximum(cm.sum(axis=1),1)*100
+    aa=per_cls.mean()
+    return oa,aa,kappa,cm,per_cls
 
 def main():
-    args = parse_args()
-    rank, world_size, local_rank, device = init_ddp()
-    main_proc = (rank == 0)
-
+    args=parse_args()
     if not args.real_dir and not args.aug_dir:
         raise ValueError("Fournir --real_dir ou --aug_dir")
-
-    torch.backends.cudnn.benchmark        = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32       = True
-
-    if main_proc:
-        print(f"\n{'='*65}")
-        print(f"  OS={platform.system()}  GPUs={world_size}  AMP={args.amp}")
-
-    barrier(world_size)
-
-    meta = build_loaders(
-        real_dir       = args.real_dir,
-        aug_dir        = args.aug_dir,
-        mapping_path   = args.mapping_path,
-        split_mode     = args.split_mode,
-        use_pca        = args.use_pca,
-        pca_components = args.pca_components,
-        patch_size     = args.patch_size,
-        test_ratio     = args.test_ratio,
-        val_ratio      = args.val_ratio,
-        batch_size     = args.batch_size,
-        random_state   = args.random_state,
-        fit_max_pixels = args.fit_max_pixels,
-        num_workers    = args.num_workers,
-        bg_ratio       = args.bg_ratio,
-        cache_dir      = args.cache_dir,
-        balance_train  = args.balance_train,
-        rank           = rank,
-        world_size     = world_size,
-        ram_cache_gb   = args.ram_cache_gb,
-    )
-
-    barrier(world_size)
-
-    train_mgr    = meta["train_mgr"]
-    val_mgr      = meta["val_mgr"]
-    test_mgr     = meta["test_mgr"]
-    batch_size   = args.batch_size  if args.batch_size  else meta["batch_size"]
-    num_workers  = args.num_workers if args.num_workers else meta["num_workers"]
-    prefetch     = meta["prefetch"]
-    mp_ctx       = meta["mp_ctx"]
-    pin          = meta["pin"]
-    n_blocks     = train_mgr.n_total_blocks
-
-    eff_batch = batch_size * world_size * (args.grad_accum or 1)
-    if main_proc:
-        print(f"  batch/GPU={batch_size}  eff={eff_batch:,}  blocs/epoque={n_blocks}")
-        print(f"{'='*65}\n")
-
-    barrier(world_size)
-
-    model = SSFTTnet(
-        in_channels = 1,
-        num_classes = meta["num_classes"],
-        num_tokens  = args.num_tokens,
-        dim         = args.dim,
-        depth       = args.depth,
-        heads       = args.heads,
-        mlp_dim     = args.mlp_dim,
-        dropout     = args.dropout,
-        emb_dropout = args.emb_dropout,
-    ).to(device)
-
-    barrier(world_size)
-
-    if args.compile and hasattr(torch, "compile"):
-        model = torch.compile(model, mode="max-autotune")
-
-    if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
-                    find_unused_parameters=False)
-
-    ema       = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
-    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smooth)
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = build_scheduler(optimizer, args.warmup_epochs, args.epochs)
-    scaler    = GradScaler(enabled=args.amp)
-
-    start_epoch, best_val_acc, patience_cnt = 1, 0.0, 0
-    ckpt_dir = Path(args.checkpoint_dir)
-    if main_proc:
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-
+    n_gpus=torch.cuda.device_count()
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark=True
+    torch.backends.cuda.matmul.allow_tf32=True
+    torch.backends.cudnn.allow_tf32=True
+    print(f"\n{'='*65}")
+    print(f"  OS={platform.system()}  GPUs={n_gpus}  device={device}  AMP={args.amp}")
+    train_loader,val_loader,test_loader,meta=build_loaders(
+        real_dir=args.real_dir,aug_dir=args.aug_dir,mapping_path=args.mapping_path,
+        split_mode=args.split_mode,use_pca=args.use_pca,pca_components=args.pca_components,
+        patch_size=args.patch_size,test_ratio=args.test_ratio,val_ratio=args.val_ratio,
+        batch_size=args.batch_size,random_state=args.random_state,
+        fit_max_pixels=args.fit_max_pixels,num_workers=args.num_workers,
+        bg_ratio=args.bg_ratio,cache_dir=args.cache_dir,balance_train=args.balance_train,
+        max_ram_gb=args.max_ram_gb)
+    model=SSFTTnet(in_channels=1,num_classes=meta["num_classes"],num_tokens=args.num_tokens,
+                   dim=args.dim,depth=args.depth,heads=args.heads,mlp_dim=args.mlp_dim,
+                   dropout=args.dropout,emb_dropout=args.emb_dropout).to(device)
+    if n_gpus>1:
+        model=nn.DataParallel(model)
+        print(f"  DataParallel sur {n_gpus} GPUs")
+    if args.compile and hasattr(torch,"compile"):
+        model=torch.compile(model,mode="max-autotune")
+        print("  torch.compile actif")
+    n_params=sum(p.numel() for p in model.parameters() if p.requires_grad)
+    batch_size=train_loader.batch_size
+    eff_batch=batch_size*args.grad_accum
+    print(f"  Params={n_params:,}  Classes={meta['num_classes']}  Bandes={meta['num_bands']}")
+    print(f"  batch={batch_size}  grad_accum={args.grad_accum}  eff={eff_batch:,}")
+    print(f"{'='*65}\n")
+    ema=ModelEMA(model,decay=args.ema_decay) if args.use_ema else None
+    criterion=nn.CrossEntropyLoss(label_smoothing=args.label_smooth)
+    optimizer=AdamW(model.parameters(),lr=args.lr,weight_decay=args.weight_decay)
+    scheduler=build_scheduler(optimizer,args.warmup_epochs,args.epochs)
+    scaler=GradScaler(enabled=args.amp)
+    start_epoch,best_val_acc,patience_cnt=1,0.0,0
+    ckpt_dir=Path(args.checkpoint_dir)
+    ckpt_dir.mkdir(parents=True,exist_ok=True)
     if args.resume and Path(args.resume).exists():
-        start_epoch, best_val_acc = load_ckpt(
-            args.resume, model, optimizer, scheduler, scaler, ema, device)
-        start_epoch += 1
-
-    for epoch in range(start_epoch, args.epochs + 1):
-        t_epoch = time.perf_counter()
-
-        # ── Phase train : parcourt tous les blocs RAM ─────────────────────────
-        train_mgr.set_epoch(epoch)
-        epoch_loss = torch.zeros(1, device=device)
-        epoch_corr = torch.zeros(1, device=device)
-        epoch_tot  = torch.zeros(1, device=device)
-
-        while train_mgr.has_next():
-            block_ds = train_mgr.next_block()
-            loader   = make_block_loader(block_ds, batch_size, num_workers,
-                                         prefetch, mp_ctx, pin)
-
-            # Tous les ranks chargent leur bloc en parallele -> pas de NCCL timeout
-            # Ils font exactement le meme nombre de steps (drop_last=True dans make_block_loader)
-            bl_loss, bl_acc = run_block(
-                model, loader, criterion, optimizer, scaler,
-                device, args.amp, args.grad_accum, args.grad_clip,
-                train=True, world_size=world_size, ema=ema)
-
-            n_bl = len(block_ds)
-            epoch_loss += bl_loss * n_bl
-            epoch_corr += bl_acc  * n_bl
-            epoch_tot  += n_bl
-
-            del block_ds, loader; gc_collect()
-
-            # Barrier apres chaque bloc : tous les ranks avancent ensemble
-            barrier(world_size)
-
-        tr_loss = (epoch_loss / epoch_tot).item() if epoch_tot.item() > 0 else 0.0
-        tr_acc  = (epoch_corr / epoch_tot).item() if epoch_tot.item() > 0 else 0.0
-
-        # ── Phase val : parcourt tous les blocs val ───────────────────────────
-        raw     = model.module if hasattr(model, "module") else model
-        orig_sd = deepcopy(raw.state_dict())
+        start_epoch,best_val_acc=load_ckpt(args.resume,model,optimizer,scheduler,scaler,ema,device)
+        start_epoch+=1
+        print(f"  Resume depuis {args.resume} (epoch {start_epoch})")
+    for epoch in range(start_epoch,args.epochs+1):
+        train_ds=train_loader.dataset
+        if hasattr(train_ds,'reshuffle'):
+            train_ds.reshuffle(epoch)
+        t0=time.perf_counter()
+        tr_loss,tr_acc=run_epoch(model,train_loader,criterion,optimizer,scaler,
+                                 device,args.amp,args.grad_accum,args.grad_clip,train=True,ema=ema)
+        raw=model.module if hasattr(model,"module") else model
+        orig_sd=deepcopy(raw.state_dict())
         if ema is not None:
-            ema.apply_to(raw)
-
-        va_loss, va_acc = evaluate_on_manager(
-            model, val_mgr, batch_size, num_workers, prefetch, mp_ctx, pin,
-            device, args.amp, world_size)
-
+            ema.apply_to(model)
+        with torch.no_grad():
+            va_loss,va_acc=run_epoch(model,val_loader,criterion,optimizer,scaler,
+                                     device,args.amp,1,0,train=False)
         if ema is not None:
             raw.load_state_dict(orig_sd)
-
         scheduler.step()
-
-        if main_proc:
-            elapsed = time.perf_counter() - t_epoch
-            lr_now  = optimizer.param_groups[0]["lr"]
-            vram    = torch.cuda.max_memory_allocated(device) / 1e9 if torch.cuda.is_available() else 0
-            torch.cuda.reset_peak_memory_stats(device)
-            print(f"Ep {epoch:03d}/{args.epochs}"
-                  f"  tr {tr_loss:.4f}/{tr_acc*100:.2f}%"
-                  f"  va {va_loss:.4f}/{va_acc*100:.2f}%"
-                  f"  lr {lr_now:.2e}  VRAM {vram:.1f}GB  {elapsed:.1f}s")
-
-            if epoch % args.save_every == 0:
-                save_ckpt(ckpt_dir / f"ckpt_ep{epoch:03d}.pt",
-                          epoch, model, optimizer, scheduler, scaler, ema, va_acc)
-
-            if va_acc > best_val_acc:
-                best_val_acc = va_acc
-                patience_cnt = 0
-                save_ckpt(ckpt_dir / "best_model.pt",
-                          epoch, model, optimizer, scheduler, scaler, ema, va_acc)
-                print(f"  -> Meilleur modele  val acc={va_acc*100:.2f}%")
-            else:
-                patience_cnt += 1
-                if patience_cnt >= args.patience:
-                    print(f"  Early stopping apres {args.patience} epoques.")
-                    break
-
-        barrier(world_size)
-
-    if main_proc:
-        print(f"\n{'='*65}")
-        ckpt = torch.load(ckpt_dir / "best_model.pt", map_location=device)
-        raw  = model.module if hasattr(model, "module") else model
-        if ema is not None and "ema" in ckpt:
-            raw.load_state_dict({k: v.to(device) for k, v in ckpt["ema"].items()})
+        elapsed=time.perf_counter()-t0
+        lr_now=optimizer.param_groups[0]["lr"]
+        vram=torch.cuda.max_memory_allocated(device)/1e9 if torch.cuda.is_available() else 0
+        torch.cuda.reset_peak_memory_stats(device)
+        throughput=len(train_loader.dataset)/elapsed
+        print(f"Ep {epoch:03d}/{args.epochs}"
+              f"  tr {tr_loss:.4f}/{tr_acc*100:.2f}%"
+              f"  va {va_loss:.4f}/{va_acc*100:.2f}%"
+              f"  lr {lr_now:.2e}  VRAM {vram:.1f}GB"
+              f"  {throughput:,.0f}p/s  {elapsed:.1f}s")
+        if epoch%args.save_every==0:
+            save_ckpt(ckpt_dir/f"ckpt_ep{epoch:03d}.pt",epoch,model,optimizer,scheduler,scaler,ema,va_acc)
+        if va_acc>best_val_acc:
+            best_val_acc=va_acc
+            patience_cnt=0
+            save_ckpt(ckpt_dir/"best_model.pt",epoch,model,optimizer,scheduler,scaler,ema,va_acc)
+            print(f"  -> Meilleur modele  val acc={va_acc*100:.2f}%")
         else:
-            raw.load_state_dict(ckpt["model"])
+            patience_cnt+=1
+            if patience_cnt>=args.patience:
+                print(f"  Early stopping apres {args.patience} epoques.")
+                break
+    print(f"\n{'='*65}")
+    ckpt=torch.load(ckpt_dir/"best_model.pt",map_location=device)
+    raw=model.module if hasattr(model,"module") else model
+    if ema is not None and "ema" in ckpt:
+        raw.load_state_dict({k:v.to(device) for k,v in ckpt["ema"].items()})
+    else:
+        raw.load_state_dict(ckpt["model"])
+    oa,aa,kappa,cm,per_cls=evaluate_metrics(model,test_loader,device,args.amp,meta["class_names"])
+    print(f"  OA={oa:.2f}%  AA={aa:.2f}%  Kappa={kappa:.2f}%")
+    for name,acc in zip(meta["class_names"],per_cls):
+        print(f"    {name:<25}: {acc:.2f}%")
+    print(f"\n  Matrice de confusion:\n{cm}")
+    results_dir=Path("cls_results")
+    results_dir.mkdir(exist_ok=True)
+    with open(results_dir/"report.txt","w") as f:
+        f.write(f"OA={oa:.2f}%  AA={aa:.2f}%  Kappa={kappa:.2f}%\n\n")
+        for name,acc in zip(meta["class_names"],per_cls):
+            f.write(f"{name}: {acc:.2f}%\n")
+        f.write(f"\nConfusion Matrix:\n{cm}\n")
+    print(f"{'='*65}\n")
 
-        oa, aa, kappa, cm, per_cls = evaluate_metrics(
-            model, test_mgr, batch_size, num_workers, prefetch, mp_ctx, pin,
-            device, args.amp, meta["class_names"])
-        print(f"  OA={oa:.2f}%  AA={aa:.2f}%  Kappa={kappa:.2f}%")
-        for name, acc in zip(meta["class_names"], per_cls):
-            print(f"    {name:<25}: {acc:.2f}%")
-        print(f"\n  Matrice de confusion :\n{cm}")
-
-        results_dir = Path("cls_results")
-        results_dir.mkdir(exist_ok=True)
-        with open(results_dir / "report.txt", "w") as f:
-            f.write(f"OA={oa:.2f}%  AA={aa:.2f}%  Kappa={kappa:.2f}%\n\n")
-            for name, acc in zip(meta["class_names"], per_cls):
-                f.write(f"{name}: {acc:.2f}%\n")
-            f.write(f"\nConfusion Matrix:\n{cm}\n")
-        print(f"{'='*65}\n")
-
-    if world_size > 1:
-        dist.destroy_process_group()
-
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
