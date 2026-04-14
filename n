@@ -1,0 +1,183 @@
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+import random
+import os
+
+class FastMmapDataset(Dataset):
+    def __init__(self, data_dir, split="train", ram_cache_gb=50, shuffle=True):
+        self.data_dir = data_dir
+        self.split = split
+        self.shuffle = shuffle
+
+        self.X = np.memmap(os.path.join(data_dir, f"{split}_X.npy"), mode="r", dtype=np.float32)
+        self.y = np.memmap(os.path.join(data_dir, f"{split}_y.npy"), mode="r", dtype=np.int64)
+
+        self.total = self.y.shape[0]
+
+        shape = self._infer_shape()
+        self.X = self.X.reshape((self.total,) + shape)
+
+        self.order = np.arange(self.total)
+        if shuffle:
+            np.random.shuffle(self.order)
+
+        self.ram_limit = min(self.total, int((ram_cache_gb * 1e9) / self.X[0].nbytes))
+
+        self.ram_X = torch.from_numpy(np.array(self.X[:self.ram_limit]))
+        self.ram_y = torch.from_numpy(np.array(self.y[:self.ram_limit]))
+
+    def _infer_shape(self):
+        n = self.X.shape[0]
+        rem = self.X.size // n
+        c = rem // (13 * 13)
+        return (c, 13, 13)
+
+    def __len__(self):
+        return self.total
+
+    def reshuffle(self, epoch):
+        np.random.shuffle(self.order)
+
+    def __getitem__(self, idx):
+        i = self.order[idx]
+
+        if i < self.ram_limit:
+            x = self.ram_X[i]
+            y = self.ram_y[i]
+        else:
+            x = torch.from_numpy(self.X[i].copy())
+            y = int(self.y[i])
+
+        return x, torch.tensor(y, dtype=torch.long)
+    
+from torch.utils.data import DataLoader
+
+def build_loaders(data_dir, batch_size, num_workers):
+    train_ds = FastMmapDataset(data_dir, "train", ram_cache_gb=60, shuffle=True)
+    val_ds = FastMmapDataset(data_dir, "val", ram_cache_gb=10, shuffle=False)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=8,
+        drop_last=True
+    )
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=8,
+        drop_last=False
+    )
+
+    return train_loader, val_loader
+
+
+import torch
+import time
+from torch.cuda.amp import autocast, GradScaler
+
+def train_one_epoch(model, loader, optimizer, criterion, device, scaler, grad_accum=1, use_amp=True, clip=1.0):
+    model.train()
+
+    optimizer.zero_grad(set_to_none=True)
+
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    start = time.perf_counter()
+
+    for step, (x, y) in enumerate(loader):
+
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        with autocast(enabled=use_amp):
+            out = model(x)
+            loss = criterion(out, y) / grad_accum
+
+        scaler.scale(loss).backward()
+
+        if (step + 1) % grad_accum == 0:
+            if clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        total_loss += loss.item() * grad_accum * x.size(0)
+        correct += (out.argmax(1) == y).sum().item()
+        total += x.size(0)
+
+    elapsed = time.perf_counter() - start
+
+    return total_loss / total, correct / total, elapsed
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, device, use_amp=True):
+    model.eval()
+
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        with autocast(enabled=use_amp):
+            out = model(x)
+            loss = criterion(out, y)
+
+        total_loss += loss.item() * x.size(0)
+        correct += (out.argmax(1) == y).sum().item()
+        total += x.size(0)
+
+    return total_loss / total, correct / total
+
+def fit(model, train_loader, val_loader, optimizer, criterion, device, epochs=50, grad_accum=1):
+    scaler = GradScaler()
+
+    best = 0.0
+
+    for epoch in range(epochs):
+
+        if hasattr(train_loader.dataset, "reshuffle"):
+            train_loader.dataset.reshuffle(epoch)
+
+        t0 = time.perf_counter()
+
+        tr_loss, tr_acc, t_train = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            scaler,
+            grad_accum=grad_accum,
+            use_amp=True,
+            clip=1.0
+        )
+
+        va_loss, va_acc = evaluate(model, val_loader, criterion, device)
+
+        elapsed = time.perf_counter() - t0
+
+        print(epoch, tr_loss, tr_acc, va_loss, va_acc, elapsed)
+
+        if va_acc > best:
+            best = va_acc
+            torch.save(model.state_dict(), "best.pt")
