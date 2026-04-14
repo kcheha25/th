@@ -237,6 +237,7 @@ import queue
 from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
+import time as _time
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -545,7 +546,6 @@ def _balance_hdf5_streaming(h5_path, split_name, patch_size, num_bands, random_s
             del f[tmp_split]
         f.create_dataset(f"{tmp_split}/X", shape=(n_new, num_bands, patch_size, patch_size), dtype=np.float32, chunks=(HDF5_CHUNK_PATCHES, num_bands, patch_size, patch_size), compression='lzf')
         f.create_dataset(f"{tmp_split}/y", shape=(n_new,), dtype=np.int64, chunks=(4096,), compression='lzf')
-    written = 0
     for chunk_start in range(0, n_new, read_chunk):
         chunk_end = min(chunk_start + read_chunk, n_new)
         chunk_idx = sorted_kept[chunk_start:chunk_end]
@@ -555,7 +555,6 @@ def _balance_hdf5_streaming(h5_path, split_name, patch_size, num_bands, random_s
         with h5py.File(h5_path, 'a') as f:
             f[f"{tmp_split}/X"][chunk_start:chunk_end] = X_chunk
             f[f"{tmp_split}/y"][chunk_start:chunk_end] = y_chunk
-        written += len(chunk_idx)
         del X_chunk, y_chunk
         gc.collect()
     with h5py.File(h5_path, 'a') as f:
@@ -564,23 +563,47 @@ def _balance_hdf5_streaming(h5_path, split_name, patch_size, num_bands, random_s
     return n_new
 class HDF5DatasetRAM(Dataset):
     def __init__(self, h5_path, split_name):
-        import time
         self.split_name = split_name
         with h5py.File(h5_path, 'r') as f:
             self.length = f[f"{split_name}/y"].shape[0]
             print(f"  [{split_name}] chargement {self.length:,} patches en RAM...", flush=True)
-            t0 = time.time()
+            t0 = _time.time()
             X_np = f[f"{split_name}/X"][:]
             y_np = f[f"{split_name}/y"][:]
         self._X = torch.from_numpy(X_np.astype(np.float32)).share_memory_()
         self._y = torch.from_numpy(y_np.astype(np.int64)).share_memory_()
         del X_np, y_np
         gc.collect()
-        print(f"  [{split_name}] OK en {time.time()-t0:.1f}s ({self._X.nbytes/1e9:.1f} GB)", flush=True)
+        print(f"  [{split_name}] OK en {_time.time()-t0:.1f}s ({self._X.nbytes/1e9:.1f} GB)", flush=True)
     def __len__(self):
         return self.length
     def __getitem__(self, idx):
         return self._X[idx].unsqueeze(0), self._y[idx]
+def _read_chunk_verbose(h5_path: str, sorted_idx: np.ndarray, chunk_id: int, n_chunks: int, sub_size: int = 2_000_000) -> tuple:
+    n = len(sorted_idx)
+    t0 = _time.time()
+    print(f"\n  ┌─ Chunk {chunk_id+1}/{n_chunks} : lecture {n:,} patches depuis HDF5...", flush=True)
+    X_parts, y_parts = [], []
+    with h5py.File(h5_path, 'r', swmr=True) as f:
+        dX = f["train/X"]
+        dy = f["train/y"]
+        for start in range(0, n, sub_size):
+            end = min(start + sub_size, n)
+            sub_idx = sorted_idx[start:end]
+            X_parts.append(dX[sub_idx])
+            y_parts.append(dy[sub_idx])
+            elapsed = _time.time() - t0
+            gb_read = end * dX.shape[1] * dX.shape[2] * dX.shape[3] * 4 / 1e9
+            speed = gb_read / max(elapsed, 1e-3)
+            pct = end / n * 100
+            print(f"  │  {pct:5.1f}%  {elapsed:6.1f}s  débit ≈ {speed:.2f} GB/s", flush=True)
+    X = np.concatenate(X_parts, axis=0)
+    y = np.concatenate(y_parts, axis=0)
+    del X_parts, y_parts
+    ram_gb = X.nbytes / 1e9
+    total = _time.time() - t0
+    print(f"  └─ Chunk {chunk_id+1}/{n_chunks} prêt : {ram_gb:.1f} GB en RAM, lu en {total:.1f}s ({ram_gb/max(total,1e-3):.2f} GB/s)", flush=True)
+    return (torch.from_numpy(X.astype(np.float32)).share_memory_(), torch.from_numpy(y.astype(np.int64)).share_memory_())
 class _ChunkDataset(Dataset):
     def __init__(self, X: torch.Tensor, y: torch.Tensor):
         self.X = X
@@ -599,37 +622,47 @@ def make_chunked_train_loader(h5_path: str, batch_size: int, num_workers: int, r
     chunk_size = int((ram_budget_gb * 1e9) / patch_bytes)
     chunk_size = max(1, min(chunk_size, n_total))
     n_chunks = int(np.ceil(n_total / chunk_size))
-    print(f"\n  [train] {n_total:,} patches | chunk={chunk_size:,} ({ram_budget_gb:.0f} GB RAM) | {n_chunks} chunks/époque", flush=True)
-    def _read_chunk(sorted_idx: np.ndarray):
-        with h5py.File(h5_path, 'r', swmr=True) as f:
-            X = f["train/X"][sorted_idx]
-            y = f["train/y"][sorted_idx]
-        return (torch.from_numpy(X.astype(np.float32)).share_memory_(), torch.from_numpy(y.astype(np.int64)).share_memory_())
+    chunk_gb = chunk_size * patch_bytes / 1e9
+    print(f"\n  [train loader]")
+    print(f"    {n_total:,} patches  |  {n_bands} bandes  |  patch {patch_sz}x{patch_sz}")
+    print(f"    RAM/chunk cible : {ram_budget_gb:.0f} GB")
+    print(f"    chunk_size      : {chunk_size:,} patches ({chunk_gb:.1f} GB non compressé)")
+    print(f"    chunks/époque   : {n_chunks}")
+    print(f"    batch_size      : {batch_size}  |  num_workers : {num_workers}\n", flush=True)
     def epoch_loader(epoch: int = 0):
         rng = np.random.default_rng(seed + epoch)
         global_idx = rng.permutation(n_total).astype(np.int64)
-        chunk_slices = [np.sort(global_idx[s:s + chunk_size]) for s in range(0, n_total, chunk_size)]
+        chunk_slices = [np.sort(global_idx[s: s + chunk_size]) for s in range(0, n_total, chunk_size)]
         pin = torch.cuda.is_available()
         pq = queue.Queue(maxsize=1)
-        def _prefetch(idx_arr):
+        def _prefetch(ci_: int):
             try:
-                pq.put(_read_chunk(idx_arr))
-            except Exception as e:
-                pq.put(e)
-        t = threading.Thread(target=_prefetch, args=(chunk_slices[0],), daemon=True)
-        t.start()
-        for ci, slc in enumerate(chunk_slices):
-            result = pq.get()
-            if isinstance(result, Exception):
-                raise result
-            X_buf, y_buf = result
+                result = _read_chunk_verbose(h5_path, chunk_slices[ci_], ci_, n_chunks)
+                pq.put(("ok", result))
+            except Exception as exc:
+                pq.put(("err", exc))
+        threading.Thread(target=_prefetch, args=(0,), daemon=True).start()
+        epoch_t0 = _time.time()
+        for ci in range(n_chunks):
+            status, payload = pq.get()
+            if status == "err":
+                raise payload
+            X_buf, y_buf = payload
             if ci + 1 < n_chunks:
-                t = threading.Thread(target=_prefetch, args=(chunk_slices[ci + 1],), daemon=True)
-                t.start()
-            perm = torch.randperm(len(y_buf), generator=torch.Generator().manual_seed(int(seed + epoch * 1000 + ci)))
+                threading.Thread(target=_prefetch, args=(ci + 1,), daemon=True).start()
+            g = torch.Generator()
+            g.manual_seed(int(seed + epoch * 10_000 + ci))
+            perm = torch.randperm(len(y_buf), generator=g)
             ds = _ChunkDataset(X_buf[perm], y_buf[perm])
             loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin, persistent_workers=(num_workers > 0), prefetch_factor=4 if num_workers > 0 else None, worker_init_fn=worker_init_fn)
-            yield from loader
+            gpu_t0 = _time.time()
+            n_batches = 0
+            for batch in loader:
+                yield batch
+                n_batches += 1
+            gpu_t = _time.time() - gpu_t0
+            total_t = _time.time() - epoch_t0
+            print(f"  [chunk {ci+1}/{n_chunks}] GPU: {n_batches} batches en {gpu_t:.0f}s ({len(y_buf)/max(gpu_t,1e-3)/1e6:.2f} Mpatch/s) | époque total: {total_t:.0f}s", flush=True)
             del X_buf, y_buf, ds, loader
             gc.collect()
     return epoch_loader, n_total
@@ -674,7 +707,7 @@ def build_loaders(real_dir=None, aug_dir=None, mapping_path="mapping.json", spli
     meta = {"class_names": class_names, "label2idx": label2idx, "num_classes": len(class_names), "num_bands": num_bands, "patch_size": patch_size, "balance_train": balance_train, "h5_path": str(h5_path)}
     return train_epoch_fn, val_loader, test_loader, meta, n_train
 if __name__ == "__main__":
-    import argparse, time
+    import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--real_dir")
     p.add_argument("--aug_dir")
@@ -698,11 +731,11 @@ if __name__ == "__main__":
     args = p.parse_args()
     if not args.real_dir and not args.aug_dir:
         p.error("--real_dir ou --aug_dir requis")
-    train_epoch_fn, val_loader, test_loader, meta, n_train = build_loaders(**{k: v for k, v in vars(args).items() if k in build_loaders.__code__.co_varnames})
-    print(f"\nTest : itération sur 3 batches du train (époque 0)")
-    t0 = time.time()
+    train_epoch_fn, val_loader, test_loader, meta, n_train = build_loaders(real_dir=args.real_dir, aug_dir=args.aug_dir, mapping_path=args.mapping_path, split_mode=args.split_mode, use_pca=args.use_pca, pca_components=args.pca_components, patch_size=args.patch_size, test_ratio=args.test_ratio, val_ratio=args.val_ratio, batch_size=args.batch_size, random_state=args.random_state, fit_max_pixels=args.fit_max_pixels, num_workers=args.num_workers, bg_ratio=args.bg_ratio, cache_dir=args.cache_dir, force_recompute=args.force_recompute, balance_train=args.balance_train, ram_budget_gb=args.ram_budget_gb)
+    print(f"\n=== Test : 3 batches de l'époque 0 ===")
+    t0 = _time.time()
     for i, (X, y) in enumerate(train_epoch_fn(epoch=0)):
-        print(f"  batch {i}: X={tuple(X.shape)}  y={tuple(y.shape)}")
+        print(f"  batch {i}: X={tuple(X.shape)}  y={tuple(y.shape)}  ({_time.time()-t0:.1f}s)", flush=True)
         if i >= 2:
             break
-    print(f"  3 batches en {time.time()-t0:.2f}s")
+    print(f"\nTerminé en {_time.time()-t0:.1f}s total")
