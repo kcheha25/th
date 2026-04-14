@@ -176,23 +176,19 @@ def extract_split_to_mmap(meta_list, split_name, patch_size, extrude2final, labe
         tmp, _ = _load_envi_cube(meta_list[0]["hdr"], meta_list[0]["source"])
         num_bands = tmp.shape[0]
         del tmp; gc.collect()
-    
     base_dir = Path(base_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
     X_path = base_dir / f"{split_name}_X.dat"
     y_path = base_dir / f"{split_name}_y.dat"
-    
-    all_X = []
-    all_y = []
+    batch_size = 100000
+    X_mmap = None
+    y_mmap = None
+    current_size = 0
     bg_idx = label2idx["background"]
-    
     for i, meta in enumerate(meta_list):
         print(f"  [{split_name}] Cube {i+1}/{len(meta_list)}: {meta['name']}")
-        name = meta["name"]
-        source = meta["source"]
-        rng = np.random.default_rng(random_state + hash(name) % 10_000)
         try:
-            cube_raw, _ = _load_envi_cube(meta["hdr"], source)
+            cube_raw, _ = _load_envi_cube(meta["hdr"], meta["source"])
             if pca is not None:
                 cube_pca = apply_pca_chunked(cube_raw, pca)
                 del cube_raw; gc.collect()
@@ -204,6 +200,7 @@ def extract_split_to_mmap(meta_list, split_name, patch_size, extrude2final, labe
             r_all, c_all = np.where(label_map >= 0)
             labels_all = label_map[r_all, c_all]
             del label_map
+            rng = np.random.default_rng(random_state + hash(meta["name"]) % 10_000)
             keep = balance_background(labels_all, bg_idx, rng, bg_ratio)
             rows_k = r_all[keep].astype(np.int32)
             cols_k = c_all[keep].astype(np.int32)
@@ -211,25 +208,40 @@ def extract_split_to_mmap(meta_list, split_name, patch_size, extrude2final, labe
             del r_all, c_all, labels_all, keep; gc.collect()
             if len(rows_k) > 0:
                 patches = _extract_patches_cpu(cube_pca, rows_k, cols_k, patch_size)
-                all_X.append(patches)
-                all_y.append(labels_k)
+                n_patches = len(patches)
+                if X_mmap is None:
+                    X_mmap = np.memmap(X_path, dtype=np.float32, mode='w+', shape=(n_patches, num_bands, patch_size, patch_size))
+                    y_mmap = np.memmap(y_path, dtype=np.int64, mode='w+', shape=(n_patches,))
+                else:
+                    if current_size + n_patches > X_mmap.shape[0]:
+                        new_shape = (current_size + n_patches + batch_size, num_bands, patch_size, patch_size)
+                        X_mmap.flush()
+                        y_mmap.flush()
+                        del X_mmap, y_mmap
+                        X_mmap = np.memmap(X_path, dtype=np.float32, mode='r+', shape=new_shape)
+                        y_mmap = np.memmap(y_path, dtype=np.int64, mode='r+', shape=(new_shape[0],))
+                X_mmap[current_size:current_size + n_patches] = patches
+                y_mmap[current_size:current_size + n_patches] = labels_k
+                current_size += n_patches
+                X_mmap.flush()
+                y_mmap.flush()
+                print(f"    -> {n_patches} patches, total: {current_size}")
             del cube_pca; gc.collect()
         except Exception as e:
-            print(f"  Erreur {name}: {e}")
-    
-    if all_X:
-        X_all = np.concatenate(all_X, axis=0)
-        y_all = np.concatenate(all_y, axis=0)
-        X_mmap = np.memmap(X_path, dtype=np.float32, mode='w+', shape=X_all.shape)
-        y_mmap = np.memmap(y_path, dtype=np.int64, mode='w+', shape=y_all.shape)
-        X_mmap[:] = X_all
-        y_mmap[:] = y_all
-        X_mmap.flush()
-        y_mmap.flush()
-        meta = {"shape": list(X_all.shape), "dtype": "float32"}
+            print(f"  Erreur {meta['name']}: {e}")
+    if X_mmap is not None and current_size > 0:
+        if current_size < X_mmap.shape[0]:
+            X_mmap.flush()
+            y_mmap.flush()
+            del X_mmap, y_mmap
+            X_mmap = np.memmap(X_path, dtype=np.float32, mode='r+', shape=(current_size, num_bands, patch_size, patch_size))
+            y_mmap = np.memmap(y_path, dtype=np.int64, mode='r+', shape=(current_size,))
+            X_mmap.flush()
+            y_mmap.flush()
+        meta = {"shape": [current_size, num_bands, patch_size, patch_size], "dtype": "float32"}
         with open(base_dir / f"{split_name}_meta.json", 'w') as f:
             json.dump(meta, f)
-        return len(y_all)
+        return current_size
     return 0
 
 class MMapDataset(Dataset):
@@ -254,9 +266,9 @@ def build_loaders(mmap_dir, batch_size=64, num_workers=4):
     train_ds = MMapDataset(mmap_dir, 'train')
     val_ds = MMapDataset(mmap_dir, 'val')
     test_ds = MMapDataset(mmap_dir, 'test')
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, persistent_workers=True if num_workers > 0 else False)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=True if num_workers > 0 else False)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=True if num_workers > 0 else False)
     with open(mmap_dir / "global_meta.json") as f:
         meta = json.load(f)
     return train_loader, val_loader, test_loader, meta
