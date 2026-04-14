@@ -766,3 +766,425 @@ def main():
 
 if __name__=="__main__":
     main()
+
+
+
+# profile_training.py
+import argparse
+import time
+import cProfile
+import pstats
+import io
+from pathlib import Path
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim import AdamW
+from torch.profiler import profile, record_function, ProfilerActivity
+from dataset import build_loaders, HDF5Dataset
+from ssfnet import SSFTTnet
+
+class TimingProfiler:
+    def __init__(self):
+        self.times = {}
+        self.counts = {}
+        self.current_section = None
+        self.start_time = None
+    
+    def start(self, name):
+        self.current_section = name
+        self.start_time = time.perf_counter()
+    
+    def stop(self):
+        if self.current_section and self.start_time:
+            elapsed = time.perf_counter() - self.start_time
+            if self.current_section not in self.times:
+                self.times[self.current_section] = 0
+                self.counts[self.current_section] = 0
+            self.times[self.current_section] += elapsed
+            self.counts[self.current_section] += 1
+        self.current_section = None
+        self.start_time = None
+    
+    def report(self):
+        print("\n" + "="*80)
+        print("RESULTATS PROFILING")
+        print("="*80)
+        total_time = sum(self.times.values())
+        print(f"{'Section':<40} {'Temps':<12} {'Appels':<10} {'Moyenne':<12} {'%':<8}")
+        print("-"*80)
+        
+        sorted_items = sorted(self.times.items(), key=lambda x: x[1], reverse=True)
+        for name, total in sorted_items:
+            count = self.counts[name]
+            avg = total / count if count > 0 else 0
+            pct = (total / total_time * 100) if total_time > 0 else 0
+            print(f"{name:<40} {total:>8.3f}s {count:>8d} {avg:>10.4f}s {pct:>6.1f}%")
+        
+        print("="*80)
+        print(f"TOTAL: {total_time:.3f}s")
+        print("="*80)
+
+def profile_data_loading(args, num_batches=50):
+    print("\n" + "="*80)
+    print("PROFILING CHARGEMENT DONNEES")
+    print("="*80)
+    
+    train_loader, _, _, meta = build_loaders(
+        real_dir=args.real_dir,
+        aug_dir=args.aug_dir,
+        mapping_path=args.mapping_path,
+        split_mode=args.split_mode,
+        use_pca=args.use_pca,
+        pca_components=args.pca_components,
+        patch_size=args.patch_size,
+        test_ratio=args.test_ratio,
+        val_ratio=args.val_ratio,
+        batch_size=args.batch_size or 64,
+        random_state=args.random_state,
+        fit_max_pixels=args.fit_max_pixels,
+        num_workers=args.num_workers or 4,
+        bg_ratio=args.bg_ratio,
+        cache_dir=args.cache_dir,
+        balance_train=args.balance_train
+    )
+    
+    timer = TimingProfiler()
+    
+    print(f"\nTest sur {num_batches} batches...")
+    
+    for batch_idx, (X, y) in enumerate(train_loader):
+        if batch_idx >= num_batches:
+            break
+        
+        timer.start("DataLoader_next_batch")
+        
+        if torch.cuda.is_available():
+            timer.start("Transfert_CPU_GPU")
+            X = X.cuda(non_blocking=True)
+            y = y.cuda(non_blocking=True)
+            torch.cuda.synchronize()
+            timer.stop()
+        
+        if batch_idx % 10 == 0:
+            print(f"  Batch {batch_idx}/{num_batches}")
+    
+    timer.report()
+    
+    print(f"\nDataset: {len(train_loader.dataset):,} patches")
+    print(f"Batches/epoch: {len(train_loader):,}")
+    print(f"Batch size: {train_loader.batch_size}")
+    print(f"Num workers: {train_loader.num_workers}")
+
+def profile_full_epoch(args, max_batches=None):
+    print("\n" + "="*80)
+    print("PROFILING COMPLET")
+    print("="*80)
+    
+    train_loader, _, _, meta = build_loaders(
+        real_dir=args.real_dir,
+        aug_dir=args.aug_dir,
+        mapping_path=args.mapping_path,
+        split_mode=args.split_mode,
+        use_pca=args.use_pca,
+        pca_components=args.pca_components,
+        patch_size=args.patch_size,
+        test_ratio=args.test_ratio,
+        val_ratio=args.val_ratio,
+        batch_size=args.batch_size or 64,
+        random_state=args.random_state,
+        fit_max_pixels=args.fit_max_pixels,
+        num_workers=args.num_workers or 4,
+        bg_ratio=args.bg_ratio,
+        cache_dir=args.cache_dir,
+        balance_train=args.balance_train
+    )
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = SSFTTnet(
+        in_channels=1,
+        num_classes=meta["num_classes"],
+        num_tokens=args.num_tokens,
+        dim=args.dim,
+        depth=args.depth,
+        heads=args.heads,
+        mlp_dim=args.mlp_dim,
+        dropout=args.dropout,
+        emb_dropout=args.emb_dropout
+    ).to(device)
+    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = AdamW(model.parameters(), lr=1e-3)
+    scaler = GradScaler()
+    
+    model.train()
+    timer = TimingProfiler()
+    
+    print(f"\nProfiling sur {max_batches or 20} batches...")
+    
+    for batch_idx, (X, y) in enumerate(train_loader):
+        if max_batches and batch_idx >= max_batches:
+            break
+        
+        timer.start("1_Transfert_CPU_GPU")
+        X = X.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        timer.stop()
+        
+        timer.start("2_Forward")
+        with autocast():
+            logits = model(X)
+            loss = criterion(logits, y)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        timer.stop()
+        
+        timer.start("3_Backward")
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        timer.stop()
+        
+        timer.start("4_Optimizer")
+        scaler.step(optimizer)
+        scaler.update()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        timer.stop()
+        
+        if batch_idx % 5 == 0:
+            print(f"  Batch {batch_idx} - Loss: {loss.item():.4f}")
+    
+    timer.report()
+    print(f"\nTemps total pour {max_batches} batches: {sum(timer.times.values()):.3f}s")
+
+def profile_hdf5_access(h5_path, split='train', num_samples=1000):
+    print("\n" + "="*80)
+    print("PROFILING ACCES HDF5")
+    print("="*80)
+    
+    import h5py
+    
+    timer = TimingProfiler()
+    
+    with h5py.File(h5_path, 'r') as f:
+        dset = f[f'{split}/X']
+        total = dset.shape[0]
+        
+        print(f"Dataset: {total:,} patches")
+        print(f"Shape: {dset.shape}")
+        print(f"Chunks: {dset.chunks}")
+        print(f"Compression: {dset.compression}")
+        
+        print(f"\nAcces sequentiel ({num_samples} echantillons)...")
+        indices = np.arange(min(num_samples, total))
+        
+        timer.start("Acces_sequentiel")
+        for i in indices:
+            _ = dset[i]
+        timer.stop()
+        
+        print(f"\nAcces aleatoire ({num_samples} echantillons)...")
+        rng = np.random.default_rng(42)
+        indices = rng.choice(total, min(num_samples, total), replace=False)
+        
+        timer.start("Acces_aleatoire")
+        for i in indices:
+            _ = dset[i]
+        timer.stop()
+        
+        print(f"\nAcces batch (taille=64)...")
+        batch_size = 64
+        num_batches = min(num_samples // batch_size, total // batch_size)
+        
+        timer.start("Acces_batch")
+        for i in range(num_batches):
+            start = i * batch_size
+            end = start + batch_size
+            _ = dset[start:end]
+        timer.stop()
+    
+    timer.report()
+
+def profile_gpu_utilization():
+    print("\n" + "="*80)
+    print("UTILISATION GPU")
+    print("="*80)
+    
+    if not torch.cuda.is_available():
+        print("CUDA non disponible")
+        return
+    
+    for i in range(torch.cuda.device_count()):
+        print(f"\nGPU {i}: {torch.cuda.get_device_name(i)}")
+        print(f"  Memoire totale: {torch.cuda.get_device_properties(i).total_memory / 1e9:.2f} GB")
+        print(f"  Memoire allouee: {torch.cuda.memory_allocated(i) / 1e9:.2f} GB")
+        print(f"  Memoire cache: {torch.cuda.memory_reserved(i) / 1e9:.2f} GB")
+
+def estimate_training_time(args):
+    print("\n" + "="*80)
+    print("ESTIMATION TEMPS ENTRAINEMENT")
+    print("="*80)
+    
+    train_loader, _, _, meta = build_loaders(
+        real_dir=args.real_dir,
+        aug_dir=args.aug_dir,
+        mapping_path=args.mapping_path,
+        split_mode=args.split_mode,
+        use_pca=args.use_pca,
+        pca_components=args.pca_components,
+        patch_size=args.patch_size,
+        test_ratio=args.test_ratio,
+        val_ratio=args.val_ratio,
+        batch_size=args.batch_size or 64,
+        random_state=args.random_state,
+        fit_max_pixels=args.fit_max_pixels,
+        num_workers=args.num_workers or 4,
+        bg_ratio=args.bg_ratio,
+        cache_dir=args.cache_dir,
+        balance_train=args.balance_train
+    )
+    
+    total_patches = len(train_loader.dataset)
+    batches_per_epoch = len(train_loader)
+    
+    print(f"\nPatches total: {total_patches:,}")
+    print(f"Batches/epoch: {batches_per_epoch:,}")
+    print(f"Batch size: {train_loader.batch_size}")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = SSFTTnet(
+        in_channels=1,
+        num_classes=meta["num_classes"],
+        num_tokens=args.num_tokens,
+        dim=args.dim,
+        depth=args.depth,
+        heads=args.heads,
+        mlp_dim=args.mlp_dim,
+        dropout=args.dropout,
+        emb_dropout=args.emb_dropout
+    ).to(device)
+    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = AdamW(model.parameters(), lr=1e-3)
+    
+    print("\nMesure temps par batch...")
+    times = []
+    model.train()
+    
+    for batch_idx, (X, y) in enumerate(train_loader):
+        if batch_idx >= 10:
+            break
+        
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        
+        X = X.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        logits = model(X)
+        loss = criterion(logits, y)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+        times.append(elapsed)
+        print(f"  Batch {batch_idx+1}/10: {elapsed:.3f}s")
+    
+    avg_batch_time = np.mean(times)
+    epoch_time = avg_batch_time * batches_per_epoch
+    total_time = epoch_time * args.epochs
+    
+    print(f"\nTemps moyen/batch: {avg_batch_time:.3f}s")
+    print(f"Temps estime/epoch: {epoch_time/60:.1f} minutes")
+    print(f"Temps estime total ({args.epochs} epochs): {total_time/3600:.1f} heures")
+    
+    if total_time > 10:
+        print(f"\nATTENTION: Temps trop long")
+        print(f"Solutions:")
+        print(f"  1. --subset_fraction 0.1")
+        print(f"  2. --batch_size 256")
+        print(f"  3. --num_workers 16")
+        print(f"  4. --epochs 30")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--real_dir")
+    parser.add_argument("--aug_dir")
+    parser.add_argument("--mapping_path", default="mapping.json")
+    parser.add_argument("--cache_dir", default="cache")
+    parser.add_argument("--split_mode", default="aug_real")
+    parser.add_argument("--use_pca", action="store_true", default=True)
+    parser.add_argument("--no_pca", action="store_false", dest="use_pca")
+    parser.add_argument("--pca_components", type=int, default=30)
+    parser.add_argument("--patch_size", type=int, default=13)
+    parser.add_argument("--val_ratio", type=float, default=0.15)
+    parser.add_argument("--test_ratio", type=float, default=0.15)
+    parser.add_argument("--bg_ratio", type=float, default=1.5)
+    parser.add_argument("--random_state", type=int, default=345)
+    parser.add_argument("--fit_max_pixels", type=int, default=500_000)
+    parser.add_argument("--balance_train", action="store_true")
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_tokens", type=int, default=4)
+    parser.add_argument("--dim", type=int, default=64)
+    parser.add_argument("--depth", type=int, default=1)
+    parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--mlp_dim", type=int, default=8)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--emb_dropout", type=float, default=0.1)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--profile_mode", choices=['data', 'full', 'hdf5', 'gpu', 'estimate', 'all'],
+                       default='estimate')
+    parser.add_argument("--num_batches", type=int, default=50)
+    parser.add_argument("--hdf5_path", type=str)
+    
+    args = parser.parse_args()
+    
+    print("\n" + "="*80)
+    print("PROFILER ENTRAINEMENT")
+    print("="*80)
+    print(f"Mode: {args.profile_mode}")
+    print(f"Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print("="*80)
+    
+    try:
+        if args.profile_mode in ['data', 'all']:
+            profile_data_loading(args, args.num_batches)
+        
+        if args.profile_mode in ['full', 'all']:
+            profile_full_epoch(args, args.num_batches)
+        
+        if args.profile_mode in ['hdf5', 'all']:
+            if args.hdf5_path:
+                profile_hdf5_access(args.hdf5_path)
+            else:
+                cache_dir = Path(args.cache_dir)
+                h5_files = list(cache_dir.glob("patches_*.h5"))
+                if h5_files:
+                    profile_hdf5_access(str(h5_files[0]))
+        
+        if args.profile_mode in ['gpu', 'all']:
+            profile_gpu_utilization()
+        
+        if args.profile_mode in ['estimate', 'all']:
+            estimate_training_time(args)
+            
+    except KeyboardInterrupt:
+        print("\n\nInterrompu")
+    except Exception as e:
+        print(f"\nErreur: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
