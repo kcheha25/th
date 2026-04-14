@@ -849,8 +849,12 @@ class LRUMemoryCache:
 class MMapDataset(Dataset):
     def __init__(self, mmap_dir, split, cache_gb=8, max_samples=None, random_state=345):
         mmap_dir = Path(mmap_dir)
-        self.X_mmap = np.memmap(mmap_dir / f"{split}_X.dat", dtype=np.float32, mode='r')
-        self.y_mmap = np.memmap(mmap_dir / f"{split}_y.dat", dtype=np.int64, mode='r')
+        with open(mmap_dir / f"{split}_meta.json") as f:
+            split_meta = json.load(f)
+            shape = tuple(split_meta["shape"])
+            dtype = split_meta["dtype"]
+        self.X_mmap = np.memmap(mmap_dir / f"{split}_X.dat", dtype=dtype, mode='r', shape=shape)
+        self.y_mmap = np.memmap(mmap_dir / f"{split}_y.dat", dtype=np.int64, mode='r', shape=(shape[0],))
         self.total = len(self.y_mmap)
         self.max_samples = max_samples or self.total
         self.cache = LRUMemoryCache(cache_gb)
@@ -869,16 +873,20 @@ class MMapDataset(Dataset):
         self.rng.shuffle(self.indices)
         self.length = len(self.indices)
     def _start_prefetch(self):
-        if self.prefetch_thread is not None: self._stop_prefetch()
+        if self.prefetch_thread is not None:
+            self._stop_prefetch()
         self.prefetch_running = True
         self.prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
         self.prefetch_thread.start()
     def _stop_prefetch(self):
         self.prefetch_running = False
-        if self.prefetch_thread: self.prefetch_thread.join(timeout=5)
+        if self.prefetch_thread:
+            self.prefetch_thread.join(timeout=5)
         while not self.prefetch_queue.empty():
-            try: self.prefetch_queue.get_nowait()
-            except queue.Empty: break
+            try:
+                self.prefetch_queue.get_nowait()
+            except queue.Empty:
+                break
     def _prefetch_worker(self):
         chunk_idx = 0
         while self.prefetch_running:
@@ -897,9 +905,12 @@ class MMapDataset(Dataset):
                 X_chunk, y_chunk = self.cache.get(key, load_chunk)
                 self.prefetch_queue.put((X_chunk, y_chunk, start), timeout=1)
                 chunk_idx += 1
-            except queue.Full: pass
-            except Exception: break
-    def __len__(self): return self.length
+            except queue.Full:
+                pass
+            except Exception:
+                break
+    def __len__(self):
+        return self.length
     def __getitem__(self, idx):
         try:
             while True:
@@ -909,15 +920,18 @@ class MMapDataset(Dataset):
                     X = torch.from_numpy(X_chunk[offset]).float()
                     y = int(y_chunk[offset])
                     return X.unsqueeze(0), torch.tensor(y, dtype=torch.long)
-        except queue.Empty: pass
+        except queue.Empty:
+            pass
         real_idx = self.indices[idx]
         X = torch.from_numpy(self.X_mmap[real_idx].copy()).float()
         y = int(self.y_mmap[real_idx])
         return X.unsqueeze(0), torch.tensor(y, dtype=torch.long)
     def __del__(self):
         self._stop_prefetch()
-        if hasattr(self, 'X_mmap'): del self.X_mmap
-        if hasattr(self, 'y_mmap'): del self.y_mmap
+        if hasattr(self, 'X_mmap'):
+            del self.X_mmap
+        if hasattr(self, 'y_mmap'):
+            del self.y_mmap
 
 class PinnedBatchSampler:
     def __init__(self, dataset, batch_size, device, num_streams=2):
@@ -968,15 +982,22 @@ class PinnedBatchSampler:
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
 
 def build_mmap_loaders_direct(mmap_dir, class_names, label2idx, batch_size=128, cache_gb=8, max_train_samples=1000000, num_workers=0):
+    mmap_dir = Path(mmap_dir)
     train_ds = MMapDataset(mmap_dir, 'train', cache_gb=cache_gb, max_samples=max_train_samples)
     val_ds = MMapDataset(mmap_dir, 'val', cache_gb=cache_gb)
     test_ds = MMapDataset(mmap_dir, 'test', cache_gb=cache_gb)
     train_sampler = PinnedBatchSampler(train_ds, batch_size, device=torch.device('cuda'))
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=num_workers>0)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=num_workers>0)
-    meta = {"class_names": class_names, "label2idx": label2idx, "num_classes": len(class_names), "num_bands": train_ds.X_mmap.shape[1], "patch_size": train_ds.X_mmap.shape[2]}
+    shape = train_ds.X_mmap.shape
+    meta = {
+        "class_names": class_names,
+        "label2idx": label2idx,
+        "num_classes": len(class_names),
+        "num_bands": shape[1],
+        "patch_size": shape[2]
+    }
     return train_sampler, val_loader, test_loader, meta
-
 def build_mmap_direct(real_dir=None, aug_dir=None, mapping_path="mapping.json", split_mode="aug_real", use_pca=True, pca_components=30, patch_size=13, test_ratio=0.15, val_ratio=0.15, batch_size=64, random_state=345, fit_max_pixels=500_000, num_workers=0, bg_ratio=1.5, mmap_dir="mmap_data", force_recompute=False, balance_train=False, cache_gb=8, max_train_samples=1000000):
     extrude2final, class_names, label2idx = load_mapping(mapping_path)
     mmap_dir = Path(mmap_dir)
