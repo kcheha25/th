@@ -136,3 +136,104 @@ for class_name in real_class_folders:
         plt.title(f"{class_name} - SAM: {sam:.6f}")
         plt.savefig(os.path.join(OUTPUT_DIR, f"{class_name}_spec_{i+1}_SAM.png"), dpi=300)
         plt.close()
+
+
+import os
+import numpy as np
+import random
+import torch
+import matplotlib.pyplot as plt
+from spectral import envi
+from glob import glob
+from sklearn.neighbors import NearestNeighbors
+
+REAL_DIR = "extrudes_cubes_vf"
+GAN_DIR = "wgans_weight"
+OUTPUT_DIR = "results_gan_eval"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def load_cube(hdr_path):
+    img = envi.open(hdr_path)
+    cube = np.array(img.load())
+    if cube.shape[-1] != 272:
+        for i, dim in enumerate(cube.shape):
+            if dim == 272:
+                if i == 0:
+                    cube = np.transpose(cube, (1, 2, 0))
+                elif i == 1:
+                    cube = np.transpose(cube, (0, 2, 1))
+                break
+    return cube
+
+def extract_spectra(cube):
+    spectra = cube.reshape(-1, cube.shape[-1])
+    mask = np.any(spectra != 0, axis=1)
+    return spectra[mask]
+
+def get_class_name(folder):
+    return folder.split("_")[0]
+
+real_class_folders = {}
+
+for folder in os.listdir(REAL_DIR):
+    class_name = get_class_name(folder)
+    real_class_folders.setdefault(class_name, []).append(os.path.join(REAL_DIR, folder))
+
+for class_name in real_class_folders:
+
+    print(f"\n===== Classe {class_name} =====")
+
+    real_list = []
+
+    for folder in real_class_folders[class_name]:
+        hdrs = glob(os.path.join(folder, "*.hdr"))
+        for h in hdrs:
+            cube = load_cube(h)
+            real_list.append(extract_spectra(cube))
+
+    real_spectra = np.vstack(real_list)
+
+    nn = NearestNeighbors(n_neighbors=1, metric="euclidean")
+    nn.fit(real_spectra)
+
+    gan_path = os.path.join(GAN_DIR, class_name, "netG_best.pth")
+    netG = torch.load(gan_path, map_location=device)
+    netG.eval()
+
+    latent_dim = 100
+
+    with torch.no_grad():
+        z = torch.randn(100, latent_dim).to(device)
+        fake_spectra = netG(z).cpu().numpy()
+
+    selected = random.sample(range(100), 3)
+
+    for i, idx in enumerate(selected):
+
+        gan_spec = fake_spectra[idx].reshape(1, -1)
+
+        dist, nn_idx = nn.kneighbors(gan_spec)
+        real_spec = real_spectra[nn_idx[0][0]]
+
+        diff = gan_spec.flatten() - real_spec
+
+        L1 = np.sum(np.abs(diff))
+        L2 = np.sqrt(np.sum(diff ** 2))
+
+        plt.figure()
+        plt.plot(real_spec)
+        plt.plot(gan_spec.flatten())
+        plt.title(f"{class_name} | L1={L1:.4e} | L2={L2:.4e}")
+        plt.savefig(os.path.join(OUTPUT_DIR, f"{class_name}_gan_vs_real_{i}.png"))
+        plt.close()
+
+        plt.figure()
+        plt.plot(diff)
+        plt.title(f"{class_name}")
+        plt.savefig(os.path.join(OUTPUT_DIR, f"{class_name}_diff_{i}.png"))
+        plt.close()
+
+    print(f"Classe {class_name} OK")
