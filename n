@@ -47,3 +47,416 @@ if __name__ == "__main__":
     p.add_argument("--output_dir", required=True)
     args = p.parse_args()
     convert_h5_to_mmap(args.h5_path, args.output_dir)
+
+
+# mmap_dataset.py
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+import threading
+import queue
+from collections import OrderedDict
+from pathlib import Path
+import json
+import time
+
+class LRUMemoryCache:
+    def __init__(self, max_size_gb=8):
+        self.max_size = int(max_size_gb * 1024**3)
+        self.cache = OrderedDict()
+        self.current_size = 0
+        self.lock = threading.Lock()
+    def get(self, key, loader_func):
+        with self.lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                return self.cache[key]
+        data = loader_func()
+        size = data[0].nbytes + data[1].nbytes
+        with self.lock:
+            while self.current_size + size > self.max_size and self.cache:
+                _, old_data = self.cache.popitem(last=False)
+                self.current_size -= old_data[0].nbytes + old_data[1].nbytes
+            self.cache[key] = data
+            self.current_size += size
+        return data
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+            self.current_size = 0
+
+class MMapDataset(Dataset):
+    def __init__(self, mmap_dir, split, cache_gb=8, max_samples=None, random_state=345):
+        mmap_dir = Path(mmap_dir)
+        self.X_mmap = np.memmap(mmap_dir / f"{split}_X.dat", dtype=np.float32, mode='r')
+        self.y_mmap = np.memmap(mmap_dir / f"{split}_y.dat", dtype=np.int64, mode='r')
+        with open(mmap_dir / "meta.json") as f:
+            self.meta = json.load(f)
+        self.total = len(self.y_mmap)
+        self.max_samples = max_samples or self.total
+        self.cache = LRUMemoryCache(cache_gb)
+        self.rng = np.random.RandomState(random_state)
+        self.chunk_size = 512
+        self.prefetch_queue = queue.Queue(maxsize=4)
+        self.prefetch_running = False
+        self.prefetch_thread = None
+        self.resample()
+        self._start_prefetch()
+    def resample(self):
+        if self.max_samples < self.total:
+            self.indices = self.rng.choice(self.total, self.max_samples, replace=False)
+        else:
+            self.indices = np.arange(self.total)
+        self.rng.shuffle(self.indices)
+        self.length = len(self.indices)
+    def _start_prefetch(self):
+        if self.prefetch_thread is not None:
+            self._stop_prefetch()
+        self.prefetch_running = True
+        self.prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
+        self.prefetch_thread.start()
+    def _stop_prefetch(self):
+        self.prefetch_running = False
+        if self.prefetch_thread:
+            self.prefetch_thread.join(timeout=5)
+        while not self.prefetch_queue.empty():
+            try:
+                self.prefetch_queue.get_nowait()
+            except queue.Empty:
+                break
+    def _prefetch_worker(self):
+        chunk_idx = 0
+        while self.prefetch_running:
+            if self.prefetch_queue.qsize() >= 3:
+                time.sleep(0.001)
+                continue
+            start = (chunk_idx * self.chunk_size) % self.length
+            end = min(start + self.chunk_size, self.length)
+            real_indices = self.indices[start:end]
+            def load_chunk():
+                X_chunk = np.array(self.X_mmap[real_indices])
+                y_chunk = np.array(self.y_mmap[real_indices])
+                return (X_chunk, y_chunk)
+            key = f"chunk_{chunk_idx}"
+            try:
+                X_chunk, y_chunk = self.cache.get(key, load_chunk)
+                self.prefetch_queue.put((X_chunk, y_chunk, start), timeout=1)
+                chunk_idx += 1
+            except queue.Full:
+                pass
+            except Exception:
+                break
+    def __len__(self):
+        return self.length
+    def __getitem__(self, idx):
+        try:
+            while True:
+                X_chunk, y_chunk, chunk_start = self.prefetch_queue.get_nowait()
+                if chunk_start <= idx < chunk_start + len(y_chunk):
+                    offset = idx - chunk_start
+                    X = torch.from_numpy(X_chunk[offset]).float()
+                    y = int(y_chunk[offset])
+                    return X.unsqueeze(0), torch.tensor(y, dtype=torch.long)
+        except queue.Empty:
+            pass
+        real_idx = self.indices[idx]
+        X = torch.from_numpy(self.X_mmap[real_idx].copy()).float()
+        y = int(self.y_mmap[real_idx])
+        return X.unsqueeze(0), torch.tensor(y, dtype=torch.long)
+    def __del__(self):
+        self._stop_prefetch()
+        if hasattr(self, 'X_mmap'):
+            del self.X_mmap
+        if hasattr(self, 'y_mmap'):
+            del self.y_mmap
+
+class PinnedBatchSampler:
+    def __init__(self, dataset, batch_size, device, num_streams=2):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.device = device
+        self.num_streams = num_streams
+        self.streams = [torch.cuda.Stream(device=device) for _ in range(num_streams)]
+        self.current_stream = 0
+        self.batch_queue = queue.Queue(maxsize=4)
+        self.prefetch_running = False
+        self.prefetch_thread = None
+    def start_prefetch(self):
+        self.prefetch_running = True
+        self.prefetch_thread = threading.Thread(target=self._prefetch_batches, daemon=True)
+        self.prefetch_thread.start()
+    def _prefetch_batches(self):
+        indices = np.arange(len(self.dataset))
+        np.random.shuffle(indices)
+        for start in range(0, len(indices), self.batch_size):
+            if not self.prefetch_running:
+                break
+            end = min(start + self.batch_size, len(indices))
+            batch_indices = indices[start:end]
+            X_batch = []
+            y_batch = []
+            for idx in batch_indices:
+                X, y = self.dataset[idx]
+                X_batch.append(X)
+                y_batch.append(y)
+            X_tensor = torch.stack(X_batch).pin_memory()
+            y_tensor = torch.tensor(y_batch).pin_memory()
+            self.batch_queue.put((X_tensor, y_tensor))
+    def __iter__(self):
+        self.start_prefetch()
+        return self
+    def __next__(self):
+        try:
+            X_pinned, y_pinned = self.batch_queue.get(timeout=30)
+            stream = self.streams[self.current_stream]
+            self.current_stream = (self.current_stream + 1) % self.num_streams
+            with torch.cuda.stream(stream):
+                X_gpu = X_pinned.to(self.device, non_blocking=True)
+                y_gpu = y_pinned.to(self.device, non_blocking=True)
+            torch.cuda.current_stream().wait_stream(stream)
+            return X_gpu, y_gpu
+        except queue.Empty:
+            self.prefetch_running = False
+            raise StopIteration
+    def __len__(self):
+        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+
+def build_mmap_loaders(mmap_dir, batch_size=128, cache_gb=8, max_train_samples=1000000, num_workers=0):
+    train_ds = MMapDataset(mmap_dir, 'train', cache_gb=cache_gb, max_samples=max_train_samples)
+    val_ds = MMapDataset(mmap_dir, 'val', cache_gb=cache_gb)
+    test_ds = MMapDataset(mmap_dir, 'test', cache_gb=cache_gb)
+    train_sampler = PinnedBatchSampler(train_ds, batch_size, device=torch.device('cuda'))
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=num_workers>0)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=num_workers>0)
+    return train_sampler, val_loader, test_loader, train_ds.meta
+
+
+# train_mmap.py
+import argparse
+import math
+import os
+import time
+import platform
+from copy import deepcopy
+from pathlib import Path
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from sklearn.metrics import confusion_matrix, accuracy_score, cohen_kappa_score
+from mmap_dataset import build_mmap_loaders
+from ssfnet import SSFTTnet
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--mmap_dir", required=True)
+    p.add_argument("--cache_gb", type=float, default=16)
+    p.add_argument("--max_train_samples", type=int, default=2000000)
+    p.add_argument("--batch_size", type=int, default=256)
+    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--warmup_epochs", type=int, default=3)
+    p.add_argument("--patience", type=int, default=15)
+    p.add_argument("--label_smooth", type=float, default=0.05)
+    p.add_argument("--grad_accum", type=int, default=1)
+    p.add_argument("--amp", action="store_true", default=True)
+    p.add_argument("--no_amp", action="store_false", dest="amp")
+    p.add_argument("--compile", action="store_true", default=False)
+    p.add_argument("--num_tokens", type=int, default=4)
+    p.add_argument("--dim", type=int, default=64)
+    p.add_argument("--depth", type=int, default=1)
+    p.add_argument("--heads", type=int, default=8)
+    p.add_argument("--mlp_dim", type=int, default=8)
+    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--emb_dropout", type=float, default=0.1)
+    p.add_argument("--checkpoint_dir", default="checkpoints")
+    p.add_argument("--resume", default=None)
+    p.add_argument("--save_every", type=int, default=5)
+    return p.parse_args()
+
+def build_scheduler(optimizer, warmup, total):
+    def lr_lambda(ep):
+        if ep < warmup:
+            return (ep + 1) / max(warmup, 1)
+        p = (ep - warmup) / max(total - warmup, 1)
+        return 0.5 * (1.0 + math.cos(math.pi * p))
+    return LambdaLR(optimizer, lr_lambda)
+
+def run_epoch_overlapped(model, train_sampler, criterion, optimizer, scaler, device, use_amp, grad_accum, grad_clip):
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    optimizer.zero_grad(set_to_none=True)
+    compute_event = torch.cuda.Event()
+    transfer_event = torch.cuda.Event()
+    batch_iter = iter(train_sampler)
+    next_batch = None
+    for step in range(len(train_sampler)):
+        if next_batch is None:
+            X, y = next(batch_iter)
+        else:
+            X, y = next_batch
+        if step < len(train_sampler) - 1:
+            next_batch = next(batch_iter)
+            transfer_event.record()
+        is_last = (step + 1) % grad_accum == 0 or (step + 1) == len(train_sampler)
+        with autocast(enabled=use_amp):
+            logits = model(X)
+            loss = criterion(logits, y)
+            if grad_accum > 1:
+                loss = loss / grad_accum
+        scaler.scale(loss).backward()
+        if is_last:
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        if step < len(train_sampler) - 1:
+            compute_event.record()
+            transfer_event.wait(compute_event)
+        with torch.no_grad():
+            total_loss += loss.item() * (grad_accum if is_last else 1) * len(y)
+            correct += (logits.argmax(1) == y).sum().item()
+            total += len(y)
+    return total_loss / total, correct / total
+
+def run_epoch_val(model, loader, criterion, device, use_amp):
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for X, y in loader:
+            X = X.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            with autocast(enabled=use_amp):
+                logits = model(X)
+                loss = criterion(logits, y)
+            total_loss += loss.item() * len(y)
+            correct += (logits.argmax(1) == y).sum().item()
+            total += len(y)
+    return total_loss / total, correct / total
+
+def save_ckpt(path, epoch, model, optimizer, scheduler, scaler, val_acc):
+    raw = model.module if hasattr(model, "module") else model
+    obj = {
+        "epoch": epoch, "val_acc": val_acc, "model": raw.state_dict(),
+        "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict()
+    }
+    torch.save(obj, path)
+
+def load_ckpt(path, model, optimizer, scheduler, scaler, device):
+    ckpt = torch.load(path, map_location=device)
+    raw = model.module if hasattr(model, "module") else model
+    raw.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    scheduler.load_state_dict(ckpt["scheduler"])
+    scaler.load_state_dict(ckpt["scaler"])
+    return ckpt["epoch"], ckpt["val_acc"]
+
+def evaluate_metrics(model, loader, device, use_amp, class_names):
+    model.eval()
+    all_pred, all_true = [], []
+    with torch.no_grad():
+        for X, y in loader:
+            X = X.to(device, non_blocking=True)
+            with autocast(enabled=use_amp):
+                logits = model(X)
+            all_pred.extend(logits.argmax(1).cpu().numpy())
+            all_true.extend(y.numpy())
+    all_pred = np.array(all_pred)
+    all_true = np.array(all_true)
+    oa = accuracy_score(all_true, all_pred) * 100
+    kappa = cohen_kappa_score(all_true, all_pred) * 100
+    cm = confusion_matrix(all_true, all_pred)
+    per_cls = np.diag(cm) / np.maximum(cm.sum(axis=1), 1) * 100
+    aa = per_cls.mean()
+    return oa, aa, kappa, cm, per_cls
+
+def main():
+    args = parse_args()
+    n_gpus = torch.cuda.device_count()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    print(f"\n{'='*65}")
+    print(f"  OS={platform.system()}  GPUs={n_gpus}  device={device}  AMP={args.amp}")
+    train_sampler, val_loader, test_loader, meta = build_mmap_loaders(
+        mmap_dir=args.mmap_dir,
+        batch_size=args.batch_size,
+        cache_gb=args.cache_gb,
+        max_train_samples=args.max_train_samples,
+        num_workers=args.num_workers
+    )
+    model = SSFTTnet(
+        in_channels=1,
+        num_classes=meta["num_classes"],
+        num_tokens=args.num_tokens,
+        dim=args.dim,
+        depth=args.depth,
+        heads=args.heads,
+        mlp_dim=args.mlp_dim,
+        dropout=args.dropout,
+        emb_dropout=args.emb_dropout
+    ).to(device)
+    if n_gpus > 1:
+        model = nn.DataParallel(model)
+        print(f"  DataParallel sur {n_gpus} GPUs")
+    if args.compile and hasattr(torch, "compile"):
+        model = torch.compile(model, mode="max-autotune")
+        print("  torch.compile actif")
+    print(f"{'='*65}\n")
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smooth)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = build_scheduler(optimizer, args.warmup_epochs, args.epochs)
+    scaler = GradScaler(enabled=args.amp)
+    start_epoch, best_val_acc, patience_cnt = 1, 0.0, 0
+    ckpt_dir = Path(args.checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if args.resume and Path(args.resume).exists():
+        start_epoch, best_val_acc = load_ckpt(args.resume, model, optimizer, scheduler, scaler, device)
+        start_epoch += 1
+    for epoch in range(start_epoch, args.epochs + 1):
+        t0 = time.perf_counter()
+        train_sampler.dataset.resample()
+        tr_loss, tr_acc = run_epoch_overlapped(
+            model, train_sampler, criterion, optimizer, scaler,
+            device, args.amp, args.grad_accum, args.grad_clip
+        )
+        va_loss, va_acc = run_epoch_val(model, val_loader, criterion, device, args.amp)
+        scheduler.step()
+        elapsed = time.perf_counter() - t0
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(f"Ep {epoch:03d}/{args.epochs}  tr {tr_loss:.4f}/{tr_acc*100:.2f}%  va {va_loss:.4f}/{va_acc*100:.2f}%  lr {lr_now:.2e}  {elapsed:.1f}s")
+        if epoch % args.save_every == 0:
+            save_ckpt(ckpt_dir / f"ckpt_ep{epoch:03d}.pt", epoch, model, optimizer, scheduler, scaler, va_acc)
+        if va_acc > best_val_acc:
+            best_val_acc = va_acc
+            patience_cnt = 0
+            save_ckpt(ckpt_dir / "best_model.pt", epoch, model, optimizer, scheduler, scaler, va_acc)
+            print("  -> Meilleur modele")
+        else:
+            patience_cnt += 1
+            if patience_cnt >= args.patience:
+                print("  Early stopping")
+                break
+    print(f"\n{'='*65}")
+    ckpt = torch.load(ckpt_dir / "best_model.pt", map_location=device)
+    raw = model.module if hasattr(model, "module") else model
+    raw.load_state_dict(ckpt["model"])
+    oa, aa, kappa, cm, per_cls = evaluate_metrics(model, test_loader, device, args.amp, meta["class_names"])
+    print(f"OA={oa:.2f}%  AA={aa:.2f}%  Kappa={kappa:.2f}%")
+    print(f"{'='*65}\n")
+
+if __name__ == "__main__":
+    main()
