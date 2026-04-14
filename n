@@ -460,3 +460,835 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# dataset_mmap_direct.py
+import gc
+import json
+import random
+import re
+import pickle
+import hashlib
+import threading
+import queue
+import time
+from collections import defaultdict
+from pathlib import Path
+from datetime import datetime
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.decomposition import PCA
+from spectral import envi
+from torch.utils.data import DataLoader, Dataset
+
+NUM_GPUS = max(1, torch.cuda.device_count())
+PATCH_EXTRACT_BATCH = 8192
+PREFETCH_QUEUE_SIZE = 4
+MMAP_CHUNK_SIZE = 10000
+
+def load_mapping(mapping_path):
+    with open(mapping_path) as f:
+        raw = json.load(f)
+    extrude2final = {}
+    for final_class, extrude_list in raw.items():
+        for ext in extrude_list:
+            extrude2final[ext.strip()] = final_class
+    final_classes = sorted(raw.keys())
+    class_names = final_classes + ["background"]
+    label2idx = {name: i for i, name in enumerate(class_names)}
+    return extrude2final, class_names, label2idx
+
+def _load_envi_cube(hdr_path, source):
+    img = envi.open(str(hdr_path))
+    cube = img.load().astype(np.float32)
+    wl = [float(w) for w in img.metadata.get("wavelength", [])]
+    if cube.ndim == 3:
+        if source == "real" and wl and cube.shape[2] == len(wl):
+            cube = cube.transpose(2, 0, 1)
+        elif source != "real" and wl and cube.shape[1] == len(wl):
+            cube = cube.transpose(1, 0, 2)
+    if cube.ndim != 3:
+        raise ValueError(f"Cube invalide : {cube.shape}")
+    return cube, wl
+
+def _load_shapes(json_path):
+    with open(json_path) as f:
+        return json.load(f).get("shapes", [])
+
+def collect_plots_meta(real_dir=None, aug_dir=None):
+    meta_list = []
+    if real_dir:
+        real_dir = Path(real_dir)
+        for hdr in sorted(real_dir.glob("plot_*_cube.hdr")):
+            m = re.match(r"plot_(\d+)_cube", hdr.stem)
+            if not m: continue
+            jsn = real_dir / f"plot_{m.group(1)}_annotations.json"
+            if jsn.exists():
+                meta_list.append({"source": "real", "name": hdr.stem, "hdr": hdr, "jsn": jsn})
+    if aug_dir:
+        aug_dir = Path(aug_dir)
+        for hdr in sorted(aug_dir.glob("*.hdr")):
+            if any(hdr.stem.endswith(s) for s in ("_ratio", "_cube")): continue
+            jsn = aug_dir / f"{hdr.stem}.json"
+            if not jsn.exists(): continue
+            source = "circle" if "circle" in hdr.stem.lower() else "aug"
+            meta_list.append({"source": source, "name": hdr.stem, "hdr": hdr, "jsn": jsn})
+    if not meta_list:
+        raise RuntimeError("Aucun plot trouvé.")
+    return meta_list
+
+def split_plots(plots_meta, split_mode="aug_real", val_ratio=0.15, test_ratio=0.15, random_state=345):
+    rng = random.Random(random_state)
+    if split_mode == "aug_real":
+        aug = [p for p in plots_meta if p["source"] in ("aug", "circle")]
+        real = [p for p in plots_meta if p["source"] == "real"]
+        rng.shuffle(aug)
+        n_val = max(1, int(len(aug) * val_ratio))
+        train, val, test = aug[n_val:], aug[:n_val], real
+    elif split_mode == "shuffle":
+        all_p = plots_meta[:]
+        rng.shuffle(all_p)
+        n = len(all_p)
+        n_test, n_val = max(1, int(n * test_ratio)), max(1, int(n * val_ratio))
+        test = all_p[:n_test]
+        val = all_p[n_test:n_test + n_val]
+        train = all_p[n_test + n_val:]
+    else:
+        raise ValueError(f"split_mode inconnu : {split_mode}")
+    return train, val, test
+
+def _rasterize_cpu(points, H, W):
+    pts = np.array(points, dtype=np.float32)
+    n = len(pts)
+    cols = np.arange(W, dtype=np.float32) + 0.5
+    rows = np.arange(H, dtype=np.float32) + 0.5
+    gc_, gr_ = np.meshgrid(cols, rows)
+    px, py = gc_.ravel(), gr_.ravel()
+    inside = np.zeros(len(px), dtype=bool)
+    x1, y1 = pts[:, 0], pts[:, 1]
+    x2, y2 = np.roll(x1, -1), np.roll(y1, -1)
+    for i in range(n):
+        dy = y2[i] - y1[i]
+        if abs(dy) < 1e-10: continue
+        cond = (y1[i] < py) != (y2[i] < py)
+        xi = x1[i] + (py - y1[i]) * (x2[i] - x1[i]) / dy
+        inside ^= cond & (px < xi)
+    return inside.reshape(H, W)
+
+def build_label_map(H, W, shapes, extrude2final, label2idx):
+    bg = label2idx["background"]
+    lm = np.full((H, W), bg, dtype=np.int32)
+    for shape in shapes:
+        raw = shape.get("label", "").strip()
+        stype = shape.get("shape_type", "")
+        if raw.lower() == "trou" or stype not in ("polygon", "rectangle"): continue
+        final = extrude2final.get(raw)
+        if final is None: continue
+        pts = shape["points"]
+        if len(pts) < 3: continue
+        try: lm[_rasterize_cpu(pts, H, W)] = label2idx[final]
+        except Exception as e: print(f"Warning rasterisation '{raw}': {e}")
+    return lm
+
+def fit_or_load_pca(real_meta_list, pca_components, cache_dir, config_hash, fit_max_pixels=500_000):
+    path = Path(cache_dir) / f"pca_{config_hash}.pkl"
+    if path.exists():
+        with open(path, "rb") as f: return pickle.load(f)
+    pixels = []
+    for meta in real_meta_list:
+        try:
+            cube, _ = _load_envi_cube(meta["hdr"], meta["source"])
+            B, H, W = cube.shape
+            n = min(20_000, H * W)
+            idx = np.random.choice(H * W, n, replace=False)
+            pixels.append(cube.reshape(B, -1)[:, idx].T)
+            del cube; gc.collect()
+        except Exception as e: print(f"Warning {meta['name']}: {e}")
+    pixels = np.concatenate(pixels)
+    if len(pixels) > fit_max_pixels:
+        pixels = pixels[np.random.choice(len(pixels), fit_max_pixels, replace=False)]
+    pca = PCA(n_components=pca_components, whiten=True)
+    pca.fit(pixels)
+    del pixels; gc.collect()
+    with open(path, "wb") as f: pickle.dump(pca, f, protocol=pickle.HIGHEST_PROTOCOL)
+    return pca
+
+def apply_pca_chunked(cube, pca, chunk=30_000):
+    B, H, W = cube.shape
+    flat = cube.reshape(B, -1).T
+    out = np.empty((H * W, pca.n_components_), dtype=np.float32)
+    for s in range(0, len(flat), chunk):
+        out[s:s + chunk] = pca.transform(flat[s:s + chunk])
+    del flat
+    return out.T.reshape(pca.n_components_, H, W).astype(np.float32)
+
+def balance_background(labels, bg_idx, rng, bg_ratio=1.5):
+    fg = labels != bg_idx
+    keep = fg.copy()
+    n_fg = int(fg.sum())
+    if n_fg > 0:
+        bg_pool = np.where(~fg)[0]
+        n_keep = min(int(n_fg * bg_ratio), len(bg_pool))
+        if n_keep > 0: keep[rng.choice(bg_pool, n_keep, replace=False)] = True
+    return keep
+
+def _extract_patches_on_gpu(cube_pca, rows_k, cols_k, patch_size, device):
+    B, H, W = cube_pca.shape
+    m = patch_size // 2
+    cube_t = torch.from_numpy(cube_pca).to(device, non_blocking=True).unsqueeze(0)
+    padded = F.pad(cube_t, (m, m, m, m), mode="constant", value=0)
+    del cube_t
+    n_patches = len(rows_k)
+    all_patches = np.empty((n_patches, B, patch_size, patch_size), dtype=np.float32)
+    for start in range(0, n_patches, PATCH_EXTRACT_BATCH):
+        end = min(start + PATCH_EXTRACT_BATCH, n_patches)
+        rs = rows_k[start:end]
+        cs = cols_k[start:end]
+        batch = torch.stack([padded[0, :, r:r + patch_size, c:c + patch_size] for r, c in zip(rs, cs)])
+        all_patches[start:end] = batch.cpu().numpy()
+        del batch
+    del padded; torch.cuda.empty_cache()
+    return all_patches
+
+class MMAPWriter:
+    def __init__(self, base_dir, split_name, num_bands, patch_size, max_samples=None):
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.split_name = split_name
+        self.num_bands = num_bands
+        self.patch_size = patch_size
+        self.max_samples = max_samples
+        self.current_size = 0
+        self.X_mmap = None
+        self.y_mmap = None
+        self.meta = {"shape": None, "dtype": "float32"}
+        self.lock = threading.Lock()
+        self._init_mmap()
+    def _init_mmap(self):
+        if self.max_samples:
+            shape = (self.max_samples, self.num_bands, self.patch_size, self.patch_size)
+        else:
+            shape = (0, self.num_bands, self.patch_size, self.patch_size)
+        self.X_path = self.base_dir / f"{self.split_name}_X.dat"
+        self.y_path = self.base_dir / f"{self.split_name}_y.dat"
+        self.X_mmap = np.memmap(self.X_path, dtype=np.float32, mode='w+', shape=shape)
+        self.y_mmap = np.memmap(self.y_path, dtype=np.int64, mode='w+', shape=(shape[0],))
+        self.current_size = 0
+    def write_batch(self, X_batch, y_batch):
+        n = len(X_batch)
+        with self.lock:
+            if self.current_size + n > self.X_mmap.shape[0]:
+                new_shape = (self.current_size + n + MMAP_CHUNK_SIZE, self.num_bands, self.patch_size, self.patch_size)
+                self._resize(new_shape)
+            self.X_mmap[self.current_size:self.current_size + n] = X_batch
+            self.y_mmap[self.current_size:self.current_size + n] = y_batch
+            self.current_size += n
+    def _resize(self, new_shape):
+        self.X_mmap.flush()
+        self.y_mmap.flush()
+        del self.X_mmap, self.y_mmap
+        self.X_mmap = np.memmap(self.X_path, dtype=np.float32, mode='r+', shape=new_shape)
+        self.y_mmap = np.memmap(self.y_path, dtype=np.int64, mode='r+', shape=(new_shape[0],))
+    def finalize(self):
+        with self.lock:
+            self.X_mmap.flush()
+            self.y_mmap.flush()
+            if self.current_size < self.X_mmap.shape[0]:
+                final_shape = (self.current_size, self.num_bands, self.patch_size, self.patch_size)
+                del self.X_mmap, self.y_mmap
+                self.X_mmap = np.memmap(self.X_path, dtype=np.float32, mode='r+', shape=final_shape)
+                self.y_mmap = np.memmap(self.y_path, dtype=np.int64, mode='r+', shape=(self.current_size,))
+                self.X_mmap.flush()
+                self.y_mmap.flush()
+            meta = {"shape": list(self.X_mmap.shape), "dtype": str(self.X_mmap.dtype)}
+            with open(self.base_dir / f"{self.split_name}_meta.json", 'w') as f:
+                json.dump(meta, f)
+    def close(self):
+        if hasattr(self, 'X_mmap') and self.X_mmap is not None:
+            del self.X_mmap
+        if hasattr(self, 'y_mmap') and self.y_mmap is not None:
+            del self.y_mmap
+
+def _gpu_worker_mmap(gpu_id, task_queue, mmap_writer, patch_size, extrude2final, label2idx, bg_ratio, random_state, pca, write_lock, counters):
+    device = torch.device(f"cuda:{gpu_id}")
+    bg_idx = label2idx["background"]
+    while True:
+        try: meta = task_queue.get(timeout=30)
+        except queue.Empty: break
+        if meta is None:
+            task_queue.task_done()
+            break
+        name = meta["name"]
+        source = meta["source"]
+        rng = np.random.default_rng(random_state + hash(name) % 10_000)
+        try:
+            cube_raw, _ = _load_envi_cube(meta["hdr"], source)
+            if pca is not None:
+                cube_pca = apply_pca_chunked(cube_raw, pca)
+                del cube_raw; gc.collect()
+            else: cube_pca = cube_raw
+            B, H, W = cube_pca.shape
+            shapes = _load_shapes(meta["jsn"])
+            label_map = build_label_map(H, W, shapes, extrude2final, label2idx)
+            r_all, c_all = np.where(label_map >= 0)
+            labels_all = label_map[r_all, c_all]
+            del label_map
+            keep = balance_background(labels_all, bg_idx, rng, bg_ratio)
+            rows_k = r_all[keep].astype(np.int32)
+            cols_k = c_all[keep].astype(np.int32)
+            labels_k = labels_all[keep].astype(np.int32)
+            del r_all, c_all, labels_all, keep; gc.collect()
+            if len(rows_k) == 0:
+                del cube_pca; gc.collect()
+                task_queue.task_done()
+                continue
+            all_patches = _extract_patches_on_gpu(cube_pca, rows_k, cols_k, patch_size, device)
+            del cube_pca; gc.collect()
+            n_extracted = len(all_patches)
+            mmap_writer.write_batch(all_patches, labels_k)
+            del all_patches, labels_k, rows_k, cols_k; gc.collect()
+            with counters["lock"]:
+                counters["patches"] += n_extracted
+                counters["cubes"] += 1
+                done = counters["cubes"]
+                total = counters["total"]
+                ptch = counters["patches"]
+                if done % 10 == 0 or done == total:
+                    print(f"  GPU{gpu_id} | [{mmap_writer.split_name}] {done}/{total} cubes | {ptch:,} patches | VRAM {torch.cuda.memory_allocated(device)/1e9:.2f} GB")
+        except Exception as e: print(f"  GPU{gpu_id} | {name} : {e}")
+        finally:
+            task_queue.task_done()
+            torch.cuda.empty_cache()
+
+def extract_split_to_mmap(meta_list, split_name, patch_size, extrude2final, label2idx, bg_ratio, random_state, pca, base_dir, balance_train=False):
+    if not meta_list: return 0
+    shuffled = meta_list[:]
+    random.shuffle(shuffled)
+    if pca is not None: num_bands = pca.n_components_
+    else:
+        tmp, _ = _load_envi_cube(shuffled[0]["hdr"], shuffled[0]["source"])
+        num_bands = tmp.shape[0]
+        del tmp; gc.collect()
+    mmap_writer = MMAPWriter(base_dir, split_name, num_bands, patch_size)
+    task_q = queue.Queue(maxsize=PREFETCH_QUEUE_SIZE)
+    counters = {"cubes": 0, "patches": 0, "total": len(shuffled), "lock": threading.Lock()}
+    write_lock = threading.Lock()
+    workers = []
+    for gpu_id in range(NUM_GPUS):
+        t = threading.Thread(target=_gpu_worker_mmap, args=(gpu_id, task_q, mmap_writer, patch_size, extrude2final, label2idx, bg_ratio, random_state, pca, write_lock, counters), daemon=True)
+        t.start()
+        workers.append(t)
+    for meta in shuffled: task_q.put(meta)
+    for _ in range(NUM_GPUS): task_q.put(None)
+    for t in workers: t.join()
+    mmap_writer.finalize()
+    total_patches = counters["patches"]
+    if balance_train and split_name == "train" and total_patches > 0:
+        total_patches = _balance_mmap_direct(base_dir, split_name, patch_size, num_bands, random_state)
+    return total_patches
+
+def _balance_mmap_direct(base_dir, split_name, patch_size, num_bands, random_state):
+    base_dir = Path(base_dir)
+    X_mmap = np.memmap(base_dir / f"{split_name}_X.dat", dtype=np.float32, mode='r')
+    y_mmap = np.memmap(base_dir / f"{split_name}_y.dat", dtype=np.int64, mode='r')
+    n_tot = len(y_mmap)
+    by_label = defaultdict(list)
+    for i in range(n_tot):
+        by_label[int(y_mmap[i])].append(i)
+    min_count = min(len(v) for v in by_label.values())
+    rng = random.Random(random_state)
+    kept_idx = []
+    for lbl, idxs in sorted(by_label.items()):
+        rng.shuffle(idxs)
+        kept_idx.extend(idxs[:min_count])
+    rng.shuffle(kept_idx)
+    kept_idx = np.array(kept_idx, dtype=np.int64)
+    n_new = len(kept_idx)
+    X_new = np.memmap(base_dir / f"{split_name}_balanced_X.dat", dtype=np.float32, mode='w+', shape=(n_new, num_bands, patch_size, patch_size))
+    y_new = np.memmap(base_dir / f"{split_name}_balanced_y.dat", dtype=np.int64, mode='w+', shape=(n_new,))
+    chunk_size = 50000
+    for start in range(0, n_new, chunk_size):
+        end = min(start + chunk_size, n_new)
+        idx_chunk = kept_idx[start:end]
+        X_new[start:end] = X_mmap[idx_chunk]
+        y_new[start:end] = y_mmap[idx_chunk]
+    X_new.flush(); y_new.flush()
+    del X_mmap, y_mmap, X_new, y_new
+    (base_dir / f"{split_name}_X.dat").unlink()
+    (base_dir / f"{split_name}_y.dat").unlink()
+    (base_dir / f"{split_name}_balanced_X.dat").rename(base_dir / f"{split_name}_X.dat")
+    (base_dir / f"{split_name}_balanced_y.dat").rename(base_dir / f"{split_name}_y.dat")
+    return n_new
+
+class LRUMemoryCache:
+    def __init__(self, max_size_gb=8):
+        self.max_size = int(max_size_gb * 1024**3)
+        self.cache = {}
+        self.order = []
+        self.current_size = 0
+        self.lock = threading.Lock()
+    def get(self, key, loader_func):
+        with self.lock:
+            if key in self.cache:
+                self.order.remove(key)
+                self.order.append(key)
+                return self.cache[key]
+        data = loader_func()
+        size = data[0].nbytes + data[1].nbytes
+        with self.lock:
+            while self.current_size + size > self.max_size and self.order:
+                old_key = self.order.pop(0)
+                old_data = self.cache.pop(old_key)
+                self.current_size -= old_data[0].nbytes + old_data[1].nbytes
+            self.cache[key] = data
+            self.order.append(key)
+            self.current_size += size
+        return data
+
+class MMapDataset(Dataset):
+    def __init__(self, mmap_dir, split, cache_gb=8, max_samples=None, random_state=345):
+        mmap_dir = Path(mmap_dir)
+        self.X_mmap = np.memmap(mmap_dir / f"{split}_X.dat", dtype=np.float32, mode='r')
+        self.y_mmap = np.memmap(mmap_dir / f"{split}_y.dat", dtype=np.int64, mode='r')
+        self.total = len(self.y_mmap)
+        self.max_samples = max_samples or self.total
+        self.cache = LRUMemoryCache(cache_gb)
+        self.rng = np.random.RandomState(random_state)
+        self.chunk_size = 512
+        self.prefetch_queue = queue.Queue(maxsize=4)
+        self.prefetch_running = False
+        self.prefetch_thread = None
+        self.resample()
+        self._start_prefetch()
+    def resample(self):
+        if self.max_samples < self.total:
+            self.indices = self.rng.choice(self.total, self.max_samples, replace=False)
+        else:
+            self.indices = np.arange(self.total)
+        self.rng.shuffle(self.indices)
+        self.length = len(self.indices)
+    def _start_prefetch(self):
+        if self.prefetch_thread is not None: self._stop_prefetch()
+        self.prefetch_running = True
+        self.prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
+        self.prefetch_thread.start()
+    def _stop_prefetch(self):
+        self.prefetch_running = False
+        if self.prefetch_thread: self.prefetch_thread.join(timeout=5)
+        while not self.prefetch_queue.empty():
+            try: self.prefetch_queue.get_nowait()
+            except queue.Empty: break
+    def _prefetch_worker(self):
+        chunk_idx = 0
+        while self.prefetch_running:
+            if self.prefetch_queue.qsize() >= 3:
+                time.sleep(0.001)
+                continue
+            start = (chunk_idx * self.chunk_size) % self.length
+            end = min(start + self.chunk_size, self.length)
+            real_indices = self.indices[start:end]
+            def load_chunk():
+                X_chunk = np.array(self.X_mmap[real_indices])
+                y_chunk = np.array(self.y_mmap[real_indices])
+                return (X_chunk, y_chunk)
+            key = f"chunk_{chunk_idx}"
+            try:
+                X_chunk, y_chunk = self.cache.get(key, load_chunk)
+                self.prefetch_queue.put((X_chunk, y_chunk, start), timeout=1)
+                chunk_idx += 1
+            except queue.Full: pass
+            except Exception: break
+    def __len__(self): return self.length
+    def __getitem__(self, idx):
+        try:
+            while True:
+                X_chunk, y_chunk, chunk_start = self.prefetch_queue.get_nowait()
+                if chunk_start <= idx < chunk_start + len(y_chunk):
+                    offset = idx - chunk_start
+                    X = torch.from_numpy(X_chunk[offset]).float()
+                    y = int(y_chunk[offset])
+                    return X.unsqueeze(0), torch.tensor(y, dtype=torch.long)
+        except queue.Empty: pass
+        real_idx = self.indices[idx]
+        X = torch.from_numpy(self.X_mmap[real_idx].copy()).float()
+        y = int(self.y_mmap[real_idx])
+        return X.unsqueeze(0), torch.tensor(y, dtype=torch.long)
+    def __del__(self):
+        self._stop_prefetch()
+        if hasattr(self, 'X_mmap'): del self.X_mmap
+        if hasattr(self, 'y_mmap'): del self.y_mmap
+
+class PinnedBatchSampler:
+    def __init__(self, dataset, batch_size, device, num_streams=2):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.device = device
+        self.num_streams = num_streams
+        self.streams = [torch.cuda.Stream(device=device) for _ in range(num_streams)]
+        self.current_stream = 0
+        self.batch_queue = queue.Queue(maxsize=4)
+        self.prefetch_running = False
+        self.prefetch_thread = None
+    def start_prefetch(self):
+        self.prefetch_running = True
+        self.prefetch_thread = threading.Thread(target=self._prefetch_batches, daemon=True)
+        self.prefetch_thread.start()
+    def _prefetch_batches(self):
+        indices = np.arange(len(self.dataset))
+        np.random.shuffle(indices)
+        for start in range(0, len(indices), self.batch_size):
+            if not self.prefetch_running: break
+            end = min(start + self.batch_size, len(indices))
+            batch_indices = indices[start:end]
+            X_batch, y_batch = [], []
+            for idx in batch_indices:
+                X, y = self.dataset[idx]
+                X_batch.append(X); y_batch.append(y)
+            X_tensor = torch.stack(X_batch).pin_memory()
+            y_tensor = torch.tensor(y_batch).pin_memory()
+            self.batch_queue.put((X_tensor, y_tensor))
+    def __iter__(self):
+        self.start_prefetch()
+        return self
+    def __next__(self):
+        try:
+            X_pinned, y_pinned = self.batch_queue.get(timeout=30)
+            stream = self.streams[self.current_stream]
+            self.current_stream = (self.current_stream + 1) % self.num_streams
+            with torch.cuda.stream(stream):
+                X_gpu = X_pinned.to(self.device, non_blocking=True)
+                y_gpu = y_pinned.to(self.device, non_blocking=True)
+            torch.cuda.current_stream().wait_stream(stream)
+            return X_gpu, y_gpu
+        except queue.Empty:
+            self.prefetch_running = False
+            raise StopIteration
+    def __len__(self):
+        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+
+def build_mmap_loaders_direct(mmap_dir, class_names, label2idx, batch_size=128, cache_gb=8, max_train_samples=1000000, num_workers=0):
+    train_ds = MMapDataset(mmap_dir, 'train', cache_gb=cache_gb, max_samples=max_train_samples)
+    val_ds = MMapDataset(mmap_dir, 'val', cache_gb=cache_gb)
+    test_ds = MMapDataset(mmap_dir, 'test', cache_gb=cache_gb)
+    train_sampler = PinnedBatchSampler(train_ds, batch_size, device=torch.device('cuda'))
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=num_workers>0)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=num_workers>0)
+    meta = {"class_names": class_names, "label2idx": label2idx, "num_classes": len(class_names), "num_bands": train_ds.X_mmap.shape[1], "patch_size": train_ds.X_mmap.shape[2]}
+    return train_sampler, val_loader, test_loader, meta
+
+def build_mmap_direct(real_dir=None, aug_dir=None, mapping_path="mapping.json", split_mode="aug_real", use_pca=True, pca_components=30, patch_size=13, test_ratio=0.15, val_ratio=0.15, batch_size=64, random_state=345, fit_max_pixels=500_000, num_workers=0, bg_ratio=1.5, mmap_dir="mmap_data", force_recompute=False, balance_train=False, cache_gb=8, max_train_samples=1000000):
+    extrude2final, class_names, label2idx = load_mapping(mapping_path)
+    mmap_dir = Path(mmap_dir)
+    mmap_dir.mkdir(parents=True, exist_ok=True)
+    config_str = f"{real_dir}_{aug_dir}_{split_mode}_{patch_size}_{random_state}_{bg_ratio}_{pca_components if use_pca else 0}_{balance_train}"
+    config_hash = hashlib.md5(config_str.encode()).hexdigest()[:12]
+    mmap_subdir = mmap_dir / config_hash
+    mmap_subdir.mkdir(parents=True, exist_ok=True)
+    meta_path = mmap_subdir / "global_meta.json"
+    if not force_recompute and meta_path.exists():
+        with open(meta_path) as f: meta = json.load(f)
+        return build_mmap_loaders_direct(str(mmap_subdir), class_names, label2idx, batch_size, cache_gb, max_train_samples, num_workers)
+    plots_meta = collect_plots_meta(real_dir=real_dir, aug_dir=aug_dir)
+    train_meta, val_meta, test_meta = split_plots(plots_meta, split_mode, val_ratio, test_ratio, random_state)
+    pca_model = None
+    if use_pca:
+        real_meta = [m for m in plots_meta if m["source"] == "real"]
+        if real_meta: pca_model = fit_or_load_pca(real_meta, pca_components, mmap_subdir, config_hash, fit_max_pixels)
+    for meta_list, sname, do_balance in [(train_meta, "train", balance_train), (val_meta, "val", False), (test_meta, "test", False)]:
+        extract_split_to_mmap(meta_list, sname, patch_size, extrude2final, label2idx, bg_ratio, random_state, pca_model, str(mmap_subdir), balance_train=do_balance)
+    meta = {"class_names": class_names, "label2idx": label2idx, "num_bands": pca_components if use_pca else -1, "patch_size": patch_size, "created_at": datetime.now().isoformat()}
+    with open(meta_path, 'w') as f: json.dump(meta, f)
+    return build_mmap_loaders_direct(str(mmap_subdir), class_names, label2idx, batch_size, cache_gb, max_train_samples, num_workers)
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--real_dir")
+    p.add_argument("--aug_dir")
+    p.add_argument("--mapping_path", default="mapping.json")
+    p.add_argument("--split_mode", default="aug_real", choices=["aug_real", "shuffle"])
+    p.add_argument("--use_pca", action="store_true", default=True)
+    p.add_argument("--no_pca", action="store_false", dest="use_pca")
+    p.add_argument("--pca_components", type=int, default=30)
+    p.add_argument("--patch_size", type=int, default=13)
+    p.add_argument("--test_ratio", type=float, default=0.15)
+    p.add_argument("--val_ratio", type=float, default=0.15)
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--random_state", type=int, default=345)
+    p.add_argument("--fit_max_pixels", type=int, default=500_000)
+    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--bg_ratio", type=float, default=1.5)
+    p.add_argument("--mmap_dir", default="mmap_data")
+    p.add_argument("--force_recompute", action="store_true")
+    p.add_argument("--balance_train", action="store_true")
+    p.add_argument("--cache_gb", type=float, default=8)
+    p.add_argument("--max_train_samples", type=int, default=1000000)
+    args = p.parse_args()
+    train_sampler, val_loader, test_loader, meta = build_mmap_direct(**vars(args))
+    batch_iter = iter(train_sampler)
+    X_b, y_b = next(batch_iter)
+    print(f"Batch : {X_b.shape} | Labels : {y_b.shape}")
+
+
+# train_mmap_direct.py
+import argparse
+import math
+import os
+import time
+import platform
+from pathlib import Path
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from sklearn.metrics import confusion_matrix, accuracy_score, cohen_kappa_score
+from dataset_mmap_direct import build_mmap_direct
+from ssfnet import SSFTTnet
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--real_dir", default=None)
+    p.add_argument("--aug_dir", default=None)
+    p.add_argument("--mapping_path", default="mapping.json")
+    p.add_argument("--mmap_dir", default="mmap_data")
+    p.add_argument("--split_mode", default="aug_real", choices=["aug_real", "shuffle"])
+    p.add_argument("--use_pca", action="store_true", default=True)
+    p.add_argument("--no_pca", action="store_false", dest="use_pca")
+    p.add_argument("--pca_components", type=int, default=30)
+    p.add_argument("--patch_size", type=int, default=13)
+    p.add_argument("--val_ratio", type=float, default=0.15)
+    p.add_argument("--test_ratio", type=float, default=0.15)
+    p.add_argument("--bg_ratio", type=float, default=1.5)
+    p.add_argument("--random_state", type=int, default=345)
+    p.add_argument("--fit_max_pixels", type=int, default=500000)
+    p.add_argument("--balance_train", action="store_true")
+    p.add_argument("--force_recompute", action="store_true")
+    p.add_argument("--cache_gb", type=float, default=16)
+    p.add_argument("--max_train_samples", type=int, default=2000000)
+    p.add_argument("--batch_size", type=int, default=256)
+    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--warmup_epochs", type=int, default=3)
+    p.add_argument("--patience", type=int, default=15)
+    p.add_argument("--label_smooth", type=float, default=0.05)
+    p.add_argument("--grad_accum", type=int, default=1)
+    p.add_argument("--amp", action="store_true", default=True)
+    p.add_argument("--no_amp", action="store_false", dest="amp")
+    p.add_argument("--compile", action="store_true", default=False)
+    p.add_argument("--num_tokens", type=int, default=4)
+    p.add_argument("--dim", type=int, default=64)
+    p.add_argument("--depth", type=int, default=1)
+    p.add_argument("--heads", type=int, default=8)
+    p.add_argument("--mlp_dim", type=int, default=8)
+    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--emb_dropout", type=float, default=0.1)
+    p.add_argument("--checkpoint_dir", default="checkpoints")
+    p.add_argument("--resume", default=None)
+    p.add_argument("--save_every", type=int, default=5)
+    return p.parse_args()
+
+def build_scheduler(optimizer, warmup, total):
+    def lr_lambda(ep):
+        if ep < warmup:
+            return (ep + 1) / max(warmup, 1)
+        p = (ep - warmup) / max(total - warmup, 1)
+        return 0.5 * (1.0 + math.cos(math.pi * p))
+    return LambdaLR(optimizer, lr_lambda)
+
+def run_epoch_overlapped(model, train_sampler, criterion, optimizer, scaler, device, use_amp, grad_accum, grad_clip):
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    optimizer.zero_grad(set_to_none=True)
+    compute_event = torch.cuda.Event()
+    transfer_event = torch.cuda.Event()
+    batch_iter = iter(train_sampler)
+    next_batch = None
+    for step in range(len(train_sampler)):
+        if next_batch is None:
+            X, y = next(batch_iter)
+        else:
+            X, y = next_batch
+        if step < len(train_sampler) - 1:
+            next_batch = next(batch_iter)
+            transfer_event.record()
+        is_last = (step + 1) % grad_accum == 0 or (step + 1) == len(train_sampler)
+        with autocast(enabled=use_amp):
+            logits = model(X)
+            loss = criterion(logits, y)
+            if grad_accum > 1:
+                loss = loss / grad_accum
+        scaler.scale(loss).backward()
+        if is_last:
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        if step < len(train_sampler) - 1:
+            compute_event.record()
+            transfer_event.wait(compute_event)
+        with torch.no_grad():
+            total_loss += loss.item() * (grad_accum if is_last else 1) * len(y)
+            correct += (logits.argmax(1) == y).sum().item()
+            total += len(y)
+    return total_loss / total, correct / total
+
+def run_epoch_val(model, loader, criterion, device, use_amp):
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for X, y in loader:
+            X = X.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            with autocast(enabled=use_amp):
+                logits = model(X)
+                loss = criterion(logits, y)
+            total_loss += loss.item() * len(y)
+            correct += (logits.argmax(1) == y).sum().item()
+            total += len(y)
+    return total_loss / total, correct / total
+
+def save_ckpt(path, epoch, model, optimizer, scheduler, scaler, val_acc):
+    raw = model.module if hasattr(model, "module") else model
+    obj = {
+        "epoch": epoch, "val_acc": val_acc, "model": raw.state_dict(),
+        "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict()
+    }
+    torch.save(obj, path)
+
+def load_ckpt(path, model, optimizer, scheduler, scaler, device):
+    ckpt = torch.load(path, map_location=device)
+    raw = model.module if hasattr(model, "module") else model
+    raw.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    scheduler.load_state_dict(ckpt["scheduler"])
+    scaler.load_state_dict(ckpt["scaler"])
+    return ckpt["epoch"], ckpt["val_acc"]
+
+def evaluate_metrics(model, loader, device, use_amp, class_names):
+    model.eval()
+    all_pred, all_true = [], []
+    with torch.no_grad():
+        for X, y in loader:
+            X = X.to(device, non_blocking=True)
+            with autocast(enabled=use_amp):
+                logits = model(X)
+            all_pred.extend(logits.argmax(1).cpu().numpy())
+            all_true.extend(y.numpy())
+    all_pred = np.array(all_pred)
+    all_true = np.array(all_true)
+    oa = accuracy_score(all_true, all_pred) * 100
+    kappa = cohen_kappa_score(all_true, all_pred) * 100
+    cm = confusion_matrix(all_true, all_pred)
+    per_cls = np.diag(cm) / np.maximum(cm.sum(axis=1), 1) * 100
+    aa = per_cls.mean()
+    return oa, aa, kappa, cm, per_cls
+
+def main():
+    args = parse_args()
+    if not args.real_dir and not args.aug_dir:
+        raise ValueError("Fournir --real_dir ou --aug_dir")
+    n_gpus = torch.cuda.device_count()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    print(f"\n{'='*65}")
+    print(f"  OS={platform.system()}  GPUs={n_gpus}  device={device}  AMP={args.amp}")
+    train_sampler, val_loader, test_loader, meta = build_mmap_direct(
+        real_dir=args.real_dir,
+        aug_dir=args.aug_dir,
+        mapping_path=args.mapping_path,
+        split_mode=args.split_mode,
+        use_pca=args.use_pca,
+        pca_components=args.pca_components,
+        patch_size=args.patch_size,
+        test_ratio=args.test_ratio,
+        val_ratio=args.val_ratio,
+        batch_size=args.batch_size,
+        random_state=args.random_state,
+        fit_max_pixels=args.fit_max_pixels,
+        num_workers=args.num_workers,
+        bg_ratio=args.bg_ratio,
+        mmap_dir=args.mmap_dir,
+        force_recompute=args.force_recompute,
+        balance_train=args.balance_train,
+        cache_gb=args.cache_gb,
+        max_train_samples=args.max_train_samples
+    )
+    model = SSFTTnet(
+        in_channels=1,
+        num_classes=meta["num_classes"],
+        num_tokens=args.num_tokens,
+        dim=args.dim,
+        depth=args.depth,
+        heads=args.heads,
+        mlp_dim=args.mlp_dim,
+        dropout=args.dropout,
+        emb_dropout=args.emb_dropout
+    ).to(device)
+    if n_gpus > 1:
+        model = nn.DataParallel(model)
+        print(f"  DataParallel sur {n_gpus} GPUs")
+    if args.compile and hasattr(torch, "compile"):
+        model = torch.compile(model, mode="max-autotune")
+        print("  torch.compile actif")
+    print(f"{'='*65}\n")
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smooth)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = build_scheduler(optimizer, args.warmup_epochs, args.epochs)
+    scaler = GradScaler(enabled=args.amp)
+    start_epoch, best_val_acc, patience_cnt = 1, 0.0, 0
+    ckpt_dir = Path(args.checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if args.resume and Path(args.resume).exists():
+        start_epoch, best_val_acc = load_ckpt(args.resume, model, optimizer, scheduler, scaler, device)
+        start_epoch += 1
+    for epoch in range(start_epoch, args.epochs + 1):
+        t0 = time.perf_counter()
+        train_sampler.dataset.resample()
+        tr_loss, tr_acc = run_epoch_overlapped(
+            model, train_sampler, criterion, optimizer, scaler,
+            device, args.amp, args.grad_accum, args.grad_clip
+        )
+        va_loss, va_acc = run_epoch_val(model, val_loader, criterion, device, args.amp)
+        scheduler.step()
+        elapsed = time.perf_counter() - t0
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(f"Ep {epoch:03d}/{args.epochs}  tr {tr_loss:.4f}/{tr_acc*100:.2f}%  va {va_loss:.4f}/{va_acc*100:.2f}%  lr {lr_now:.2e}  {elapsed:.1f}s")
+        if epoch % args.save_every == 0:
+            save_ckpt(ckpt_dir / f"ckpt_ep{epoch:03d}.pt", epoch, model, optimizer, scheduler, scaler, va_acc)
+        if va_acc > best_val_acc:
+            best_val_acc = va_acc
+            patience_cnt = 0
+            save_ckpt(ckpt_dir / "best_model.pt", epoch, model, optimizer, scheduler, scaler, va_acc)
+            print("  -> Meilleur modele")
+        else:
+            patience_cnt += 1
+            if patience_cnt >= args.patience:
+                print("  Early stopping")
+                break
+    print(f"\n{'='*65}")
+    ckpt = torch.load(ckpt_dir / "best_model.pt", map_location=device)
+    raw = model.module if hasattr(model, "module") else model
+    raw.load_state_dict(ckpt["model"])
+    oa, aa, kappa, cm, per_cls = evaluate_metrics(model, test_loader, device, args.amp, meta["class_names"])
+    print(f"OA={oa:.2f}%  AA={aa:.2f}%  Kappa={kappa:.2f}%")
+    for i, name in enumerate(meta["class_names"]):
+        print(f"  {name}: {per_cls[i]:.2f}%")
+    print(f"{'='*65}\n")
+
+if __name__ == "__main__":
+    main()
