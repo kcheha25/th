@@ -203,11 +203,16 @@ for class_name in real_class_folders:
     netG = torch.load(gan_path, map_location=device)
     netG.eval()
 
-    latent_dim = 100
+    fake_spectra = []
 
     with torch.no_grad():
-        z = torch.randn(100, latent_dim).to(device)
-        fake_spectra = netG(z).cpu().numpy()
+        for _ in range(100):
+            noise = torch.randn(1, 64, 1, device=device)
+            fake = netG(noise).cpu().squeeze().numpy()
+            fake = (fake + 1) / 2
+            fake_spectra.append(fake)
+
+    fake_spectra = np.array(fake_spectra)
 
     selected = random.sample(range(100), 3)
 
@@ -223,16 +228,28 @@ for class_name in real_class_folders:
         L1 = np.sum(np.abs(diff))
         L2 = np.sqrt(np.sum(diff ** 2))
 
+        diff_mean = np.mean(diff)
+        diff_max = np.max(np.abs(diff))
+        diff_min = np.min(diff)
+
+        nn_distance = dist[0][0]
+
         plt.figure()
-        plt.plot(real_spec)
-        plt.plot(gan_spec.flatten())
-        plt.title(f"{class_name} | L1={L1:.4e} | L2={L2:.4e}")
+        plt.plot(real_spec, label="Real")
+        plt.plot(gan_spec.flatten(), label="GAN")
+        plt.legend()
+        plt.title(
+            f"{class_name} | NN={nn_distance:.4e} | L1={L1:.4e} | L2={L2:.4e} | "
+            f"mean={diff_mean:.2e} | max={diff_max:.2e}"
+        )
         plt.savefig(os.path.join(OUTPUT_DIR, f"{class_name}_gan_vs_real_{i}.png"))
         plt.close()
 
         plt.figure()
         plt.plot(diff)
-        plt.title(f"{class_name}")
+        plt.title(
+            f"{class_name} diff | min={diff_min:.2e} | max={diff_max:.2e} | mean={diff_mean:.2e}"
+        )
         plt.savefig(os.path.join(OUTPUT_DIR, f"{class_name}_diff_{i}.png"))
         plt.close()
 
