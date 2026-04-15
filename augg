@@ -254,3 +254,107 @@ for class_name in real_class_folders:
         plt.close()
 
     print(f"Classe {class_name} OK")
+
+
+
+import os
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+from spectral import envi
+from sklearn.decomposition import PCA
+from glob import glob
+
+REAL_DIR = "extrudes_cubes_vf"
+AUG_DIR = "aug_data"
+OUTPUT_DIR = "results"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+with open("mapping.json", "r") as f:
+    class_mapping = json.load(f)
+
+def load_cube(hdr_path):
+    img = envi.open(hdr_path)
+    cube = np.array(img.load())
+    if cube.shape[-1] != 272:
+        for i, dim in enumerate(cube.shape):
+            if dim == 272:
+                if i == 0:
+                    cube = np.transpose(cube, (1, 2, 0))
+                elif i == 1:
+                    cube = np.transpose(cube, (0, 2, 1))
+                break
+    return cube
+
+def extract_spectra(cube):
+    spectra = cube.reshape(-1, cube.shape[-1])
+    mask = np.any(spectra != 0, axis=1)
+    return spectra[mask]
+
+def get_super_class(sub_class):
+    for super_class, sub_list in class_mapping.items():
+        if sub_class in sub_list:
+            return super_class
+    return None
+
+real_spectra_all = []
+aug_spectra_all = []
+
+real_labels = []
+aug_labels = []
+
+for folder in os.listdir(REAL_DIR):
+    sub_class = folder.split("_")[0]
+    super_class = get_super_class(sub_class)
+
+    if super_class is None:
+        continue
+
+    folder_path = os.path.join(REAL_DIR, folder)
+    hdr_files = glob(os.path.join(folder_path, "*.hdr"))
+
+    for hdr in hdr_files:
+        cube = load_cube(hdr)
+        spectra = extract_spectra(cube)
+        real_spectra_all.append(spectra)
+        real_labels.extend([super_class] * len(spectra))
+
+for sub_class in os.listdir(AUG_DIR):
+    super_class = get_super_class(sub_class)
+
+    if super_class is None:
+        continue
+
+    folder_path = os.path.join(AUG_DIR, sub_class)
+    hdr_files = glob(os.path.join(folder_path, "*.hdr"))
+
+    for hdr in hdr_files:
+        cube = load_cube(hdr)
+        spectra = extract_spectra(cube)
+        aug_spectra_all.append(spectra)
+        aug_labels.extend([super_class] * len(spectra))
+
+real_spectra = np.vstack(real_spectra_all)
+aug_spectra = np.vstack(aug_spectra_all)
+
+all_data = np.vstack([real_spectra, aug_spectra])
+
+pca = PCA(n_components=2)
+pca.fit(all_data)
+
+real_pca = pca.transform(real_spectra)
+aug_pca = pca.transform(aug_spectra)
+
+plt.figure(figsize=(10, 7))
+
+plt.scatter(real_pca[:, 0], real_pca[:, 1],
+            s=1, alpha=0.3, label="Real")
+
+plt.scatter(aug_pca[:, 0], aug_pca[:, 1],
+            s=1, alpha=0.3, label="GAN/Augmented")
+
+plt.legend()
+plt.title("Global PCA - Real vs Augmented (All Classes)")
+plt.savefig(os.path.join(OUTPUT_DIR, "PCA_GLOBAL.png"), dpi=300)
+plt.close()
