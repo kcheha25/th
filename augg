@@ -258,7 +258,6 @@ for class_name in real_class_folders:
 
 
 import os
-import json
 import numpy as np
 import matplotlib.pyplot as plt
 from spectral import envi
@@ -270,9 +269,6 @@ AUG_DIR = "aug_data"
 OUTPUT_DIR = "results"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-with open("mapping.json", "r") as f:
-    class_mapping = json.load(f)
 
 def load_cube(hdr_path):
     img = envi.open(hdr_path)
@@ -292,51 +288,29 @@ def extract_spectra(cube):
     mask = np.any(spectra != 0, axis=1)
     return spectra[mask]
 
-def get_super_class(sub_class):
-    for super_class, sub_list in class_mapping.items():
-        if sub_class in sub_list:
-            return super_class
-    return None
-
-real_spectra_all = []
-aug_spectra_all = []
-
-real_labels = []
-aug_labels = []
+real_spectra_list = []
+aug_spectra_list = []
 
 for folder in os.listdir(REAL_DIR):
-    sub_class = folder.split("_")[0]
-    super_class = get_super_class(sub_class)
-
-    if super_class is None:
-        continue
-
     folder_path = os.path.join(REAL_DIR, folder)
     hdr_files = glob(os.path.join(folder_path, "*.hdr"))
 
     for hdr in hdr_files:
         cube = load_cube(hdr)
         spectra = extract_spectra(cube)
-        real_spectra_all.append(spectra)
-        real_labels.extend([super_class] * len(spectra))
+        real_spectra_list.append(spectra)
 
-for sub_class in os.listdir(AUG_DIR):
-    super_class = get_super_class(sub_class)
-
-    if super_class is None:
-        continue
-
-    folder_path = os.path.join(AUG_DIR, sub_class)
+for folder in os.listdir(AUG_DIR):
+    folder_path = os.path.join(AUG_DIR, folder)
     hdr_files = glob(os.path.join(folder_path, "*.hdr"))
 
     for hdr in hdr_files:
         cube = load_cube(hdr)
         spectra = extract_spectra(cube)
-        aug_spectra_all.append(spectra)
-        aug_labels.extend([super_class] * len(spectra))
+        aug_spectra_list.append(spectra)
 
-real_spectra = np.vstack(real_spectra_all)
-aug_spectra = np.vstack(aug_spectra_all)
+real_spectra = np.vstack(real_spectra_list)
+aug_spectra = np.vstack(aug_spectra_list)
 
 all_data = np.vstack([real_spectra, aug_spectra])
 
@@ -352,9 +326,38 @@ plt.scatter(real_pca[:, 0], real_pca[:, 1],
             s=1, alpha=0.3, label="Real")
 
 plt.scatter(aug_pca[:, 0], aug_pca[:, 1],
-            s=1, alpha=0.3, label="GAN/Augmented")
+            s=1, alpha=0.3, label="GAN / Augmented")
 
 plt.legend()
-plt.title("Global PCA - Real vs Augmented (All Classes)")
+plt.title("PCA global - Real vs GAN")
 plt.savefig(os.path.join(OUTPUT_DIR, "PCA_GLOBAL.png"), dpi=300)
 plt.close()
+
+
+def forward(self, x, mask=None):
+    b = x.shape[0]  # taille réelle du batch sur CE GPU
+
+    x = self.conv3d_features(x)
+    x = rearrange(x, 'b c h w y -> b (c h) w y')
+    x = self.conv2d_features(x)
+    x = rearrange(x, 'b c h w -> b (h w) c')
+
+    # Expand explicitement sur le batch de CE GPU
+    wa = self.token_wA.expand(b, -1, -1)          # (b, L, 64)
+    wa = rearrange(wa, 'b h w -> b w h')
+    A = torch.einsum('bij,bjk->bik', x, wa)
+    A = rearrange(A, 'b h w -> b w h')
+    A = A.softmax(dim=-1)
+
+    wv = self.token_wV.expand(b, -1, -1)          # (b, 64, cT)
+    VV = torch.einsum('bij,bjk->bik', x, wv)
+    T = torch.einsum('bij,bjk->bik', A, VV)
+
+    cls_tokens = self.cls_token.expand(b, -1, -1)  # (b, 1, dim)
+    x = torch.cat((cls_tokens, T), dim=1)
+    x += self.pos_embedding                         # broadcast ok
+    x = self.dropout(x)
+    x = self.transformer(x, mask)
+    x = self.to_cls_token(x[:, 0])
+    x = self.nn1(x)
+    return x
