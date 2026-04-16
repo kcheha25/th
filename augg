@@ -784,3 +784,25 @@ plt.close()
 print(f"\nPlot saved to: {output_path}")
 print(f"Real points: {real_total:,} (foreground)")
 print(f"Augmented points: {aug_total:,} (background)")
+
+
+def main():
+    args = parse_args()
+    torch.multiprocessing.set_start_method('spawn', force=True)  # ← ajouter ici
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# Avant
+torch.save(model.state_dict(), ckpt_dir / "best_model.pt")
+
+# Après
+m = model.module if hasattr(model, 'module') else model
+torch.save(m.state_dict(), ckpt_dir / "best_model.pt")
+
+
+# Avant
+model.load_state_dict(torch.load(ckpt_dir / "best_model.pt"))
+
+# Après
+m = model.module if hasattr(model, 'module') else model
+m.load_state_dict(torch.load(ckpt_dir / "best_model.pt"))
