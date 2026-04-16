@@ -261,7 +261,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from spectral import envi
-from sklearn.decomposition import PCA
+from sklearn.decomposition import IncrementalPCA
 from glob import glob
 
 REAL_DIR = "extrudes_cubes_vf"
@@ -288,46 +288,51 @@ def extract_spectra(cube):
     mask = np.any(spectra != 0, axis=1)
     return spectra[mask]
 
-real_spectra_list = []
-aug_spectra_list = []
+BATCH_SIZE = 5000
+pca = IncrementalPCA(n_components=2)
+
+def fit_pca_from_dir(directory):
+    for folder in os.listdir(directory):
+        folder_path = os.path.join(directory, folder)
+        hdr_files = glob(os.path.join(folder_path, "*.hdr"))
+        for hdr in hdr_files:
+            cube = load_cube(hdr)
+            spectra = extract_spectra(cube)
+            for i in range(0, len(spectra), BATCH_SIZE):
+                pca.partial_fit(spectra[i:i + BATCH_SIZE])
+
+fit_pca_from_dir(REAL_DIR)
+fit_pca_from_dir(AUG_DIR)
+
+real_pca_list = []
 
 for folder in os.listdir(REAL_DIR):
-    folder_path = os.path.join(REAL_DIR, folder)
-    hdr_files = glob(os.path.join(folder_path, "*.hdr"))
-
+    folder_path = os.path.join(folder)
+    hdr_files = glob(os.path.join(REAL_DIR, folder, "*.hdr"))
     for hdr in hdr_files:
         cube = load_cube(hdr)
         spectra = extract_spectra(cube)
-        real_spectra_list.append(spectra)
+        for i in range(0, len(spectra), BATCH_SIZE):
+            real_pca_list.append(pca.transform(spectra[i:i + BATCH_SIZE]))
+
+real_pca = np.vstack(real_pca_list)
+
+aug_pca_list = []
 
 for folder in os.listdir(AUG_DIR):
-    folder_path = os.path.join(AUG_DIR, folder)
-    hdr_files = glob(os.path.join(folder_path, "*.hdr"))
-
+    folder_path = os.path.join(folder)
+    hdr_files = glob(os.path.join(AUG_DIR, folder, "*.hdr"))
     for hdr in hdr_files:
         cube = load_cube(hdr)
         spectra = extract_spectra(cube)
-        aug_spectra_list.append(spectra)
+        for i in range(0, len(spectra), BATCH_SIZE):
+            aug_pca_list.append(pca.transform(spectra[i:i + BATCH_SIZE]))
 
-real_spectra = np.vstack(real_spectra_list)
-aug_spectra = np.vstack(aug_spectra_list)
-
-all_data = np.vstack([real_spectra, aug_spectra])
-
-pca = PCA(n_components=2)
-pca.fit(all_data)
-
-real_pca = pca.transform(real_spectra)
-aug_pca = pca.transform(aug_spectra)
+aug_pca = np.vstack(aug_pca_list)
 
 plt.figure(figsize=(10, 7))
-
-plt.scatter(real_pca[:, 0], real_pca[:, 1],
-            s=1, alpha=0.3, label="Real")
-
-plt.scatter(aug_pca[:, 0], aug_pca[:, 1],
-            s=1, alpha=0.3, label="GAN / Augmented")
-
+plt.scatter(real_pca[:, 0], real_pca[:, 1], s=1, alpha=0.3, label="Real")
+plt.scatter(aug_pca[:, 0], aug_pca[:, 1], s=1, alpha=0.3, label="GAN / Augmented")
 plt.legend()
 plt.title("PCA global - Real vs GAN")
 plt.savefig(os.path.join(OUTPUT_DIR, "PCA_GLOBAL.png"), dpi=300)
@@ -361,3 +366,421 @@ def forward(self, x, mask=None):
     x = self.to_cls_token(x[:, 0])
     x = self.nn1(x)
     return x
+
+state = torch.load(ckpt_dir / "best_model.pt")
+if torch.cuda.device_count() > 1:
+    model.module.load_state_dict(state)
+else:
+    model.load_state_dict(state)
+
+# Avant
+torch.save(model.state_dict(), ...)
+
+# Après
+m = model.module if hasattr(model, 'module') else model
+torch.save(m.state_dict(), ckpt_dir / "best_model.pt")
+
+
+
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from spectral import envi
+from sklearn.decomposition import IncrementalPCA
+from glob import glob
+
+REAL_DIR = "extrudes_cubes_vf"
+AUG_DIR = "aug_data"
+OUTPUT_DIR = "results"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def load_cube(hdr_path):
+    img = envi.open(hdr_path)
+    cube = np.array(img.load())
+    if cube.shape[-1] != 272:
+        for i, dim in enumerate(cube.shape):
+            if dim == 272:
+                if i == 0:
+                    cube = np.transpose(cube, (1, 2, 0))
+                elif i == 1:
+                    cube = np.transpose(cube, (0, 2, 1))
+                break
+    return cube
+
+def extract_spectra(cube):
+    spectra = cube.reshape(-1, cube.shape[-1])
+    mask = np.any(spectra != 0, axis=1)
+    return spectra[mask]
+
+BATCH_SIZE = 5000
+pca = IncrementalPCA(n_components=2)
+
+def fit_pca_from_dir(directory):
+    for folder in os.listdir(directory):
+        folder_path = os.path.join(directory, folder)
+        hdr_files = glob(os.path.join(folder_path, "*.hdr"))
+        for hdr in hdr_files:
+            cube = load_cube(hdr)
+            spectra = extract_spectra(cube)
+            for i in range(0, len(spectra), BATCH_SIZE):
+                pca.partial_fit(spectra[i:i + BATCH_SIZE])
+
+fit_pca_from_dir(REAL_DIR)
+fit_pca_from_dir(AUG_DIR)
+
+real_pca_list = []
+
+for folder in os.listdir(REAL_DIR):
+    folder_path = os.path.join(folder)
+    hdr_files = glob(os.path.join(REAL_DIR, folder, "*.hdr"))
+    for hdr in hdr_files:
+        cube = load_cube(hdr)
+        spectra = extract_spectra(cube)
+        for i in range(0, len(spectra), BATCH_SIZE):
+            real_pca_list.append(pca.transform(spectra[i:i + BATCH_SIZE]))
+
+real_pca = np.vstack(real_pca_list)
+
+aug_pca_list = []
+
+for folder in os.listdir(AUG_DIR):
+    folder_path = os.path.join(folder)
+    hdr_files = glob(os.path.join(AUG_DIR, folder, "*.hdr"))
+    for hdr in hdr_files:
+        cube = load_cube(hdr)
+        spectra = extract_spectra(cube)
+        for i in range(0, len(spectra), BATCH_SIZE):
+            aug_pca_list.append(pca.transform(spectra[i:i + BATCH_SIZE]))
+
+aug_pca = np.vstack(aug_pca_list)
+
+plt.figure(figsize=(10, 7))
+plt.scatter(real_pca[:, 0], real_pca[:, 1], s=1, alpha=0.3, label="Real")
+plt.scatter(aug_pca[:, 0], aug_pca[:, 1], s=1, alpha=0.3, label="GAN / Augmented")
+plt.legend()
+plt.title("PCA global - Real vs GAN")
+plt.savefig(os.path.join(OUTPUT_DIR, "PCA_GLOBAL.png"), dpi=300)
+plt.close()
+
+
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from spectral import envi
+from sklearn.decomposition import IncrementalPCA
+from glob import glob
+
+REAL_DIR = "extrudes_cubes_vf"
+AUG_DIR = "aug_data"
+OUTPUT_DIR = "results"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def load_cube(hdr_path):
+    img = envi.open(hdr_path)
+    cube = np.array(img.load())
+    if cube.shape[-1] != 272:
+        for i, dim in enumerate(cube.shape):
+            if dim == 272:
+                if i == 0:
+                    cube = np.transpose(cube, (1, 2, 0))
+                elif i == 1:
+                    cube = np.transpose(cube, (0, 2, 1))
+                break
+    return cube
+
+def extract_spectra(cube):
+    spectra = cube.reshape(-1, cube.shape[-1])
+    mask = np.any(spectra != 0, axis=1)
+    return spectra[mask]
+
+BATCH_SIZE = 5000
+
+pca = IncrementalPCA(n_components=2)
+
+def fit_pca_on_real_only(directory):
+    print(f"Fitting PCA on {directory}...")
+    file_count = 0
+    total_spectra = 0
+    
+    for folder in os.listdir(directory):
+        folder_path = os.path.join(directory, folder)
+        if not os.path.isdir(folder_path):
+            continue
+            
+        hdr_files = glob(os.path.join(folder_path, "*.hdr"))
+        for hdr in hdr_files:
+            cube = load_cube(hdr)
+            spectra = extract_spectra(cube)
+            total_spectra += len(spectra)
+            
+            for i in range(0, len(spectra), BATCH_SIZE):
+                pca.partial_fit(spectra[i:i + BATCH_SIZE])
+            
+            file_count += 1
+            if file_count % 10 == 0:
+                print(f"  Processed {file_count} files, {total_spectra:,} spectra")
+    
+    print(f"Completed: {file_count} files, {total_spectra:,} spectra")
+    return total_spectra
+
+n_real_spectra = fit_pca_on_real_only(REAL_DIR)
+
+print(f"\nPCA fitted on {n_real_spectra:,} real spectra")
+print(f"Explained variance ratio: {pca.explained_variance_ratio_}")
+print(f"Total variance explained: {sum(pca.explained_variance_ratio_):.2%}")
+
+plt.figure(figsize=(12, 8))
+
+print("\nPlotting augmented data...")
+aug_total = 0
+aug_file_count = 0
+aug_batch_count = 0
+
+for folder in os.listdir(AUG_DIR):
+    folder_path = os.path.join(AUG_DIR, folder)
+    if not os.path.isdir(folder_path):
+        continue
+        
+    hdr_files = glob(os.path.join(folder_path, "*.hdr"))
+    for hdr in hdr_files:
+        cube = load_cube(hdr)
+        spectra = extract_spectra(cube)
+        
+        for i in range(0, len(spectra), BATCH_SIZE):
+            batch = spectra[i:i + BATCH_SIZE]
+            transformed = pca.transform(batch)
+            
+            plt.scatter(transformed[:, 0], transformed[:, 1], 
+                       s=2, alpha=0.2, c='red', 
+                       label='Augmented' if aug_total == 0 else "",
+                       edgecolors='none', zorder=1)
+            
+            aug_total += len(transformed)
+            aug_batch_count += 1
+            
+            if aug_batch_count % 20 == 0:
+                print(f"  Plotted {aug_total:,} augmented points...")
+        
+        aug_file_count += 1
+        if aug_file_count % 10 == 0:
+            print(f"  Processed {aug_file_count} augmented files, {aug_total:,} points")
+
+print(f"Finished plotting {aug_total:,} augmented points")
+
+print("\nPlotting real data...")
+real_total = 0
+real_file_count = 0
+real_batch_count = 0
+label_added = False
+
+for folder in os.listdir(REAL_DIR):
+    folder_path = os.path.join(REAL_DIR, folder)
+    if not os.path.isdir(folder_path):
+        continue
+        
+    hdr_files = glob(os.path.join(folder_path, "*.hdr"))
+    for hdr in hdr_files:
+        cube = load_cube(hdr)
+        spectra = extract_spectra(cube)
+        
+        for i in range(0, len(spectra), BATCH_SIZE):
+            batch = spectra[i:i + BATCH_SIZE]
+            transformed = pca.transform(batch)
+            
+            plt.scatter(transformed[:, 0], transformed[:, 1], 
+                       s=3, alpha=0.8, c='blue', 
+                       label='Real' if not label_added else "",
+                       edgecolors='white', linewidth=0.1, zorder=10)
+            
+            real_total += len(transformed)
+            real_batch_count += 1
+            label_added = True
+            
+            if real_batch_count % 20 == 0:
+                print(f"  Plotted {real_total:,} real points...")
+        
+        real_file_count += 1
+        if real_file_count % 10 == 0:
+            print(f"  Processed {real_file_count} real files, {real_total:,} points")
+
+print(f"Finished plotting {real_total:,} real points")
+
+plt.xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)")
+plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)")
+plt.title(f"PCA Projection (fitted on REAL data only)\nReal: {real_total:,} spectra | Augmented: {aug_total:,} spectra")
+plt.legend(markerscale=5)
+plt.grid(True, alpha=0.2)
+
+output_path = os.path.join(OUTPUT_DIR, "PCA_REAL_FOREGROUND_BATCH.png")
+plt.savefig(output_path, dpi=300, bbox_inches='tight')
+plt.close()
+
+print(f"\nPlot saved to: {output_path}")
+print(f"Real points: {real_total:,} (foreground)")
+print(f"Augmented points: {aug_total:,} (background)")
+
+
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from spectral import envi
+from sklearn.decomposition import IncrementalPCA
+from glob import glob
+
+REAL_DIR = "extrudes_cubes_vf"
+AUG_DIR = "aug_data"
+OUTPUT_DIR = "results"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def load_cube(hdr_path):
+    img = envi.open(hdr_path)
+    cube = np.array(img.load())
+    if cube.shape[-1] != 272:
+        for i, dim in enumerate(cube.shape):
+            if dim == 272:
+                if i == 0:
+                    cube = np.transpose(cube, (1, 2, 0))
+                elif i == 1:
+                    cube = np.transpose(cube, (0, 2, 1))
+                break
+    return cube
+
+def extract_spectra(cube):
+    spectra = cube.reshape(-1, cube.shape[-1])
+    mask = np.any(spectra != 0, axis=1)
+    return spectra[mask]
+
+BATCH_SIZE = 5000
+
+pca = IncrementalPCA(n_components=3)
+
+def fit_pca_on_real_only(directory):
+    print(f"Fitting PCA on {directory}...")
+    file_count = 0
+    total_spectra = 0
+    
+    for folder in os.listdir(directory):
+        folder_path = os.path.join(directory, folder)
+        if not os.path.isdir(folder_path):
+            continue
+            
+        hdr_files = glob(os.path.join(folder_path, "*.hdr"))
+        for hdr in hdr_files:
+            cube = load_cube(hdr)
+            spectra = extract_spectra(cube)
+            total_spectra += len(spectra)
+            
+            for i in range(0, len(spectra), BATCH_SIZE):
+                pca.partial_fit(spectra[i:i + BATCH_SIZE])
+            
+            file_count += 1
+            if file_count % 10 == 0:
+                print(f"  Processed {file_count} files, {total_spectra:,} spectra")
+    
+    print(f"Completed: {file_count} files, {total_spectra:,} spectra")
+    return total_spectra
+
+n_real_spectra = fit_pca_on_real_only(REAL_DIR)
+
+print(f"\nPCA fitted on {n_real_spectra:,} real spectra")
+print(f"Explained variance ratio: {pca.explained_variance_ratio_}")
+print(f"Total variance explained: {sum(pca.explained_variance_ratio_):.2%}")
+
+fig = plt.figure(figsize=(14, 10))
+ax = fig.add_subplot(111, projection='3d')
+
+print("\nPlotting augmented data...")
+aug_total = 0
+aug_file_count = 0
+aug_batch_count = 0
+
+for folder in os.listdir(AUG_DIR):
+    folder_path = os.path.join(AUG_DIR, folder)
+    if not os.path.isdir(folder_path):
+        continue
+        
+    hdr_files = glob(os.path.join(folder_path, "*.hdr"))
+    for hdr in hdr_files:
+        cube = load_cube(hdr)
+        spectra = extract_spectra(cube)
+        
+        for i in range(0, len(spectra), BATCH_SIZE):
+            batch = spectra[i:i + BATCH_SIZE]
+            transformed = pca.transform(batch)
+            
+            ax.scatter(transformed[:, 0], transformed[:, 1], transformed[:, 2], 
+                       s=2, alpha=0.2, c='red', 
+                       label='Augmented' if aug_total == 0 else "",
+                       edgecolors='none', zorder=1)
+            
+            aug_total += len(transformed)
+            aug_batch_count += 1
+            
+            if aug_batch_count % 20 == 0:
+                print(f"  Plotted {aug_total:,} augmented points...")
+        
+        aug_file_count += 1
+        if aug_file_count % 10 == 0:
+            print(f"  Processed {aug_file_count} augmented files, {aug_total:,} points")
+
+print(f"Finished plotting {aug_total:,} augmented points")
+
+print("\nPlotting real data...")
+real_total = 0
+real_file_count = 0
+real_batch_count = 0
+label_added = False
+
+for folder in os.listdir(REAL_DIR):
+    folder_path = os.path.join(REAL_DIR, folder)
+    if not os.path.isdir(folder_path):
+        continue
+        
+    hdr_files = glob(os.path.join(folder_path, "*.hdr"))
+    for hdr in hdr_files:
+        cube = load_cube(hdr)
+        spectra = extract_spectra(cube)
+        
+        for i in range(0, len(spectra), BATCH_SIZE):
+            batch = spectra[i:i + BATCH_SIZE]
+            transformed = pca.transform(batch)
+            
+            ax.scatter(transformed[:, 0], transformed[:, 1], transformed[:, 2], 
+                       s=3, alpha=0.8, c='blue', 
+                       label='Real' if not label_added else "",
+                       edgecolors='white', linewidth=0.1, zorder=10)
+            
+            real_total += len(transformed)
+            real_batch_count += 1
+            label_added = True
+            
+            if real_batch_count % 20 == 0:
+                print(f"  Plotted {real_total:,} real points...")
+        
+        real_file_count += 1
+        if real_file_count % 10 == 0:
+            print(f"  Processed {real_file_count} real files, {real_total:,} points")
+
+print(f"Finished plotting {real_total:,} real points")
+
+ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)")
+ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)")
+ax.set_zlabel(f"PC3 ({pca.explained_variance_ratio_[2]:.2%} variance)")
+ax.set_title(f"PCA 3D Projection (fitted on REAL data only)\nReal: {real_total:,} spectra | Augmented: {aug_total:,} spectra")
+ax.legend(markerscale=5)
+ax.grid(True, alpha=0.2)
+
+output_path = os.path.join(OUTPUT_DIR, "PCA_3D_REAL_FOREGROUND.png")
+plt.savefig(output_path, dpi=300, bbox_inches='tight')
+plt.close()
+
+print(f"\nPlot saved to: {output_path}")
+print(f"Real points: {real_total:,} (foreground)")
+print(f"Augmented points: {aug_total:,} (background)")
