@@ -810,13 +810,10 @@ m.load_state_dict(torch.load(ckpt_dir / "best_model.pt"))
 
 import os
 import numpy as np
-import pandas as pd
-import datashader as ds
-import datashader.transfer_functions as tf
 import matplotlib.pyplot as plt
 from spectral import envi
 from glob import glob
-from PIL import Image
+import umap
 
 REAL_DIR = "extrudes_cubes_vf"
 AUG_DIR = "aug_data"
@@ -848,14 +845,11 @@ def get_class_name(folder_name):
     return folder_name.split("_")[0]
 
 real_list = []
-
 for folder in os.listdir(REAL_DIR):
-    class_name = get_class_name(folder)
-    if class_name != TARGET_CLASS:
+    if get_class_name(folder) != TARGET_CLASS:
         continue
-    hdrs = glob(os.path.join(REAL_DIR, folder, "*.hdr"))
-    for h in hdrs:
-        cube = load_cube(h)
+    for hdr in glob(os.path.join(REAL_DIR, folder, "*.hdr")):
+        cube = load_cube(hdr)
         real_list.append(extract_non_zero_spectra(cube))
 
 real_spectra = np.vstack(real_list)
@@ -863,58 +857,38 @@ real_spectra = np.vstack(real_list)
 aug_list = []
 aug_folder = os.path.join(AUG_DIR, TARGET_CLASS)
 
-if os.path.exists(aug_folder):
-    hdrs = glob(os.path.join(aug_folder, "*.hdr"))
-    for h in hdrs:
-        cube = load_cube(h)
-        aug_list.append(extract_non_zero_spectra(cube))
+for hdr in glob(os.path.join(aug_folder, "*.hdr")):
+    cube = load_cube(hdr)
+    aug_list.append(extract_non_zero_spectra(cube))
 
 aug_spectra = np.vstack(aug_list)
 
 real_spectra = real_spectra[np.any(real_spectra != 0, axis=1)]
 aug_spectra = aug_spectra[np.any(aug_spectra != 0, axis=1)]
 
-n_real, n_bands = real_spectra.shape
-n_aug = aug_spectra.shape[0]
+all_data = np.vstack([real_spectra, aug_spectra])
 
-x_real = np.tile(np.arange(n_bands), n_real)
-y_real = real_spectra.flatten()
+reducer = umap.UMAP(
+    n_components=2,
+    n_neighbors=30,
+    min_dist=0.1,
+    metric="euclidean",
+    random_state=42
+)
 
-x_aug = np.tile(np.arange(n_bands), n_aug)
-y_aug = aug_spectra.flatten()
+embedding = reducer.fit_transform(all_data)
 
-df_real = pd.DataFrame({"x": x_real, "y": y_real})
-df_aug = pd.DataFrame({"x": x_aug, "y": y_aug})
+real_umap = embedding[:len(real_spectra)]
+aug_umap = embedding[len(real_spectra):]
 
-vmin = min(y_real.min(), y_aug.min())
-vmax = max(y_real.max(), y_aug.max())
+plt.figure(figsize=(8, 6))
 
-canvas = ds.Canvas(plot_width=1000, plot_height=500, x_range=(0, n_bands), y_range=(vmin, vmax))
+plt.scatter(real_umap[:, 0], real_umap[:, 1], s=5, color="blue", label="Real", alpha=0.8)
+plt.scatter(aug_umap[:, 0], aug_umap[:, 1], s=1, color="red", label="Augmented", alpha=0.3)
 
-agg_real = canvas.points(df_real, "x", "y")
-agg_aug = canvas.points(df_aug, "x", "y")
-
-img_real = tf.shade(agg_real, cmap=["lightblue", "blue"])
-img_aug = tf.shade(agg_aug, cmap=["lightcoral", "red"])
-
-img = tf.stack(img_real, img_aug)
-
-img_pil = Image.fromarray(np.array(img.to_pil()))
-
-real_mean = np.mean(real_spectra, axis=0)
-aug_mean = np.mean(aug_spectra, axis=0)
-
-plt.figure(figsize=(12, 6))
-plt.imshow(img_pil, extent=[0, n_bands, vmin, vmax], aspect='auto', origin='lower')
-
-plt.plot(real_mean, color="blue", linewidth=3, label="Mean Real")
-plt.plot(aug_mean, color="red", linewidth=3, label="Mean Augmented")
-
-plt.title(f"{TARGET_CLASS} - Datashader Spectres")
-plt.xlabel("Bandes")
-plt.ylabel("Intensité")
+plt.title(f"UMAP - Classe {TARGET_CLASS}")
 plt.legend()
 
 plt.tight_layout()
-plt.savefig(os.path.join(OUTPUT_DIR, f"{TARGET_CLASS}_datashader.png"), dpi=300)
+plt.savefig(os.path.join(OUTPUT_DIR, f"UMAP_{TARGET_CLASS}.png"), dpi=300)
 plt.close()
