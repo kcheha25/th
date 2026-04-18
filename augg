@@ -855,9 +855,6 @@ for folder in os.listdir(REAL_DIR):
         spectra = extract_non_zero_spectra(cube)
         real_spectra_list.append(spectra)
 
-if len(real_spectra_list) == 0:
-    raise ValueError("Aucun spectre réel")
-
 real_spectra = np.vstack(real_spectra_list)
 
 aug_folder = os.path.join(AUG_DIR, TARGET_CLASS)
@@ -870,59 +867,30 @@ if os.path.exists(aug_folder):
         spectra = extract_non_zero_spectra(cube)
         aug_spectra_list.append(spectra)
 
-if len(aug_spectra_list) == 0:
-    raise ValueError("Aucun spectre augmenté")
-
 aug_spectra = np.vstack(aug_spectra_list)
 
 real_spectra = real_spectra[np.any(real_spectra != 0, axis=1)]
 aug_spectra = aug_spectra[np.any(aug_spectra != 0, axis=1)]
-
-n_bands = real_spectra.shape[1]
-
-all_data = np.vstack([real_spectra, aug_spectra])
-vmin, vmax = np.min(all_data), np.max(all_data)
-
-def compute_density(data, bins_y=300):
-    density = np.zeros((bins_y, n_bands))
-    for i in range(n_bands):
-        hist, _ = np.histogram(data[:, i], bins=bins_y, range=(vmin, vmax))
-        density[:, i] = hist
-    return density
-
-real_density = compute_density(real_spectra)
-aug_density = compute_density(aug_spectra)
 
 real_mean = np.mean(real_spectra, axis=0)
 aug_mean = np.mean(aug_spectra, axis=0)
 
 plt.figure(figsize=(14, 6))
 
-plt.imshow(
-    real_density,
-    aspect='auto',
-    origin='lower',
-    extent=[0, n_bands, vmin, vmax],
-    alpha=0.6
-)
+for s in real_spectra:
+    plt.plot(s, color="blue", alpha=0.005)
 
-plt.imshow(
-    aug_density,
-    aspect='auto',
-    origin='lower',
-    extent=[0, n_bands, vmin, vmax],
-    alpha=0.6
-)
+for s in aug_spectra:
+    plt.plot(s, color="red", alpha=0.005)
 
-plt.plot(real_mean, linewidth=3, label="Mean Real")
-plt.plot(aug_mean, linewidth=3, label="Mean Augmented")
+plt.plot(real_mean, color="blue", linewidth=3, label="Mean Real")
+plt.plot(aug_mean, color="red", linewidth=3, label="Mean Augmented")
 
-plt.title(f"{TARGET_CLASS} - Spectres")
+plt.title(f"{TARGET_CLASS} - Tous les spectres")
 plt.xlabel("Bandes")
 plt.ylabel("Intensité")
 plt.legend()
-plt.colorbar()
 
 plt.tight_layout()
-plt.savefig(os.path.join(OUTPUT_DIR, f"{TARGET_CLASS}_all_spectra.png"), dpi=300)
+plt.savefig(os.path.join(OUTPUT_DIR, f"{TARGET_CLASS}_all_lines.png"), dpi=300)
 plt.close()
