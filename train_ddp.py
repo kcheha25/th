@@ -1,0 +1,354 @@
+import argparse
+import math
+import os
+import time
+import json
+import hashlib
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader, DistributedSampler
+from sklearn.metrics import accuracy_score, cohen_kappa_score, confusion_matrix
+
+from dataset_mmap import MMapDataset, build_mmap
+from ssfnet import SSFTTnet
+
+
+def setup_ddp(rank, world_size):
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+
+def cleanup_ddp():
+    dist.destroy_process_group()
+
+
+def is_main(rank):
+    return rank == 0
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--real_dir", default=None)
+    p.add_argument("--aug_dir", default=None)
+    p.add_argument("--mapping_path", default="mapping.json")
+    p.add_argument("--mmap_dir", default="mmap_data")
+    p.add_argument("--split_mode", default="aug_real", choices=["aug_real", "shuffle"])
+    p.add_argument("--use_pca", action="store_true", default=True)
+    p.add_argument("--no_pca", action="store_false", dest="use_pca")
+    p.add_argument("--pca_components", type=int, default=30)
+    p.add_argument("--patch_size", type=int, default=13)
+    p.add_argument("--val_ratio", type=float, default=0.15)
+    p.add_argument("--test_ratio", type=float, default=0.15)
+    p.add_argument("--bg_ratio", type=float, default=1.5)
+    p.add_argument("--random_state", type=int, default=345)
+    p.add_argument("--fit_max_pixels", type=int, default=500_000)
+    p.add_argument("--force_recompute", action="store_true")
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--warmup_epochs", type=int, default=3)
+    p.add_argument("--patience", type=int, default=15)
+    p.add_argument("--label_smooth", type=float, default=0.05)
+    p.add_argument("--grad_accum", type=int, default=1)
+    p.add_argument("--amp", action="store_true", default=True)
+    p.add_argument("--no_amp", action="store_false", dest="amp")
+    p.add_argument("--num_tokens", type=int, default=4)
+    p.add_argument("--dim", type=int, default=64)
+    p.add_argument("--depth", type=int, default=1)
+    p.add_argument("--heads", type=int, default=8)
+    p.add_argument("--mlp_dim", type=int, default=8)
+    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--emb_dropout", type=float, default=0.1)
+    p.add_argument("--checkpoint_dir", default="checkpoints")
+    p.add_argument("--resume", default=None)
+    p.add_argument("--save_every", type=int, default=5)
+    return p.parse_args()
+
+
+def build_scheduler(optimizer, warmup, total):
+    def lr_lambda(ep):
+        if ep < warmup:
+            return (ep + 1) / max(warmup, 1)
+        p = (ep - warmup) / max(total - warmup, 1)
+        return 0.5 * (1.0 + math.cos(math.pi * p))
+    return LambdaLR(optimizer, lr_lambda)
+
+
+def train_epoch(model, loader, criterion, optimizer, scaler, device,
+                use_amp, grad_accum, grad_clip, sampler, epoch):
+    model.train()
+    if sampler is not None:
+        sampler.set_epoch(epoch)
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    optimizer.zero_grad()
+    for step, (X, y) in enumerate(loader):
+        X = X.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        with autocast(enabled=use_amp):
+            logits = model(X)
+            loss = criterion(logits, y) / grad_accum
+        scaler.scale(loss).backward()
+        if (step + 1) % grad_accum == 0:
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+        total_loss += loss.item() * grad_accum * len(y)
+        correct += (logits.argmax(1) == y).sum().item()
+        total += len(y)
+    stats = torch.tensor([total_loss, correct, total], dtype=torch.float64, device=device)
+    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    return (stats[0] / stats[2]).item(), (stats[1] / stats[2]).item()
+
+
+def val_epoch(model, loader, criterion, device, use_amp):
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for X, y in loader:
+            X = X.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            with autocast(enabled=use_amp):
+                logits = model(X)
+                loss = criterion(logits, y)
+            total_loss += loss.item() * len(y)
+            correct += (logits.argmax(1) == y).sum().item()
+            total += len(y)
+    stats = torch.tensor([total_loss, correct, total], dtype=torch.float64, device=device)
+    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    return (stats[0] / stats[2]).item(), (stats[1] / stats[2]).item()
+
+
+def evaluate(model, loader, device, use_amp, class_names):
+    model.eval()
+    all_pred, all_true = [], []
+    with torch.no_grad():
+        for X, y in loader:
+            X = X.to(device, non_blocking=True)
+            with autocast(enabled=use_amp):
+                logits = model(X)
+            all_pred.extend(logits.argmax(1).cpu().numpy())
+            all_true.extend(y.numpy())
+    all_pred = np.array(all_pred)
+    all_true = np.array(all_true)
+    oa = accuracy_score(all_true, all_pred) * 100
+    kappa = cohen_kappa_score(all_true, all_pred) * 100
+    cm = confusion_matrix(all_true, all_pred)
+    per_cls = np.diag(cm) / np.maximum(cm.sum(axis=1), 1) * 100
+    aa = per_cls.mean()
+    return oa, aa, kappa, cm, per_cls
+
+
+def main():
+    args = parse_args()
+
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    setup_ddp(rank, world_size)
+    device = torch.device(f"cuda:{local_rank}")
+
+    if is_main(rank):
+        print(f"\n{'='*65}")
+        print(f"  DDP  world_size={world_size}  rank={rank}  device={device}")
+
+    if is_main(rank):
+        build_mmap(
+            real_dir=args.real_dir,
+            aug_dir=args.aug_dir,
+            mapping_path=args.mapping_path,
+            split_mode=args.split_mode,
+            use_pca=args.use_pca,
+            pca_components=args.pca_components,
+            patch_size=args.patch_size,
+            test_ratio=args.test_ratio,
+            val_ratio=args.val_ratio,
+            batch_size=args.batch_size,
+            random_state=args.random_state,
+            fit_max_pixels=args.fit_max_pixels,
+            num_workers=args.num_workers,
+            bg_ratio=args.bg_ratio,
+            mmap_dir=args.mmap_dir,
+            force_recompute=args.force_recompute,
+        )
+    dist.barrier()
+
+    config_str = (
+        f"{args.real_dir}_{args.aug_dir}_{args.split_mode}_{args.patch_size}"
+        f"_{args.random_state}_{args.bg_ratio}"
+        f"_{args.pca_components if args.use_pca else 0}"
+    )
+    config_hash = hashlib.md5(config_str.encode()).hexdigest()[:12]
+    mmap_subdir = Path(args.mmap_dir) / config_hash
+
+    with open(mmap_subdir / "global_meta.json") as f:
+        meta = json.load(f)
+
+    train_ds = MMapDataset(mmap_subdir, "train")
+    val_ds   = MMapDataset(mmap_subdir, "val")
+    test_ds  = MMapDataset(mmap_subdir, "test")
+
+    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+    val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=rank, shuffle=False)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, sampler=train_sampler,
+        num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, sampler=val_sampler,
+        num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+    )
+
+    model = SSFTTnet(
+        in_channels=1,
+        num_classes=len(meta["class_names"]),
+        num_tokens=args.num_tokens,
+        dim=args.dim,
+        depth=args.depth,
+        heads=args.heads,
+        mlp_dim=args.mlp_dim,
+        dropout=args.dropout,
+        emb_dropout=args.emb_dropout,
+    ).to(device)
+
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    ckpt_dir = Path(args.checkpoint_dir)
+    if is_main(rank):
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    start_epoch = 1
+    best_val_acc = 0.0
+    if args.resume:
+        map_location = {"cuda:0": f"cuda:{local_rank}"}
+        state = torch.load(args.resume, map_location=map_location)
+        model.module.load_state_dict(state["model"])
+        start_epoch = state.get("epoch", 1) + 1
+        best_val_acc = state.get("best_val_acc", 0.0)
+        if is_main(rank):
+            print(f"  Reprise depuis {args.resume} (epoque {start_epoch})")
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smooth)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = build_scheduler(optimizer, args.warmup_epochs, args.epochs)
+    scaler    = GradScaler(enabled=args.amp)
+
+    if args.resume:
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        scaler.load_state_dict(state["scaler"])
+
+    if is_main(rank):
+        print(f"  Modele : {sum(p.numel() for p in model.parameters()):,} params")
+        print(f"  Classes : {meta['class_names']}")
+        print(f"{'='*65}\n")
+
+    patience_cnt = 0
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        t0 = time.time()
+
+        tr_loss, tr_acc = train_epoch(
+            model, train_loader, criterion, optimizer, scaler,
+            device, args.amp, args.grad_accum, args.grad_clip,
+            train_sampler, epoch,
+        )
+        va_loss, va_acc = val_epoch(model, val_loader, criterion, device, args.amp)
+        scheduler.step()
+
+        if is_main(rank):
+            elapsed = time.time() - t0
+            print(
+                f"Ep {epoch:03d}  "
+                f"tr {tr_loss:.4f}/{tr_acc*100:.2f}%  "
+                f"va {va_loss:.4f}/{va_acc*100:.2f}%  "
+                f"{elapsed:.1f}s"
+            )
+
+            if va_acc > best_val_acc:
+                best_val_acc = va_acc
+                patience_cnt = 0
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model": model.module.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "scaler": scaler.state_dict(),
+                        "best_val_acc": best_val_acc,
+                        "meta": meta,
+                    },
+                    ckpt_dir / "best_model.pt",
+                )
+                print("  -> Meilleur modele sauvegarde")
+            else:
+                patience_cnt += 1
+                if epoch % args.save_every == 0:
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "model": model.module.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "scheduler": scheduler.state_dict(),
+                            "scaler": scaler.state_dict(),
+                            "best_val_acc": best_val_acc,
+                            "meta": meta,
+                        },
+                        ckpt_dir / f"epoch_{epoch:03d}.pt",
+                    )
+
+        patience_tensor = torch.tensor(patience_cnt, device=device)
+        dist.broadcast(patience_tensor, src=0)
+        patience_cnt = patience_tensor.item()
+
+        if patience_cnt >= args.patience:
+            if is_main(rank):
+                print("  Early stopping")
+            break
+
+    if is_main(rank):
+        best_ckpt = torch.load(ckpt_dir / "best_model.pt", map_location=device)
+        model.module.load_state_dict(best_ckpt["model"])
+        oa, aa, kappa, cm, per_cls = evaluate(
+            model, test_loader, device, args.amp, meta["class_names"]
+        )
+        print(f"\n{'='*65}")
+        print(f"OA={oa:.2f}%  AA={aa:.2f}%  Kappa={kappa:.2f}%")
+        for i, name in enumerate(meta["class_names"]):
+            print(f"  {name}: {per_cls[i]:.2f}%")
+        print(f"{'='*65}\n")
+
+    cleanup_ddp()
+
+
+if __name__ == "__main__":
+    main()
