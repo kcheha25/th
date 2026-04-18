@@ -892,3 +892,96 @@ plt.legend()
 plt.tight_layout()
 plt.savefig(os.path.join(OUTPUT_DIR, f"UMAP_{TARGET_CLASS}.png"), dpi=300)
 plt.close()
+
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from spectral import envi
+from glob import glob
+import umap
+
+REAL_DIR = "extrudes_cubes_vf"
+AUG_DIR = "aug_data"
+OUTPUT_DIR = "results"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+TARGET_CLASS = "nom_de_ta_classe"
+
+def load_cube(hdr_path):
+    img = envi.open(hdr_path)
+    cube = np.array(img.load())
+    if cube.shape[-1] != 272:
+        for i, dim in enumerate(cube.shape):
+            if dim == 272:
+                if i == 0:
+                    cube = np.transpose(cube, (1, 2, 0))
+                elif i == 1:
+                    cube = np.transpose(cube, (0, 2, 1))
+                break
+    return cube
+
+def extract_non_zero_spectra(cube):
+    spectra = cube.reshape(-1, cube.shape[-1])
+    mask = np.any(spectra != 0, axis=1)
+    return spectra[mask]
+
+def get_class_name(folder_name):
+    return folder_name.split("_")[0]
+
+real_list = []
+
+for folder in os.listdir(REAL_DIR):
+    if get_class_name(folder) != TARGET_CLASS:
+        continue
+    for hdr in glob(os.path.join(REAL_DIR, folder, "*.hdr")):
+        cube = load_cube(hdr)
+        real_list.append(extract_non_zero_spectra(cube))
+
+real_spectra = np.vstack(real_list)
+
+aug_list = []
+aug_folder = os.path.join(AUG_DIR, TARGET_CLASS)
+
+for hdr in glob(os.path.join(aug_folder, "*.hdr")):
+    cube = load_cube(hdr)
+    aug_list.append(extract_non_zero_spectra(cube))
+
+aug_spectra = np.vstack(aug_list)
+
+real_spectra = real_spectra[np.any(real_spectra != 0, axis=1)]
+aug_spectra = aug_spectra[np.any(aug_spectra != 0, axis=1)]
+
+def l2_normalize(x):
+    return x / np.linalg.norm(x, axis=1, keepdims=True)
+
+real_spectra = l2_normalize(real_spectra)
+aug_spectra = l2_normalize(aug_spectra)
+
+all_data = np.vstack([real_spectra, aug_spectra])
+
+reducer = umap.UMAP(
+    n_components=2,
+    n_neighbors=30,
+    min_dist=0.1,
+    metric="euclidean",
+    random_state=42
+)
+
+embedding = reducer.fit_transform(all_data)
+
+real_umap = embedding[:len(real_spectra)]
+aug_umap = embedding[len(real_spectra):]
+
+plt.figure(figsize=(8, 6))
+
+plt.scatter(real_umap[:, 0], real_umap[:, 1], s=5, color="blue", alpha=0.8, label="Real")
+plt.scatter(aug_umap[:, 0], aug_umap[:, 1], s=1, color="red", alpha=0.3, label="Augmented")
+
+plt.title(f"UMAP Normalisé - Classe {TARGET_CLASS}")
+plt.legend()
+
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, f"UMAP_{TARGET_CLASS}_norm.png"), dpi=300)
+plt.close()
