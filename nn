@@ -75,8 +75,7 @@ def parse_args():
     p.add_argument("--checkpoint_dir", default="checkpoints")
     p.add_argument("--resume", default=None)
     p.add_argument("--save_every", type=int, default=5)
-    p.add_argument("--log_every", type=int, default=50,
-                   help="Afficher accuracy/loss tous les N steps")
+    p.add_argument("--log_every", type=int, default=50)
     return p.parse_args()
 
 
@@ -118,14 +117,14 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device,
     if sampler is not None:
         sampler.set_epoch(epoch)
 
-    total_loss = 0.0
-    correct = 0
-    total = 0
-    step_loss = 0.0
+    total_loss   = 0.0
+    correct      = 0
+    total        = 0
+    step_loss    = 0.0
     step_correct = 0
-    step_total = 0
+    step_total   = 0
+    n_batches    = len(loader)
     optimizer.zero_grad()
-    n_batches = len(loader)
 
     for step, (X, y) in enumerate(loader):
         X = X.to(device, non_blocking=True)
@@ -145,25 +144,23 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device,
             scaler.update()
             optimizer.zero_grad()
 
-        batch_loss = loss.item() * grad_accum
+        batch_loss    = loss.item() * grad_accum
         batch_correct = (logits.argmax(1) == y).sum().item()
-        batch_total = len(y)
+        batch_total   = len(y)
 
-        total_loss    += batch_loss * batch_total
-        correct       += batch_correct
-        total         += batch_total
-        step_loss     += batch_loss * batch_total
-        step_correct  += batch_correct
-        step_total    += batch_total
+        total_loss   += batch_loss * batch_total
+        correct      += batch_correct
+        total        += batch_total
+        step_loss    += batch_loss * batch_total
+        step_correct += batch_correct
+        step_total   += batch_total
 
         if is_main(rank) and (step + 1) % log_every == 0:
-            step_acc  = step_correct / step_total * 100
-            step_l    = step_loss / step_total
-            elapsed_pct = (step + 1) / n_batches * 100
-            print(
-                f"  [Ep {epoch} | step {step+1:>5}/{n_batches} ({elapsed_pct:5.1f}%)] "
-                f"loss={step_l:.4f}  acc={step_acc:.2f}%"
-            )
+            pct      = (step + 1) / n_batches * 100
+            s_acc    = step_correct / step_total * 100
+            s_loss   = step_loss / step_total
+            print(f"    step {step+1:>5}/{n_batches} ({pct:5.1f}%)  loss={s_loss:.4f}  acc={s_acc:.2f}%",
+                  flush=True)
             step_loss    = 0.0
             step_correct = 0
             step_total   = 0
@@ -173,23 +170,19 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device,
     return (stats[0] / stats[2]).item(), (stats[1] / stats[2]).item()
 
 
-def val_epoch(model, loader, criterion, device, use_amp, rank):
+def val_epoch(model, loader, criterion, device, use_amp):
     model.eval()
     total_loss = 0.0
-    correct = 0
-    total = 0
-    n_batches = len(loader)
-
-    if is_main(rank):
-        print(f"  [Val] Evaluation sur {n_batches} batches...")
+    correct    = 0
+    total      = 0
 
     with torch.no_grad():
-        for step, (X, y) in enumerate(loader):
+        for X, y in loader:
             X = X.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             with autocast(enabled=use_amp):
                 logits = model(X)
-                loss = criterion(logits, y)
+                loss   = criterion(logits, y)
             total_loss += loss.item() * len(y)
             correct    += (logits.argmax(1) == y).sum().item()
             total      += len(y)
@@ -199,23 +192,17 @@ def val_epoch(model, loader, criterion, device, use_amp, rank):
     return (stats[0] / stats[2]).item(), (stats[1] / stats[2]).item()
 
 
-def evaluate(model, loader, device, use_amp, class_names, rank):
+def evaluate(model, loader, device, use_amp):
     model.eval()
     all_pred, all_true = [], []
-    n_batches = len(loader)
-
-    if is_main(rank):
-        print(f"  [Test] Evaluation finale sur {n_batches} batches...")
 
     with torch.no_grad():
-        for step, (X, y) in enumerate(loader):
+        for X, y in loader:
             X = X.to(device, non_blocking=True)
             with autocast(enabled=use_amp):
                 logits = model(X)
             all_pred.extend(logits.argmax(1).cpu().numpy())
             all_true.extend(y.numpy())
-            if is_main(rank) and (step + 1) % 100 == 0:
-                print(f"  [Test] {step+1}/{n_batches} batches traites...")
 
     all_pred = np.array(all_pred)
     all_true = np.array(all_true)
@@ -236,15 +223,14 @@ def main():
 
     mmap_subdir = get_mmap_subdir(args)
 
-    if is_main(rank):
-        print(f"\n{'='*65}")
-        print(f"  SSFTTnet DDP — {world_size} GPU(s)")
-        print(f"  Mmap dir : {mmap_subdir}")
-        print(f"{'='*65}")
-
+    # -------------------------------------------------------------------
+    # PHASE 1 : preparation donnees (avant DDP, sans aucune communication)
+    # Rang 0 construit si necessaire, les autres attendent via sentinelle.
+    # Aucun barrier, aucun all_reduce ici.
+    # -------------------------------------------------------------------
     if args.force_recompute or not mmap_ready(mmap_subdir):
         if rank == 0:
-            print(f"[rank 0] Mmaps absentes ou force_recompute=True. Construction en cours...")
+            print(f"[rank 0] Construction des mmaps...", flush=True)
             build_mmap(
                 real_dir=args.real_dir,
                 aug_dir=args.aug_dir,
@@ -263,30 +249,36 @@ def main():
                 mmap_dir=args.mmap_dir,
                 force_recompute=args.force_recompute,
             )
-            print(f"[rank 0] Mmaps construites avec succes.")
+            print(f"[rank 0] Mmaps pretes.", flush=True)
         else:
-            print(f"[rank {rank}] Mmaps manquantes, attente de la construction par rank 0...")
+            print(f"[rank {rank}] Attente mmaps...", flush=True)
             waited = 0
             while not mmap_ready(mmap_subdir):
                 time.sleep(3)
                 waited += 3
                 if waited % 30 == 0:
-                    print(f"[rank {rank}] Toujours en attente... ({waited}s ecoules)")
+                    print(f"[rank {rank}] Attente... ({waited}s)", flush=True)
                 if waited > 7200:
-                    raise RuntimeError(f"[rank {rank}] Timeout: mmaps jamais construites.")
+                    raise RuntimeError(f"[rank {rank}] Timeout mmaps.")
             time.sleep(2)
-            print(f"[rank {rank}] Mmaps detectees, continuation.")
+            print(f"[rank {rank}] Mmaps detectees.", flush=True)
     else:
-        print(f"[rank {rank}] Mmaps deja presentes, demarrage immediat.")
+        if rank == 0:
+            print(f"[rank 0] Mmaps presentes, demarrage immediat.", flush=True)
 
-    print(f"[rank {rank}] Initialisation du groupe DDP (NCCL)...")
+    # -------------------------------------------------------------------
+    # PHASE 2 : init DDP — tous les rangs arrivent ici en meme temps
+    # -------------------------------------------------------------------
     setup_ddp(rank, world_size)
     device = torch.device(f"cuda:{local_rank}")
-    print(f"[rank {rank}] DDP initialise sur {device}.")
 
     if is_main(rank):
-        print(f"\n[main] Chargement des datasets depuis {mmap_subdir}...")
+        print(f"\n{'='*65}", flush=True)
+        print(f"  SSFTTnet DDP | world_size={world_size} | device={device}", flush=True)
 
+    # -------------------------------------------------------------------
+    # PHASE 3 : chargement datasets — tous les rangs font la meme chose
+    # -------------------------------------------------------------------
     with open(mmap_subdir / "global_meta.json") as f:
         meta = json.load(f)
 
@@ -295,8 +287,8 @@ def main():
     test_ds  = MMapDataset(mmap_subdir, "test")
 
     if is_main(rank):
-        print(f"[main] Train={len(train_ds):,} | Val={len(val_ds):,} | Test={len(test_ds):,} samples")
-        print(f"[main] Classes ({len(meta['class_names'])}) : {meta['class_names']}")
+        print(f"  Train={len(train_ds):,} | Val={len(val_ds):,} | Test={len(test_ds):,}", flush=True)
+        print(f"  Classes : {meta['class_names']}", flush=True)
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=rank, shuffle=False)
@@ -314,12 +306,12 @@ def main():
     test_loader  = DataLoader(test_ds,  shuffle=False,         **loader_kwargs)
 
     if is_main(rank):
-        print(f"[main] Batches par epoch — train={len(train_loader)} | val={len(val_loader)}")
-        print(f"[main] Batch size par GPU={args.batch_size} | batch global={args.batch_size * world_size}")
+        print(f"  Batches/epoch : train={len(train_loader)} | val={len(val_loader)}", flush=True)
+        print(f"  Batch/GPU={args.batch_size} | Batch global={args.batch_size * world_size}", flush=True)
 
-    if is_main(rank):
-        print(f"\n[main] Construction du modele SSFTTnet...")
-
+    # -------------------------------------------------------------------
+    # PHASE 4 : modele — tous les rangs font la meme chose
+    # -------------------------------------------------------------------
     model = SSFTTnet(
         in_channels=1,
         num_classes=len(meta["class_names"]),
@@ -337,31 +329,28 @@ def main():
 
     if is_main(rank):
         n_params = sum(p.numel() for p in model.parameters())
-        print(f"[main] Modele cree : {n_params:,} parametres")
+        print(f"  Parametres : {n_params:,}", flush=True)
 
     ckpt_dir = Path(args.checkpoint_dir)
     if is_main(rank):
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[main] Checkpoints sauvegardes dans : {ckpt_dir}")
 
     start_epoch  = 1
     best_val_acc = 0.0
 
     if args.resume:
-        if is_main(rank):
-            print(f"[main] Chargement checkpoint : {args.resume}")
         map_location = {"cuda:0": f"cuda:{local_rank}"}
         state = torch.load(args.resume, map_location=map_location)
         model.module.load_state_dict(state["model"])
         start_epoch  = state.get("epoch", 1) + 1
         best_val_acc = state.get("best_val_acc", 0.0)
         if is_main(rank):
-            print(f"[main] Reprise a l'epoque {start_epoch} (meilleur val acc={best_val_acc*100:.2f}%)")
+            print(f"  Resume ep={start_epoch} best_val={best_val_acc*100:.2f}%", flush=True)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smooth)
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = build_scheduler(optimizer, args.warmup_epochs, args.epochs)
-    scaler    = GradScaler(enabled=args.amp)
+    optimizer  = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler  = build_scheduler(optimizer, args.warmup_epochs, args.epochs)
+    scaler     = GradScaler(enabled=args.amp)
 
     if args.resume:
         optimizer.load_state_dict(state["optimizer"])
@@ -369,25 +358,24 @@ def main():
         scaler.load_state_dict(state["scaler"])
 
     if is_main(rank):
-        print(f"[main] Optimiseur : AdamW  lr={args.lr}  wd={args.weight_decay}")
-        print(f"[main] Scheduler  : cosine warmup={args.warmup_epochs} epochs")
-        print(f"[main] AMP        : {args.amp}")
-        print(f"[main] Log every  : {args.log_every} steps")
-        print(f"\n{'='*65}")
-        print(f"  Debut de l'entrainement ({start_epoch} -> {args.epochs} epochs)")
-        print(f"{'='*65}\n")
+        print(f"  lr={args.lr} | wd={args.weight_decay} | amp={args.amp} | log_every={args.log_every} steps")
+        print(f"{'='*65}\n", flush=True)
 
+    # barrier propre : DDP est init, modele charge, tout le monde est pret
     dist.barrier()
 
     patience_cnt = 0
 
+    # -------------------------------------------------------------------
+    # BOUCLE D'ENTRAINEMENT
+    # -------------------------------------------------------------------
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
 
         if is_main(rank):
-            lr_current = optimizer.param_groups[0]["lr"]
-            print(f"\n--- Epoque {epoch}/{args.epochs}  (lr={lr_current:.2e}) ---")
-            print(f"  [Train] {len(train_loader)} batches x {args.batch_size} samples/GPU...")
+            lr_now = optimizer.param_groups[0]["lr"]
+            print(f"--- Ep {epoch}/{args.epochs}  lr={lr_now:.2e}  "
+                  f"[train {len(train_loader)} batches] ---", flush=True)
 
         tr_loss, tr_acc = train_epoch(
             model, train_loader, criterion, optimizer, scaler,
@@ -396,20 +384,15 @@ def main():
         )
 
         if is_main(rank):
-            print(f"  [Train] Fin epoque {epoch} — loss={tr_loss:.4f}  acc={tr_acc*100:.2f}%")
+            print(f"  [Train] loss={tr_loss:.4f}  acc={tr_acc*100:.2f}%", flush=True)
+            print(f"  [Val]   calcul en cours...", flush=True)
 
-        va_loss, va_acc = val_epoch(model, val_loader, criterion, device, args.amp, rank)
+        va_loss, va_acc = val_epoch(model, val_loader, criterion, device, args.amp)
         scheduler.step()
 
         if is_main(rank):
             elapsed = time.time() - t0
-            print(f"  [Val]   Fin epoque {epoch} — loss={va_loss:.4f}  acc={va_acc*100:.2f}%")
-            print(
-                f"  [Recap] Ep {epoch:03d}  "
-                f"tr {tr_loss:.4f}/{tr_acc*100:.2f}%  "
-                f"va {va_loss:.4f}/{va_acc*100:.2f}%  "
-                f"temps={elapsed:.1f}s"
-            )
+            print(f"  [Val]   loss={va_loss:.4f}  acc={va_acc*100:.2f}%  ({elapsed:.1f}s)", flush=True)
 
             if va_acc > best_val_acc:
                 best_val_acc = va_acc
@@ -426,12 +409,12 @@ def main():
                     },
                     ckpt_dir / "best_model.pt",
                 )
-                print(f"  [Checkpoint] Nouveau meilleur modele sauvegarde (val_acc={va_acc*100:.2f}%)")
+                print(f"  [Best] Nouveau meilleur sauvegarde (val={va_acc*100:.2f}%)", flush=True)
             else:
                 patience_cnt += 1
-                print(f"  [Patience] {patience_cnt}/{args.patience} sans amelioration.")
+                print(f"  [Patience] {patience_cnt}/{args.patience}", flush=True)
                 if epoch % args.save_every == 0:
-                    ckpt_path = ckpt_dir / f"epoch_{epoch:03d}.pt"
+                    path = ckpt_dir / f"epoch_{epoch:03d}.pt"
                     torch.save(
                         {
                             "epoch": epoch,
@@ -442,44 +425,41 @@ def main():
                             "best_val_acc": best_val_acc,
                             "meta": meta,
                         },
-                        ckpt_path,
+                        path,
                     )
-                    print(f"  [Checkpoint] Sauvegarde periodique : {ckpt_path}")
+                    print(f"  [Ckpt] Sauvegarde periodique : {path}", flush=True)
 
+        # tous les rangs synchronisent patience_cnt
         patience_tensor = torch.tensor(patience_cnt, device=device)
         dist.broadcast(patience_tensor, src=0)
         patience_cnt = int(patience_tensor.item())
 
         if patience_cnt >= args.patience:
             if is_main(rank):
-                print(f"\n  [Early Stopping] Patience {args.patience} atteinte a l'epoque {epoch}.")
+                print(f"\n[Early Stopping] Ep {epoch} — patience {args.patience} atteinte.", flush=True)
             break
 
+    # -------------------------------------------------------------------
+    # EVALUATION FINALE — seulement rang 0
+    # -------------------------------------------------------------------
     if is_main(rank):
-        print(f"\n{'='*65}")
-        print(f"  Entrainement termine. Chargement du meilleur modele...")
+        print(f"\n{'='*65}", flush=True)
+        print(f"  Evaluation finale sur le jeu de test...", flush=True)
         best_ckpt = torch.load(ckpt_dir / "best_model.pt", map_location=device)
         model.module.load_state_dict(best_ckpt["model"])
-        print(f"  Meilleur modele : epoque {best_ckpt['epoch']}  val_acc={best_ckpt['best_val_acc']*100:.2f}%")
+        print(f"  Meilleur modele charge : ep={best_ckpt['epoch']}  val={best_ckpt['best_val_acc']*100:.2f}%", flush=True)
 
-        oa, aa, kappa, cm, per_cls = evaluate(
-            model, test_loader, device, args.amp, meta["class_names"], rank
-        )
-        print(f"\n{'='*65}")
-        print(f"  RESULTATS FINAUX SUR LE JEU DE TEST")
-        print(f"{'='*65}")
-        print(f"  OA    = {oa:.2f}%")
+        oa, aa, kappa, cm, per_cls = evaluate(model, test_loader, device, args.amp)
+
+        print(f"\n  OA    = {oa:.2f}%")
         print(f"  AA    = {aa:.2f}%")
         print(f"  Kappa = {kappa:.2f}%")
-        print(f"{'='*65}")
-        print(f"  Accuracy par classe :")
+        print(f"\n  Accuracy par classe :")
         for i, name in enumerate(meta["class_names"]):
             print(f"    {name:<30} {per_cls[i]:.2f}%")
-        print(f"{'='*65}\n")
+        print(f"{'='*65}\n", flush=True)
 
     cleanup_ddp()
-    if is_main(rank):
-        print("[main] Processus DDP termines proprement.")
 
 
 if __name__ == "__main__":
