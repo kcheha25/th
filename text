@@ -1,8 +1,1 @@
-Administratif
-
-Inscription à l’école doctorale
-Constitution du jury CSI (Comité de Suivi Individuel)
-Convention individuelle de formation (CIF)
-
-2. Contexte et problématique
-3. Travaux effectués et résultats obtenus
+For now, only near-infrared data are fully available. The first step is to develop a classification model using HSI-NIR data to evaluate performance on this modality. The same work will be performed later on LIBS data. The final step is to combine HSI-NIR and LIBS data. The objective is to quantify the performance gain obtained with data fusion compared to using a single modality alone.
