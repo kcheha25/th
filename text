@@ -1,1 +1,1 @@
-the mean spectra of each class were grouped based on the similarity of their spectral signatures (SAM). then, for each group, mRMR was applied to select the most discriminative and informative wavelengths between the mean spectra of different samples within the same group.
+at the selected spectral bands, the observed behavior within a window of three neighboring bands is injected into those bands in the spectrum to correct the behavior at the most informative wavelengths.
