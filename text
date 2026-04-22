@@ -1,1 +1,4 @@
-PCA is a linear dimensionality reduction method. this linear method works well when the relationships between variables are approximately linear. UMAP is a non-linear method that keeps both local and global structure of the data. the UMAP results show that the augmented data matches well with the real data.
+Data augmentation done
+✔️ Go to the end of the pixel-wise classification approach
+🔍 Voir et explorer des pistes et d’autres approches, notamment la segmentation d’instance plutôt que la segmentation pixel par pixel
+📊 Obtain correct results before the end of June for the planned communication
