@@ -1,1 +1,1 @@
-with GAN, augmented data retains the same trends without being identical. for some classes, a diamond-like shape appears in the augmented data distribution and is bounded by the most distant real data points. this requires further analysis.
+PCA is a linear dimensionality reduction method. this linear method works well when the relationships between variables are approximately linear. UMAP is a non-linear method that keeps both local and global structure of the data. the UMAP results show that the augmented data matches well with the real data.
