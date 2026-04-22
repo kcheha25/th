@@ -1,3 +1,1 @@
-to reduce discrepancies and variability while preserving the same spectral reflectance distribution, the GAN-generated spectra are normalized to match the mean of the real spectra
-
-for pixels where the spectral signature differs, the SAM naturally exceeds the fixed threshold, and the augmented spectrum corresponds to the real spectrum with added controlled noise.
+with GAN, augmented data retains the same trends without being identical. for some classes, a diamond-like shape appears in the augmented data distribution and is bounded by the most distant real data points. this requires further analysis.
