@@ -1,1 +1,3 @@
-Some extruded can show heterogeneity. In some extruded, a few spectra present a different spectral signature depending on the position
+retrieve the spectra of each sample
+remove null spectra
+train a WGAN-GP for each sample
