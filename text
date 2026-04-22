@@ -1,1 +1,1 @@
-at the selected spectral bands, the observed behavior within a window of three neighboring bands is injected into those bands in the spectrum to correct the behavior at the most informative wavelengths.
+In the selected spectral bands, the behavior observed in a window of three neighboring bands is injected into these bands of the GAN spectrum in order to correct the behavior at the most informative wavelengths.
