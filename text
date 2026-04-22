@@ -1,1 +1,3 @@
-In the selected spectral bands, the behavior observed in a window of three neighboring bands is injected into these bands of the GAN spectrum in order to correct the behavior at the most informative wavelengths.
+to reduce discrepancies and variability while preserving the same spectral reflectance distribution, the GAN-generated spectra are normalized to match the mean of the real spectra
+
+for pixels where the spectral signature differs, the SAM naturally exceeds the fixed threshold, and the augmented spectrum corresponds to the real spectrum with added controlled noise.
