@@ -1,3 +1,1 @@
-retrieve the spectra of each sample
-remove null spectra
-train a WGAN-GP for each sample
+the mean spectra of each class were grouped based on the similarity of their spectral signatures (SAM). then, for each group, mRMR was applied to select the most discriminative and informative wavelengths between the mean spectra of different samples within the same group.
