@@ -1,0 +1,5 @@
+Salut Marion,
+
+J'ai lu rapidement la publi. En gros, pour augmenter les données, ils partent de méthodes de preprocessing qui enlèvent des distorsions sur un spectre. Mais au lieu de les supprimer, ils les réinjectent de façon contrôlée pour créer un nouveau spectre augmenté.
+
+C'est un peu comme ce qu'on avait fait quand le GAN ne convergeait pas : on lissait le spectre avec Savitzky-Golay sur une bande aléatoire, on calculait la différence entre le lissé et le réel, puis on appliquait un bruit modulé par cette différence.
