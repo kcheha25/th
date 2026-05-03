@@ -1,0 +1,44 @@
+Pour le jury CSI : il est demandé un spécialiste et un non spécialiste, avec au moins un HDR.
+
+Ajouter au début de la présentation un peu plus de détails concernant la base de données (nb échantillons, nb classes).
+
+La distribution n’est pas équilibrée entre les échantillons.
+
+Concernant les classes de classification, quelques classes peuvent être regroupées, à voir après selon l’avancement des performances obtenues par les modèles de classification.
+
+Idée à garder en tête : modèles hiérarchiques, regrouper les classes les plus difficiles à différencier, puis faire un deuxième traitement pour les séparer dans un second temps.
+
+Il faudra voir dans la biblio qui traite quelque type de plastique similaire à le nôtre dans le HSI-NIR pour se situer en terme de performances et le taux d’erreur qui peut être tolérer.
+
+En interne, il y a des procédés type recyclage de PET où ils considèrent du PET pur à 98 % ils arrivent à le traiter, donc on peut dire qu’un modèle à 98 % peut être toléré (à revérifier).
+
+
+Jury CSI et organisation
+Pour le jury CSI : il est demandé un spécialiste et un non spécialiste, avec au moins un HDR.
+Données et base de données
+Ajouter au début de la présentation un peu plus de détails concernant la base de données (nb échantillons, nb classes).
+La distribution n’est pas équilibrée entre les échantillons.
+Classification et modélisation
+Concernant les classes de classification, quelques classes peuvent être regroupées, à voir après selon l’avancement des performances obtenues par les modèles de classification.
+Idée à garder en tête : modèles hiérarchiques, regrouper les classes les plus difficiles à différencier, puis faire un deuxième traitement pour les séparer dans un second temps.
+Bibliographie et état de l’art
+Il faudra voir dans la biblio qui traite quelque type de plastique similaire à le nôtre dans le HSI-NIR pour se situer en terme de performances et le taux d’erreur qui peut être tolérer.
+Contexte industriel et tolérance des performances
+En interne, il y a des procédés type recyclage de PET où ils considèrent du PET pur à 98 % ils arrivent à le traiter, donc on peut dire qu’un modèle à 98 % peut être toléré (à revérifier).
+
+
+
+
+Marion : voir avec la cheffe de projet du PEPR si elle accepte de faire partie du jury CSI en tant que membre non spécialiste.
+
+Karim : contacter une personne pour lui demander si elle accepte de faire partie du jury CSI en tant que spécialiste.
+
+Karim : voir quelle est la proportion des spectres augmentés générés par GAN par rapport à ceux générés avec du bruit.
+
+Karim : pour prouver l’apport des GAN, générer les données augmentées uniquement avec du bruit et comparer les résultats de classification avec ceux obtenus sur les données augmentées GAN + bruit.
+Karim : compléter les résultats des modèles par une matrice de confusion.
+
+Marion et Loïc : voir concernant l'augmentation des espaces de stockage des serveurs dont ça sera un besoin surtout avec le traitement des données libs.
+
+Marion et Loïc : reboucler avec les chefs de projet plastique pour voir quel taux d’erreur peut être toléré.
+
