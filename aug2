@@ -1441,7 +1441,42 @@ def adjust_spectrum_within_std(fake_spec, mean_spec, std_spec, k=1.0, margin=0.2
 spectra_class = get_spectra_class(dataset, class_name)
 mean_spec, std_spec = compute_class_mean_std(dataset, class_name)
 
+def generate_augmented_cube(
+    cube,
+    class_name,
+    netG,
+    wl_max10,
+    wl_max20,
+    spectra_class=None,
+    alpha_noise=1.0,
+    force_real_classes=None,
+    sam_threshold1=0.10,
+    device="cpu",
+    save_plots=False,
+    plot_dir=None,
+    beta=1.0,
+    window_size=1
+):
 
+    if force_real_classes is None:
+        force_real_classes = {}
+
+    B, H, W = cube.shape
+
+    augmented_cube = np.zeros_like(cube)
+
+    selected_10 = [int(x) for x in wl_max10[class_name]]
+    selected_20 = [int(x) for x in wl_max20[class_name]]
+
+    full_range_B = list(range(B))
+
+    if save_plots and plot_dir is not None:
+        plot_dir = Path(plot_dir)
+        plot_dir.mkdir(parents=True, exist_ok=True)
+
+    # ==========================
+    # AJOUT : statistiques locales
+    # ==========================
     stats = {
         "gan": 0,
         "noise": 0,
@@ -1449,38 +1484,337 @@ mean_spec, std_spec = compute_class_mean_std(dataset, class_name)
         "total": 0
     }
 
+    plot_count = 0
 
-new_spec = augment_with_class_noise(real_spec, spectra_class, alpha=alpha_noise)
-stats["noise"] += 1
+    for i in range(H):
+        for j in range(W):
 
-global_stats = {}
+            real_spec = cube[:, i, j]
 
-if cube_prefix not in global_stats:
-    global_stats[cube_prefix] = {
-        "gan": 0,
-        "noise": 0,
-        "real": 0,
-        "total": 0
-    }
+            best_sam = 999
+            best_fake = None
+
+            real_tensor = (
+                torch.tensor(real_spec, dtype=torch.float32)
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .to(device)
+            )
+
+            for _ in range(5):
+
+                noise = torch.randn(1, 64, 1, device=device)
+
+                fake = (
+                    netG(noise)
+                    .detach()
+                    .cpu()
+                    .squeeze()
+                    .numpy()
+                )
+
+                fake = (fake + 1) / 2
+
+                sam = compute_sam(real_spec, fake)
+
+                if sam < best_sam:
+                    best_sam = sam
+                    best_fake = fake
+
+            wl_to_plot = []
+
+            if (
+                (
+                    class_name in ["A1", "B1", "C2", "D5"]
+                    or best_sam > sam_threshold1
+                )
+                and spectra_class is not None
+            ):
+
+                new_spec = augment_with_class_noise(
+                    real_spec,
+                    spectra_class,
+                    alpha=alpha_noise
+                )
+
+                # ==========================
+                # AJOUT : compteur bruit classe
+                # ==========================
+                stats["noise"] += 1
+
+            elif best_sam < sam_threshold1:
+
+                if list(selected_20) == full_range_B:
+
+                    new_spec = best_fake.copy()
+
+                else:
+
+                    new_spec = inject_local_variation(
+                        real_spec,
+                        best_fake,
+                        selected_20,
+                        beta=beta,
+                        window_size=window_size
+                    )
+
+                    wl_to_plot = selected_20
+
+                # ==========================
+                # AJOUT : compteur GAN
+                # ==========================
+                stats["gan"] += 1
+
+            else:
+
+                new_spec = real_spec.copy()
+
+                # ==========================
+                # AJOUT : compteur spectre réel
+                # ==========================
+                stats["real"] += 1
+
+            # ==========================
+            # AJOUT : compteur total
+            # ==========================
+            stats["total"] += 1
+
+            augmented_cube[:, i, j] = new_spec
+
+            if save_plots and plot_count < 10:
+
+                plt.figure(figsize=(8, 5))
+
+                plt.plot(
+                    real_spec,
+                    label="Real Spectrum",
+                    linewidth=2
+                )
+
+                plt.plot(
+                    best_fake,
+                    label="Best GAN Spectrum",
+                    linestyle="--"
+                )
+
+                plt.plot(
+                    new_spec,
+                    label="Final Augmented Spectrum",
+                    linewidth=2
+                )
+
+                for wl in wl_to_plot:
+
+                    plt.axvline(
+                        x=int(wl),
+                        color='red',
+                        linestyle=':',
+                        linewidth=1
+                    )
+
+                plt.title(
+                    f"{class_name} - SAM={best_sam:.4f}"
+                )
+
+                plt.xlabel("Band Index")
+                plt.ylabel("Reflectance")
+
+                plt.legend()
+
+                plt.tight_layout()
+
+                if plot_dir is not None:
+
+                    plt.savefig(
+                        plot_dir / f"{class_name}_{plot_count}.png"
+                    )
+
+                plt.close()
+
+                plot_count += 1
+
+    # ==========================
+    # AJOUT : retour stats
+    # ==========================
+    return augmented_cube, stats
 
 
-for key in stats:
-    global_stats[cube_prefix][key] += stats[key]
+def generate_multiple_augmented(
+    dataset_root,
+    input_cube_paths,
+    wl_max10,
+    wl_max20,
+    output_dir,
+    target_per_class=400,
+    alpha_noise=1.0,
+    device="cuda"
+):
 
+    dataset = SpectralPixelDataset(dataset_root)
 
-print("\n========== STATISTIQUES FINALES ==========\n")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-for class_name, stats in global_stats.items():
+    # Regrouper les cubes par classe
+    class_to_cubes = {}
 
-    total = stats["total"]
+    for cube_path in input_cube_paths:
 
-    gan_pct = 100 * stats["gan"] / total
-    noise_pct = 100 * stats["noise"] / total
-    real_pct = 100 * stats["real"] / total
+        prefix = Path(cube_path).stem.split("_")[0]
 
-    print(f"Classe : {class_name}")
-    print(f"  GAN                  : {gan_pct:.2f}% ({stats['gan']})")
-    print(f"  augment_with_noise   : {noise_pct:.2f}% ({stats['noise']})")
-    print(f"  Spectres réels       : {real_pct:.2f}% ({stats['real']})")
-    print(f"  Total                : {total}")
-    print("-" * 50)
+        class_to_cubes.setdefault(prefix, []).append(cube_path)
+
+    for class_name, cube_list in class_to_cubes.items():
+
+        print(f"\nClasse {class_name}")
+        print(f"Cubes réels : {len(cube_list)}")
+
+        n_real = len(cube_list)
+
+        if n_real == 0:
+            continue
+
+        # Calcul automatique du nombre d’augmentations par cube
+        base_per_cube = target_per_class // n_real
+        remainder = target_per_class % n_real
+
+        print(f"Objectif total : {target_per_class}")
+
+        print(
+            f"Générations par cube : "
+            f"{base_per_cube} (+1 pour {remainder} cubes)"
+        )
+
+        spectra_class = get_spectra_class(
+            dataset,
+            class_name
+        )
+
+        netG_path = f"./results/{class_name}/netG_best.pth"
+
+        netG = torch.load(
+            netG_path,
+            map_location=device
+        )
+
+        netG.to(device)
+        netG.eval()
+
+        generated_count = 0
+
+        # ==========================
+        # AJOUT : statistiques globales classe
+        # ==========================
+        class_stats = {
+            "gan": 0,
+            "noise": 0,
+            "real": 0,
+            "total": 0
+        }
+
+        for idx, cube_path in enumerate(cube_list):
+
+            # Répartir le reste
+            n_generate = (
+                base_per_cube
+                + (1 if idx < remainder else 0)
+            )
+
+            hdr_img = envi.open(cube_path)
+
+            cube = np.array(
+                hdr_img.load(),
+                dtype=np.float32
+            )
+
+            for n in range(n_generate):
+
+                # ==========================
+                # AJOUT : récupération stats
+                # ==========================
+                aug_cube, stats = generate_augmented_cube(
+                    cube,
+                    class_name,
+                    netG,
+                    wl_max10,
+                    wl_max20,
+                    spectra_class=spectra_class,
+                    alpha_noise=alpha_noise,
+                    device=device,
+                    save_plots=False
+                )
+
+                # ==========================
+                # AJOUT : accumulation statistiques
+                # ==========================
+                for key in class_stats:
+                    class_stats[key] += stats[key]
+
+                class_dir = output_dir / class_name
+
+                class_dir.mkdir(
+                    parents=True,
+                    exist_ok=True
+                )
+
+                save_path = (
+                    class_dir
+                    / f"{class_name}_aug_{generated_count}.hdr"
+                )
+
+                envi.save_image(
+                    str(save_path),
+                    aug_cube,
+                    dtype=np.float32,
+                    force=True,
+                    interleave="bsq"
+                )
+
+                generated_count += 1
+
+        print(f"Total généré pour {class_name} : {generated_count}")
+
+        # ==========================
+        # AJOUT : calcul pourcentages
+        # ==========================
+        total = class_stats["total"]
+
+        gan_pct = (
+            100 * class_stats["gan"] / total
+            if total > 0 else 0
+        )
+
+        noise_pct = (
+            100 * class_stats["noise"] / total
+            if total > 0 else 0
+        )
+
+        real_pct = (
+            100 * class_stats["real"] / total
+            if total > 0 else 0
+        )
+
+        # ==========================
+        # AJOUT : affichage final
+        # ==========================
+        print("\nStatistiques finales :")
+
+        print(
+            f"GAN : "
+            f"{gan_pct:.2f}% "
+            f"({class_stats['gan']} spectres)"
+        )
+
+        print(
+            f"augment_with_class_noise : "
+            f"{noise_pct:.2f}% "
+            f"({class_stats['noise']} spectres)"
+        )
+
+        print(
+            f"Spectres réels : "
+            f"{real_pct:.2f}% "
+            f"({class_stats['real']} spectres)"
+        )
+
+        print("-" * 60)
