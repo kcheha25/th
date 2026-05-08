@@ -1081,9 +1081,11 @@ def generate_augmented_cube(
             real_tensor = torch.tensor(real_spec, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
 
             for _ in range(5):
-                noise = torch.randn_like(real_tensor)
-                fake = netG(noise).detach().cpu().squeeze().numpy()
+                noise = torch.randn(1, 64, 1, device=device)
+                fake = netG(noise).cpu().squeeze().numpy()
+                fake = (fake +1) /2
                 sam = compute_sam(real_spec, fake)
+                
                 if sam < best_sam:
                     best_sam = sam
                     best_fake = fake
@@ -1440,3 +1442,45 @@ spectra_class = get_spectra_class(dataset, class_name)
 mean_spec, std_spec = compute_class_mean_std(dataset, class_name)
 
 
+    stats = {
+        "gan": 0,
+        "noise": 0,
+        "real": 0,
+        "total": 0
+    }
+
+
+new_spec = augment_with_class_noise(real_spec, spectra_class, alpha=alpha_noise)
+stats["noise"] += 1
+
+global_stats = {}
+
+if cube_prefix not in global_stats:
+    global_stats[cube_prefix] = {
+        "gan": 0,
+        "noise": 0,
+        "real": 0,
+        "total": 0
+    }
+
+
+for key in stats:
+    global_stats[cube_prefix][key] += stats[key]
+
+
+print("\n========== STATISTIQUES FINALES ==========\n")
+
+for class_name, stats in global_stats.items():
+
+    total = stats["total"]
+
+    gan_pct = 100 * stats["gan"] / total
+    noise_pct = 100 * stats["noise"] / total
+    real_pct = 100 * stats["real"] / total
+
+    print(f"Classe : {class_name}")
+    print(f"  GAN                  : {gan_pct:.2f}% ({stats['gan']})")
+    print(f"  augment_with_noise   : {noise_pct:.2f}% ({stats['noise']})")
+    print(f"  Spectres réels       : {real_pct:.2f}% ({stats['real']})")
+    print(f"  Total                : {total}")
+    print("-" * 50)
