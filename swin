@@ -271,6 +271,7 @@ class SpectralSwinTransformer(Backbone):
             layer = self.layers[i]
             if layer.downsample is not None:
                 x, x_down = layer(x)
+                x = x_down
             else:
                 x_down, _ = layer(x)
                 x_down = x
