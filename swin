@@ -1,30 +1,14 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-"""
-Spectral Swin Transformer Backbone for Hyperspectral Images - OPTION B
-Adapted from Swin Transformer for spatial attention to spectral attention.
-
-OPTION B: Découpage en patches spectraux → plusieurs tokens par pixel.
-Chaque pixel devient une séquence de N tokens spectraux.
-Les fenêtres glissantes opèrent sur ces tokens (le long de l'axe spectral).
-"""
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-
 from detectron2.modeling.backbone.backbone import Backbone
 
 _to_2tuple = nn.modules.utils._ntuple(2)
 
-
 class Mlp(nn.Module):
-    """Multilayer perceptron."""
-
-    def __init__(
-        self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.0
-    ):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.0):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -43,21 +27,10 @@ class Mlp(nn.Module):
 
 
 def spectral_window_partition(x, window_size):
-    """
-    Partition the spectral token dimension into windows.
-    Args:
-        x: (B, N, D) where N = number of spectral tokens, D = embedding dim
-        window_size (int): size of spectral window
-    Returns:
-        windows: (B * num_windows, window_size, D)
-        N_original: original number of spectral tokens
-        pad_n: padding added
-    """
     B, N, D = x.shape
     pad_n = (window_size - N % window_size) % window_size
     if pad_n > 0:
         x = F.pad(x, (0, 0, 0, pad_n))
-    
     N_padded = x.shape[1]
     x = x.view(B, N_padded // window_size, window_size, D)
     windows = x.contiguous().view(-1, window_size, D)
@@ -65,16 +38,6 @@ def spectral_window_partition(x, window_size):
 
 
 def spectral_window_reverse(windows, window_size, N_original, pad_n):
-    """
-    Reverse spectral window partition.
-    Args:
-        windows: (B * num_windows, window_size, D)
-        window_size (int): spectral window size
-        N_original (int): original number of spectral tokens
-        pad_n (int): padding added
-    Returns:
-        x: (B, N_original, D)
-    """
     N_padded = N_original + pad_n
     B = windows.shape[0] // (N_padded // window_size)
     x = windows.view(B, N_padded // window_size, window_size, -1)
@@ -85,80 +48,34 @@ def spectral_window_reverse(windows, window_size, N_original, pad_n):
 
 
 class SpectralWindowAttention(nn.Module):
-    """
-    Spectral Window based multi-head self attention (SW-MSA) module.
-    Applies attention within windows of spectral tokens (1D).
-    Args:
-        dim (int): Number of input channels.
-        window_size (int): The size of the spectral window.
-        num_heads (int): Number of attention heads.
-        qkv_bias (bool): If True, add a learnable bias to query, key, value.
-        qk_scale (float | None): Override default qk scale.
-        attn_drop (float): Dropout ratio of attention weight.
-        proj_drop (float): Dropout ratio of output.
-    """
-
-    def __init__(
-        self,
-        dim,
-        window_size,
-        num_heads,
-        qkv_bias=True,
-        qk_scale=None,
-        attn_drop=0.0,
-        proj_drop=0.0,
-    ):
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         self.dim = dim
-        self.window_size = window_size  # Ws (spectral window)
+        self.window_size = window_size
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim**-0.5
-
-        # Relative position bias for 1D spectral dimension
-        # Table shape: (2*Ws - 1, num_heads) -- distance entre -Ws+1 et Ws-1
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size - 1), num_heads)
-        )
-
-        # Get pair-wise relative position index for each token inside the spectral window
-        coords = torch.arange(self.window_size)                    # [0, 1, ..., Ws-1]
-        relative_coords = coords[None, :] - coords[:, None]        # Ws x Ws
-        relative_coords += self.window_size - 1                    # shift to [0, 2*Ws-2]
-        self.register_buffer("relative_position_index", relative_coords)  # Ws x Ws
-
+        self.relative_position_bias_table = nn.Parameter(torch.zeros((2 * window_size - 1), num_heads))
+        coords = torch.arange(self.window_size)
+        relative_coords = coords[None, :] - coords[:, None]
+        relative_coords += self.window_size - 1
+        self.register_buffer("relative_position_index", relative_coords)
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-
         nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, mask=None):
-        """
-        Args:
-            x: (num_windows*B, window_size, C)
-            mask: (num_windows, window_size, window_size) or None
-        """
-        B_, N, C = x.shape  # N = window_size
-        qkv = (
-            self.qkv(x)
-            .reshape(B_, N, 3, self.num_heads, C // self.num_heads)
-            .permute(2, 0, 3, 1, 4)
-        )
-        q, k, v = qkv[0], qkv[1], qkv[2]  # (B_, num_heads, N, head_dim)
-
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
         q = q * self.scale
-        attn = q @ k.transpose(-2, -1)  # (B_, num_heads, N, N)
-
-        # Relative position bias (1D)
-        relative_position_bias = self.relative_position_bias_table[
-            self.relative_position_index.view(-1)
-        ].view(self.window_size, self.window_size, -1)  # Ws, Ws, nH
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Ws, Ws
+        attn = q @ k.transpose(-2, -1)
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(self.window_size, self.window_size, -1)
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
         attn = attn + relative_position_bias.unsqueeze(0)
-
         if mask is not None:
             nW = mask.shape[0]
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
@@ -166,9 +83,7 @@ class SpectralWindowAttention(nn.Module):
             attn = self.softmax(attn)
         else:
             attn = self.softmax(attn)
-
         attn = self.attn_drop(attn)
-
         x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -176,258 +91,93 @@ class SpectralWindowAttention(nn.Module):
 
 
 class SpectralSwinTransformerBlock(nn.Module):
-    """
-    Spectral Swin Transformer Block.
-    Window-based attention on spectral tokens (le long des bandes λ).
-    Args:
-        dim (int): Embedding dimension per token.
-        num_heads (int): Number of attention heads.
-        window_size (int): Spectral window size (nombre de tokens par fenêtre).
-        shift_size (int): Shift size for SW-MSA (décalage spectral).
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        qkv_bias (bool): If True, add a learnable bias to query, key, value.
-        qk_scale (float | None): Override default qk scale.
-        drop (float): Dropout rate.
-        attn_drop (float): Attention dropout rate.
-        drop_path (float): Stochastic depth rate.
-        act_layer (nn.Module): Activation layer.
-        norm_layer (nn.Module): Normalization layer.
-    """
-
-    def __init__(
-        self,
-        dim,
-        num_heads,
-        window_size=8,
-        shift_size=0,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        qk_scale=None,
-        drop=0.0,
-        attn_drop=0.0,
-        drop_path=0.0,
-        act_layer=nn.GELU,
-        norm_layer=nn.LayerNorm,
-    ):
+    def __init__(self, dim, num_heads, window_size=8, shift_size=0, mlp_ratio=4.0, qkv_bias=True, qk_scale=None, drop=0.0, attn_drop=0.0, drop_path=0.0, act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.window_size = window_size
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
-        assert 0 <= self.shift_size < self.window_size, "shift_size must be in [0, window_size)"
-
+        assert 0 <= self.shift_size < self.window_size
         self.norm1 = norm_layer(dim)
-        self.attn = SpectralWindowAttention(
-            dim,
-            window_size=self.window_size,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
-            attn_drop=attn_drop,
-            proj_drop=drop,
-        )
-
+        self.attn = SpectralWindowAttention(dim, window_size=self.window_size, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
         if drop_path > 0.0:
             from timm.models.layers import DropPath
             self.drop_path = DropPath(drop_path)
         else:
             self.drop_path = nn.Identity()
-
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(
-            in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop
-        )
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def forward(self, x, attn_mask=None):
-        """
-        Args:
-            x: (B, N, D)  où N = nombre de tokens spectraux, D = dim
-            attn_mask: Attention mask for shifted windows.
-        Returns:
-            x: (B, N, D)
-        """
         B, N, D = x.shape
         shortcut = x
         x = self.norm1(x)
-
-        # Cyclic shift on spectral dimension (dim=1)
         if self.shift_size > 0:
             shifted_x = torch.roll(x, shifts=-self.shift_size, dims=1)
         else:
             shifted_x = x
-
-        # Partition spectral tokens into windows
         x_windows, N_original, pad_n = spectral_window_partition(shifted_x, self.window_size)
-
-        # W-MSA / SW-MSA
         attn_windows = self.attn(x_windows, mask=attn_mask)
-
-        # Merge spectral windows
         shifted_x = spectral_window_reverse(attn_windows, self.window_size, N_original, pad_n)
-
-        # Reverse cyclic shift
         if self.shift_size > 0:
             x = torch.roll(shifted_x, shifts=self.shift_size, dims=1)
         else:
             x = shifted_x
-
-        # FFN with residual
         x = shortcut + self.drop_path(x)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
-
         return x
 
 
 class SpectralPatchMerging(nn.Module):
-    """
-    Spectral Patch Merging Layer.
-    Réduit le nombre de tokens spectraux en fusionnant des paires adjacentes.
-    N tokens → N/2 tokens, dim → 2*dim.
-    Args:
-        dim (int): Input dimension per token.
-        norm_layer (nn.Module): Normalization layer.
-    """
-
     def __init__(self, dim, norm_layer=nn.LayerNorm):
         super().__init__()
         self.dim = dim
-        # Concatène 2 tokens → dim*2 entrée, sortie dim*2
         self.reduction = nn.Linear(2 * dim, 2 * dim, bias=False)
         self.norm = norm_layer(2 * dim)
 
     def forward(self, x):
-        """
-        Args:
-            x: (B, N, D)  où N = nombre de tokens spectraux
-        Returns:
-            x: (B, N//2, D*2)
-        """
         B, N, D = x.shape
-
-        # Pad N to be even
         if N % 2 == 1:
-            x = F.pad(x, (0, 0, 0, 1))  # pad on spectral dim
+            x = F.pad(x, (0, 0, 0, 1))
             N = N + 1
-
-        # Regroupe par paires : (B, N//2, 2, D)
-        x = x.view(B, N // 2, 2, D)
-        # Concatène les 2 tokens : (B, N//2, D*2)
-        x = x.permute(0, 1, 3, 2).contiguous().view(B, N // 2, D * 2)
-
+        x0 = x[:, 0::2, :]
+        x1 = x[:, 1::2, :]
+        x = torch.cat([x0, x1], -1)
         x = self.norm(x)
         x = self.reduction(x)
-
         return x
 
 
 class BasicSpectralLayer(nn.Module):
-    """
-    A basic Spectral Swin Transformer layer for one stage.
-    Args:
-        dim (int): Embedding dimension.
-        depth (int): Number of blocks in this stage.
-        num_heads (int): Number of attention heads.
-        window_size (int): Spectral window size.
-        mlp_ratio (float): Ratio of mlp hidden dim.
-        qkv_bias (bool): QKV bias.
-        qk_scale (float | None): QK scale.
-        drop (float): Dropout rate.
-        attn_drop (float): Attention dropout rate.
-        drop_path (float | list[float]): Stochastic depth rate.
-        norm_layer (nn.Module): Normalization layer.
-        downsample (nn.Module | None): Downsample layer (PatchMerging).
-        use_checkpoint (bool): Gradient checkpointing.
-    """
-
-    def __init__(
-        self,
-        dim,
-        depth,
-        num_heads,
-        window_size=8,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        qk_scale=None,
-        drop=0.0,
-        attn_drop=0.0,
-        drop_path=0.0,
-        norm_layer=nn.LayerNorm,
-        downsample=None,
-        use_checkpoint=False,
-    ):
+    def __init__(self, dim, depth, num_heads, window_size=8, mlp_ratio=4.0, qkv_bias=True, qk_scale=None, drop=0.0, attn_drop=0.0, drop_path=0.0, norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
         super().__init__()
         self.window_size = window_size
         self.shift_size = window_size // 2
         self.depth = depth
         self.use_checkpoint = use_checkpoint
-
-        # Build blocks (alternance W-MSA / SW-MSA)
-        self.blocks = nn.ModuleList(
-            [
-                SpectralSwinTransformerBlock(
-                    dim=dim,
-                    num_heads=num_heads,
-                    window_size=window_size,
-                    shift_size=0 if (i % 2 == 0) else window_size // 2,
-                    mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias,
-                    qk_scale=qk_scale,
-                    drop=drop,
-                    attn_drop=attn_drop,
-                    drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                    norm_layer=norm_layer,
-                )
-                for i in range(depth)
-            ]
-        )
-
+        self.blocks = nn.ModuleList([SpectralSwinTransformerBlock(dim=dim, num_heads=num_heads, window_size=window_size, shift_size=0 if (i % 2 == 0) else window_size // 2, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop, attn_drop=attn_drop, drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path, norm_layer=norm_layer) for i in range(depth)])
         self.downsample = downsample(dim=dim, norm_layer=norm_layer) if downsample is not None else None
 
     def forward(self, x):
-        """
-        Args:
-            x: (B, N, D)  N = nombre de tokens spectraux, D = dim
-        Returns:
-            x: (B, N, D)
-            x_down: (B, N//2, D*2) ou x si pas de downsample
-        """
         B, N, D = x.shape
-
-        # --- Calcul du masque d'attention pour SW-MSA ---
         N_padded = int(np.ceil(N / self.window_size)) * self.window_size
-        img_mask = torch.zeros((1, N_padded, 1), device=x.device)  # (1, N_padded, 1)
-
-        # Découpe en 3 régions pour le masque cyclique
-        n_slices = (
-            slice(0, -self.window_size),
-            slice(-self.window_size, -self.shift_size),
-            slice(-self.shift_size, None),
-        )
+        img_mask = torch.zeros((1, N_padded, 1), device=x.device)
+        n_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
         cnt = 0
         for s in n_slices:
             img_mask[:, s, :] = cnt
             cnt += 1
-
-        # Partition du masque en fenêtres
-        mask_windows, _, _ = spectral_window_partition(
-            img_mask.squeeze(-1).unsqueeze(0), self.window_size
-        )  # (nW, window_size, 1)
-        mask_windows = mask_windows.squeeze(-1)  # (nW, window_size)
-        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)  # (nW, Ws, Ws)
-        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(
-            attn_mask == 0, float(0.0)
-        )
-
-        # --- Passage dans les blocs ---
+        mask_windows, _, _ = spectral_window_partition(img_mask.squeeze(-1).unsqueeze(0), self.window_size)
+        mask_windows = mask_windows.squeeze(-1)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
         for blk in self.blocks:
             if self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x, attn_mask)
             else:
                 x = blk(x, attn_mask)
-
-        # --- Downsampling spectral ---
         if self.downsample is not None:
             x_down = self.downsample(x)
             return x, x_down
@@ -436,124 +186,29 @@ class BasicSpectralLayer(nn.Module):
 
 
 class SpectralPatchEmbed(nn.Module):
-    """
-    Spectral Patch Embedding (Option B).
-    Découpe les C bandes spectrales en patches de taille `spectral_patch_size`,
-    puis projette chaque patch → un token de dimension embed_dim.
-
-    Résultat : chaque pixel = N = C // spectral_patch_size tokens spectraux.
-
-    Args:
-        in_chans (int): Nombre total de bandes spectrales (ex: 270).
-        spectral_patch_size (int): Taille d'un patch spectral (ex: 1 → 1 bande par token).
-        embed_dim (int): Dimension d'embedding par token.
-        norm_layer (nn.Module | None): Normalization layer.
-    """
-
     def __init__(self, in_chans=270, spectral_patch_size=1, embed_dim=96, norm_layer=None):
         super().__init__()
         self.in_chans = in_chans
         self.spectral_patch_size = spectral_patch_size
         self.embed_dim = embed_dim
-
-        # Nombre de tokens spectraux par pixel
         self.num_spectral_tokens = in_chans // spectral_patch_size
-
-        # Projection linéaire : spectral_patch_size → embed_dim
         self.proj = nn.Linear(spectral_patch_size, embed_dim)
-
         self.norm = norm_layer(embed_dim) if norm_layer is not None else None
 
     def forward(self, x):
-        """
-        Args:
-            x: (B, C, H, W)  image hyperspectrale
-        Returns:
-            out: (B*H*W, N, embed_dim)  séquence spectrale par pixel
-            H, W: dimensions spatiales (pour reconstruction ultérieure)
-        """
         B, C, H, W = x.shape
-
-        # (B, C, H, W) → (B, H, W, C)
         x = x.permute(0, 2, 3, 1).contiguous()
-
-        # (B, H, W, C) → (B*H*W, C)  -- chaque ligne = un pixel complet
         x = x.view(B * H * W, C)
-
-        # Découpage en patches spectraux
-        # (B*H*W, C) → (B*H*W, num_tokens, patch_size)
         x = x.view(B * H * W, self.num_spectral_tokens, self.spectral_patch_size)
-
-        # Projection linéaire : chaque patch → embed_dim
-        x = self.proj(x)  # (B*H*W, num_tokens, embed_dim)
-
+        x = self.proj(x)
         if self.norm is not None:
             x = self.norm(x)
-
         return x, H, W
 
 
 class SpectralSwinTransformer(Backbone):
-    """
-    Spectral Swin Transformer Backbone (Option B) for Hyperspectral Images.
-
-    Archi complète :
-        HSI (B, C, H, W)
-            ↓ SpectralPatchEmbed
-        (B*H*W, N, embed_dim)   ← N tokens spectraux par pixel
-            ↓ Stage 1: BasicSpectralLayer (attention + merging)
-        (B*H*W, N/2, 2*embed_dim)
-            ↓ Stage 2
-        (B*H*W, N/4, 4*embed_dim)
-            ↓ Stage 3
-        (B*H*W, N/8, 8*embed_dim)
-            ↓ Stage 4
-        (B*H*W, N/16, 16*embed_dim)
-            ↓ Global pooling sur N + reshape
-        (B, D_out, H, W)  ← feature maps spatiales pour Detectron2
-
-    Args:
-        in_chans (int): Nombre de bandes spectrales. Default: 270.
-        spectral_patch_size (int): Taille d'un patch spectral. Default: 1.
-        embed_dim (int): Dimension d'embedding initiale. Default: 96.
-        depths (tuple[int]): Nombre de blocs par stage.
-        num_heads (tuple[int]): Nombre de têtes d'attention par stage.
-        spectral_window_size (int): Taille des fenêtres spectrales. Default: 8.
-        mlp_ratio (float): Ratio MLP. Default: 4.
-        qkv_bias (bool): QKV bias.
-        qk_scale (float | None): QK scale.
-        drop_rate (float): Dropout rate.
-        attn_drop_rate (float): Attention dropout rate.
-        drop_path_rate (float): Stochastic depth rate.
-        norm_layer (nn.Module): Normalization layer.
-        patch_norm (bool): Norm après patch embedding.
-        out_indices (Sequence[int]): Quels stages sortir.
-        frozen_stages (int): Stages gelés.
-        use_checkpoint (bool): Gradient checkpointing.
-    """
-
-    def __init__(
-        self,
-        in_chans=270,
-        spectral_patch_size=1,
-        embed_dim=96,
-        depths=(2, 2, 6, 2),
-        num_heads=(3, 6, 12, 24),
-        spectral_window_size=8,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        qk_scale=None,
-        drop_rate=0.0,
-        attn_drop_rate=0.0,
-        drop_path_rate=0.2,
-        norm_layer=nn.LayerNorm,
-        patch_norm=True,
-        out_indices=(0, 1, 2, 3),
-        frozen_stages=-1,
-        use_checkpoint=False,
-    ):
+    def __init__(self, in_chans=270, spectral_patch_size=1, embed_dim=96, depths=(2, 2, 6, 2), num_heads=(3, 6, 12, 24), spectral_window_size=8, mlp_ratio=4.0, qkv_bias=True, qk_scale=None, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.2, norm_layer=nn.LayerNorm, patch_norm=True, out_indices=(0, 1, 2, 3), frozen_stages=-1, use_checkpoint=False):
         super().__init__()
-
         self.num_layers = len(depths)
         self.embed_dim = embed_dim
         self.patch_norm = patch_norm
@@ -562,63 +217,24 @@ class SpectralSwinTransformer(Backbone):
         self.in_chans = in_chans
         self.spectral_patch_size = spectral_patch_size
         self.spectral_window_size = spectral_window_size
-
-        # === Spectral Patch Embedding (Option B) ===
-        self.patch_embed = SpectralPatchEmbed(
-            in_chans=in_chans,
-            spectral_patch_size=spectral_patch_size,
-            embed_dim=embed_dim,
-            norm_layer=norm_layer if self.patch_norm else None,
-        )
-
+        self.patch_embed = SpectralPatchEmbed(in_chans=in_chans, spectral_patch_size=spectral_patch_size, embed_dim=embed_dim, norm_layer=norm_layer if self.patch_norm else None)
         self.pos_drop = nn.Dropout(p=drop_rate)
-
-        # Stochastic depth
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
-
-        # === Build spectral stages ===
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            layer = BasicSpectralLayer(
-                dim=int(embed_dim * 2**i_layer),
-                depth=depths[i_layer],
-                num_heads=num_heads[i_layer],
-                window_size=spectral_window_size,
-                mlp_ratio=mlp_ratio,
-                qkv_bias=qkv_bias,
-                qk_scale=qk_scale,
-                drop=drop_rate,
-                attn_drop=attn_drop_rate,
-                drop_path=dpr[sum(depths[:i_layer]) : sum(depths[: i_layer + 1])],
-                norm_layer=norm_layer,
-                downsample=SpectralPatchMerging if (i_layer < self.num_layers - 1) else None,
-                use_checkpoint=use_checkpoint,
-            )
+            layer = BasicSpectralLayer(dim=int(embed_dim * 2**i_layer), depth=depths[i_layer], num_heads=num_heads[i_layer], window_size=spectral_window_size, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])], norm_layer=norm_layer, downsample=SpectralPatchMerging if (i_layer < self.num_layers - 1) else None, use_checkpoint=use_checkpoint)
             self.layers.append(layer)
-
-        # === Feature dimensions per stage ===
         num_features = [int(embed_dim * 2**i) for i in range(self.num_layers)]
         self.num_features = num_features
-
-        # === Output norms ===
         for i_layer in out_indices:
             layer = norm_layer(num_features[i_layer])
             layer_name = f"norm{i_layer}"
             self.add_module(layer_name, layer)
-
-        # === Freeze stages ===
         self._freeze_stages()
-
-        # === Detectron2 output config ===
         self._out_features = ["p{}".format(i) for i in self.out_indices]
-        self._out_feature_channels = {
-            "p{}".format(i): int(embed_dim * 2**i) for i in self.out_indices
-        }
-        # Les strides spatiales restent à 1 (backbone purement spectral).
-        # On met des strides croissantes pour la compatibilité FPN.
+        self._out_feature_channels = {"p{}".format(i): int(embed_dim * 2**i) for i in self.out_indices}
         self._out_feature_strides = {"p{}".format(i): 2 ** (i + 2) for i in self.out_indices}
         self._size_divisibility = 1
-
         self.apply(self._init_weights)
 
     def _freeze_stages(self):
@@ -648,78 +264,26 @@ class SpectralSwinTransformer(Backbone):
         return self._size_divisibility
 
     def forward(self, x):
-        """
-        Args:
-            x: (B, C, H, W) image hyperspectrale
-        Returns:
-            outs: dict {"p0": ..., "p1": ..., "p2": ..., "p3": ...}
-                  chaque valeur = (B, D_i, H, W)
-        """
-        # === Spectral Patch Embedding ===
-        x, H, W = self.patch_embed(x)  # (B*H*W, N, embed_dim)
+        x, H, W = self.patch_embed(x)
         x = self.pos_drop(x)
-
         outs = {}
-
         for i in range(self.num_layers):
             layer = self.layers[i]
-
             if layer.downsample is not None:
-                x, x_down = layer(x)  # x_down = après merging
+                x, x_down = layer(x)
             else:
                 x_down, _ = layer(x)
                 x_down = x
-
             if i in self.out_indices:
                 norm_layer = getattr(self, f"norm{i}")
-
-                # Global average pooling sur la dimension spectrale (dim=1)
-                # (B*H*W, N, D) → (B*H*W, D)
                 x_out = x_down.mean(dim=1)
                 x_out = norm_layer(x_out)
-
-                # Reshape en feature map 2D
-                # (B*H*W, D) → (B, D, H, W)
-                out = x_out.view(-1, H, W, self.num_features[i])
-                out = out.permute(0, 3, 1, 2).contiguous()
-
+                out = x_out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
                 outs["p{}".format(i)] = out
-
         return outs
 
 
-# ============================================================================
-# Detectron2 Registration
-# ============================================================================
-from detectron2.modeling import BACKBONE_REGISTRY
-
-@BACKBONE_REGISTRY.register()
-def build_spectral_swin_backbone(cfg, input_shape):
-    """
-    Build Spectral Swin Transformer backbone from config.
-    """
-    return SpectralSwinTransformer(
-        in_chans=cfg.MODEL.SPECTRAL_SWIN.IN_CHANS,
-        spectral_patch_size=cfg.MODEL.SPECTRAL_SWIN.PATCH_SIZE,
-        embed_dim=cfg.MODEL.SPECTRAL_SWIN.EMBED_DIM,
-        depths=cfg.MODEL.SPECTRAL_SWIN.DEPTHS,
-        num_heads=cfg.MODEL.SPECTRAL_SWIN.NUM_HEADS,
-        spectral_window_size=cfg.MODEL.SPECTRAL_SWIN.WINDOW_SIZE,
-        mlp_ratio=cfg.MODEL.SPECTRAL_SWIN.MLP_RATIO,
-        qkv_bias=cfg.MODEL.SPECTRAL_SWIN.QKV_BIAS,
-        drop_rate=cfg.MODEL.SPECTRAL_SWIN.DROP_RATE,
-        attn_drop_rate=cfg.MODEL.SPECTRAL_SWIN.ATTN_DROP_RATE,
-        drop_path_rate=cfg.MODEL.SPECTRAL_SWIN.DROP_PATH_RATE,
-        out_indices=cfg.MODEL.SPECTRAL_SWIN.OUT_INDICES,
-        frozen_stages=cfg.MODEL.SPECTRAL_SWIN.FROZEN_STAGES,
-        use_checkpoint=cfg.MODEL.SPECTRAL_SWIN.USE_CHECKPOINT,
-    )
-
-
 if __name__ == "__main__":
-    import torch
-    import torch.nn as nn
-
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     BATCH_SIZE = 2
     IN_CHANS = 270
@@ -729,23 +293,7 @@ if __name__ == "__main__":
     print(f"Device: {DEVICE}")
     print(f"Input shape: ({BATCH_SIZE}, {IN_CHANS}, {H}, {W})")
 
-    model = SpectralSwinTransformer(
-        in_chans=IN_CHANS,
-        spectral_patch_size=1,
-        embed_dim=96,
-        depths=(2, 2, 6, 2),
-        num_heads=(3, 6, 12, 24),
-        spectral_window_size=8,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        drop_rate=0.0,
-        attn_drop_rate=0.0,
-        drop_path_rate=0.0,
-        patch_norm=True,
-        out_indices=(0, 1, 2, 3),
-        frozen_stages=-1,
-        use_checkpoint=False,
-    ).to(DEVICE)
+    model = SpectralSwinTransformer(in_chans=IN_CHANS, spectral_patch_size=1, embed_dim=96, depths=(2, 2, 6, 2), num_heads=(3, 6, 12, 24), spectral_window_size=8, mlp_ratio=4.0, qkv_bias=True, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.0, patch_norm=True, out_indices=(0, 1, 2, 3), frozen_stages=-1, use_checkpoint=False).to(DEVICE)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -753,8 +301,6 @@ if __name__ == "__main__":
     print(f"Trainable parameters: {trainable_params:,}")
 
     x = torch.randn(BATCH_SIZE, IN_CHANS, H, W).to(DEVICE)
-    print(f"Input tensor: {x.shape}")
-
     model.eval()
     with torch.no_grad():
         outs = model(x)
@@ -763,12 +309,7 @@ if __name__ == "__main__":
     for k, v in outs.items():
         print(f"  {k}: {v.shape}")
 
-    expected = {
-        "p0": (BATCH_SIZE, 96, H, W),
-        "p1": (BATCH_SIZE, 192, H, W),
-        "p2": (BATCH_SIZE, 384, H, W),
-        "p3": (BATCH_SIZE, 768, H, W),
-    }
+    expected = {"p0": (BATCH_SIZE, 96, H, W), "p1": (BATCH_SIZE, 192, H, W), "p2": (BATCH_SIZE, 384, H, W), "p3": (BATCH_SIZE, 768, H, W)}
 
     all_ok = True
     for k, exp_shape in expected.items():
@@ -801,23 +342,13 @@ if __name__ == "__main__":
         print(f"Parameters with NaN gradient: {len(nan_grad)}")
         all_ok = False
 
-    test_configs = [
-        (1, 270, 64, 64),
-        (4, 270, 16, 16),
-        (2, 270, 48, 48),
-    ]
-
+    test_configs = [(1, 270, 64, 64), (4, 270, 16, 16), (2, 270, 48, 48)]
     for bs, c, h, w in test_configs:
         try:
             with torch.no_grad():
                 x_test = torch.randn(bs, c, h, w).to(DEVICE)
                 outs_test = model(x_test)
-                shapes_ok = all(
-                    outs_test[f"p{i}"].shape[0] == bs and
-                    outs_test[f"p{i}"].shape[2] == h and
-                    outs_test[f"p{i}"].shape[3] == w
-                    for i in model.out_indices
-                )
+                shapes_ok = all(outs_test[f"p{i}"].shape[0] == bs and outs_test[f"p{i}"].shape[2] == h and outs_test[f"p{i}"].shape[3] == w for i in model.out_indices)
                 if not shapes_ok:
                     print(f"Failed for bs={bs}, h={h}, w={w}")
                     all_ok = False
