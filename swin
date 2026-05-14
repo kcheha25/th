@@ -269,18 +269,14 @@ class SpectralSwinTransformer(Backbone):
         outs = {}
         for i in range(self.num_layers):
             layer = self.layers[i]
-            if layer.downsample is not None:
-                x, x_down = layer(x)
-                x = x_down
-            else:
-                x_down, _ = layer(x)
-                x_down = x
+            x_out, x_down = layer(x)
             if i in self.out_indices:
                 norm_layer = getattr(self, f"norm{i}")
-                x_out = x_down.mean(dim=1)
-                x_out = norm_layer(x_out)
-                out = x_out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
+                out = x_out.mean(dim=1)
+                out = norm_layer(out)
+                out = out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
                 outs["p{}".format(i)] = out
+            x = x_down
         return outs
 
 
