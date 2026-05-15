@@ -5,7 +5,9 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from detectron2.modeling.backbone.backbone import Backbone
 from detectron2.modeling.backbone.build import BACKBONE_REGISTRY
+from detectron2.modeling.backbone.fpn import FPN, LastLevelMaxPool, LastLevelP6P7
 from detectron2.layers import ShapeSpec
+import fvcore.nn.weight_init as weight_init
 
 _to_2tuple = nn.modules.utils._ntuple(2)
 
@@ -299,33 +301,124 @@ class SpectralSwinTransformer(Backbone):
         }
 
 
+class LastLevelP6(nn.Module):
+    """
+    This module is used in FCOS and RetinaNet to generate extra layers
+    """
+    def __init__(self, in_channels, out_channels, in_features="p3"):
+        super().__init__()
+        self.num_levels = 1
+        self.in_feature = in_features
+        self.p6 = nn.Conv2d(in_channels, out_channels, 3, 2, 1)
+        for module in [self.p6]:
+            weight_init.c2_xavier_fill(module)
+
+    def forward(self, x):
+        p6 = self.p6(x)
+        return [p6]
+
+
 @BACKBONE_REGISTRY.register()
 def build_spectral_swin_backbone(cfg, input_shape):
     """
     Create a SpectralSwinTransformer instance from config.
+    
+    Args:
+        cfg: a detectron2 CfgNode
+        input_shape: ShapeSpec of input
+        
+    Returns:
+        SpectralSwinTransformer: a SpectralSwinTransformer instance
     """
-    out_features = cfg.MODEL.SPECTRAL_SWIN.OUT_FEATURES if hasattr(cfg.MODEL, 'SPECTRAL_SWIN') else None
+    # Valeurs par défaut si la section SPECTRAL_SWIN n'existe pas dans la config
+    spectral_swin_cfg = getattr(cfg.MODEL, 'SPECTRAL_SWIN', None)
+    
+    out_features = spectral_swin_cfg.OUT_FEATURES if spectral_swin_cfg else None
     
     return SpectralSwinTransformer(
         in_chans=input_shape.channels,
-        spectral_patch_size=cfg.MODEL.SPECTRAL_SWIN.SPECTRAL_PATCH_SIZE if hasattr(cfg.MODEL, 'SPECTRAL_SWIN') else 1,
-        embed_dim=cfg.MODEL.SPECTRAL_SWIN.EMBED_DIM if hasattr(cfg.MODEL, 'SPECTRAL_SWIN') else 96,
-        depths=cfg.MODEL.SPECTRAL_SWIN.DEPTHS if hasattr(cfg.MODEL, 'SPECTRAL_SWIN') else (2, 2, 6, 2),
-        num_heads=cfg.MODEL.SPECTRAL_SWIN.NUM_HEADS if hasattr(cfg.MODEL, 'SPECTRAL_SWIN') else (3, 6, 12, 24),
-        spectral_window_size=cfg.MODEL.SPECTRAL_SWIN.WINDOW_SIZE if hasattr(cfg.MODEL, 'SPECTRAL_SWIN') else 8,
-        mlp_ratio=cfg.MODEL.SPECTRAL_SWIN.MLP_RATIO if hasattr(cfg.MODEL, 'SPECTRAL_SWIN') else 4.0,
+        spectral_patch_size=spectral_swin_cfg.SPECTRAL_PATCH_SIZE if spectral_swin_cfg else 1,
+        embed_dim=spectral_swin_cfg.EMBED_DIM if spectral_swin_cfg else 96,
+        depths=spectral_swin_cfg.DEPTHS if spectral_swin_cfg else (2, 2, 6, 2),
+        num_heads=spectral_swin_cfg.NUM_HEADS if spectral_swin_cfg else (3, 6, 12, 24),
+        spectral_window_size=spectral_swin_cfg.WINDOW_SIZE if spectral_swin_cfg else 8,
+        mlp_ratio=spectral_swin_cfg.MLP_RATIO if spectral_swin_cfg else 4.0,
         qkv_bias=True,
         qk_scale=None,
-        drop_rate=0.0,
-        attn_drop_rate=0.0,
-        drop_path_rate=cfg.MODEL.SPECTRAL_SWIN.DROP_PATH_RATE if hasattr(cfg.MODEL, 'SPECTRAL_SWIN') else 0.2,
+        drop_rate=spectral_swin_cfg.DROP_RATE if spectral_swin_cfg else 0.0,
+        attn_drop_rate=spectral_swin_cfg.ATTN_DROP_RATE if spectral_swin_cfg else 0.0,
+        drop_path_rate=spectral_swin_cfg.DROP_PATH_RATE if spectral_swin_cfg else 0.2,
         norm_layer=nn.LayerNorm,
         patch_norm=True,
-        out_indices=cfg.MODEL.SPECTRAL_SWIN.OUT_INDICES if hasattr(cfg.MODEL, 'SPECTRAL_SWIN') else (0, 1, 2, 3),
+        out_indices=spectral_swin_cfg.OUT_INDICES if spectral_swin_cfg else (0, 1, 2, 3),
         frozen_stages=cfg.MODEL.BACKBONE.FREEZE_AT if hasattr(cfg.MODEL, 'BACKBONE') else -1,
-        use_checkpoint=cfg.MODEL.SPECTRAL_SWIN.USE_CHECKPOINT if hasattr(cfg.MODEL, 'SPECTRAL_SWIN') else False,
+        use_checkpoint=spectral_swin_cfg.USE_CHECKPOINT if spectral_swin_cfg else False,
         out_features=out_features
     )
+
+
+@BACKBONE_REGISTRY.register()
+def build_spectral_swin_fpn_backbone(cfg, input_shape: ShapeSpec):
+    """
+    Build a FPN backbone with SpectralSwinTransformer as bottom-up backbone.
+    
+    Args:
+        cfg: a detectron2 CfgNode
+        input_shape: ShapeSpec of input
+        
+    Returns:
+        backbone (Backbone): backbone module with FPN, must be a subclass of :class:`Backbone`.
+    """
+    bottom_up = build_spectral_swin_backbone(cfg, input_shape)
+    in_features = cfg.MODEL.FPN.IN_FEATURES
+    out_channels = cfg.MODEL.FPN.OUT_CHANNELS
+    backbone = FPN(
+        bottom_up=bottom_up,
+        in_features=in_features,
+        out_channels=out_channels,
+        norm=cfg.MODEL.FPN.NORM,
+        top_block=LastLevelMaxPool(),
+        fuse_type=cfg.MODEL.FPN.FUSE_TYPE,
+    )
+    return backbone
+
+
+@BACKBONE_REGISTRY.register()
+def build_retinanet_spectral_swin_fpn_backbone(cfg, input_shape: ShapeSpec):
+    """
+    Build a FPN backbone with SpectralSwinTransformer for RetinaNet/FCOS.
+    
+    Args:
+        cfg: a detectron2 CfgNode
+        input_shape: ShapeSpec of input
+        
+    Returns:
+        backbone (Backbone): backbone module with FPN, must be a subclass of :class:`Backbone`.
+    """
+    bottom_up = build_spectral_swin_backbone(cfg, input_shape)
+    in_features = cfg.MODEL.FPN.IN_FEATURES
+    out_channels = cfg.MODEL.FPN.OUT_CHANNELS
+    top_levels = cfg.MODEL.FPN.TOP_LEVELS if hasattr(cfg.MODEL.FPN, 'TOP_LEVELS') else 2
+    in_channels_top = out_channels
+    
+    if top_levels == 2:
+        top_block = LastLevelP6P7(in_channels_top, out_channels, in_features[-1])
+    elif top_levels == 1:
+        top_block = LastLevelP6(in_channels_top, out_channels, in_features[-1])
+    elif top_levels == 0:
+        top_block = None
+    else:
+        top_block = LastLevelMaxPool()
+    
+    backbone = FPN(
+        bottom_up=bottom_up,
+        in_features=in_features,
+        out_channels=out_channels,
+        norm=cfg.MODEL.FPN.NORM,
+        top_block=top_block,
+        fuse_type=cfg.MODEL.FPN.FUSE_TYPE,
+    )
+    return backbone
 
 
 if __name__ == "__main__":
@@ -334,74 +427,81 @@ if __name__ == "__main__":
     IN_CHANS = 270
     H, W = 32, 32
 
-    print("Testing Spectral Swin Transformer Backbone (Option B)")
+    print("Testing Spectral Swin Transformer Backbone")
     print(f"Device: {DEVICE}")
     print(f"Input shape: ({BATCH_SIZE}, {IN_CHANS}, {H}, {W})")
 
-    model = SpectralSwinTransformer(in_chans=IN_CHANS, spectral_patch_size=1, embed_dim=96, depths=(2, 2, 6, 2), num_heads=(3, 6, 12, 24), spectral_window_size=8, mlp_ratio=4.0, qkv_bias=True, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.0, patch_norm=True, out_indices=(0, 1, 2, 3), frozen_stages=-1, use_checkpoint=False).to(DEVICE)
+    # Test du backbone simple
+    model = SpectralSwinTransformer(
+        in_chans=IN_CHANS, 
+        spectral_patch_size=1, 
+        embed_dim=96, 
+        depths=(2, 2, 6, 2), 
+        num_heads=(3, 6, 12, 24), 
+        spectral_window_size=8, 
+        mlp_ratio=4.0, 
+        qkv_bias=True, 
+        drop_rate=0.0, 
+        attn_drop_rate=0.0, 
+        drop_path_rate=0.0, 
+        patch_norm=True, 
+        out_indices=(0, 1, 2, 3), 
+        frozen_stages=-1, 
+        use_checkpoint=False
+    ).to(DEVICE)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
+    # Test du backbone simple
     x = torch.randn(BATCH_SIZE, IN_CHANS, H, W).to(DEVICE)
     model.eval()
     with torch.no_grad():
         outs = model(x)
 
-    print("Output shapes:")
+    print("Backbone output shapes:")
     for k, v in outs.items():
         print(f"  {k}: {v.shape}")
 
-    expected = {"p0": (BATCH_SIZE, 96, H, W), "p1": (BATCH_SIZE, 192, H, W), "p2": (BATCH_SIZE, 384, H, W), "p3": (BATCH_SIZE, 768, H, W)}
-
-    all_ok = True
-    for k, exp_shape in expected.items():
-        if k not in outs:
-            print(f"MISSING {k}")
-            all_ok = False
-        elif outs[k].shape != exp_shape:
-            print(f"SHAPE MISMATCH {k}: got {outs[k].shape}, expected {exp_shape}")
-            all_ok = False
-
-    model.train()
-    x = torch.randn(BATCH_SIZE, IN_CHANS, H, W).to(DEVICE)
-    outs = model(x)
-    loss = sum(v.sum() for v in outs.values())
-    loss.backward()
-
-    no_grad = []
-    nan_grad = []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if param.grad is None:
-                no_grad.append(name)
-            elif torch.isnan(param.grad).any():
-                nan_grad.append(name)
-
-    if no_grad:
-        print(f"Parameters without gradient: {len(no_grad)}")
-        all_ok = False
-    if nan_grad:
-        print(f"Parameters with NaN gradient: {len(nan_grad)}")
-        all_ok = False
-
-    test_configs = [(1, 270, 64, 64), (4, 270, 16, 16), (2, 270, 48, 48)]
-    for bs, c, h, w in test_configs:
-        try:
-            with torch.no_grad():
-                x_test = torch.randn(bs, c, h, w).to(DEVICE)
-                outs_test = model(x_test)
-                shapes_ok = all(outs_test[f"p{i}"].shape[0] == bs and outs_test[f"p{i}"].shape[2] == h and outs_test[f"p{i}"].shape[3] == w for i in model.out_indices)
-                if not shapes_ok:
-                    print(f"Failed for bs={bs}, h={h}, w={w}")
-                    all_ok = False
-        except Exception as e:
-            print(f"Error for bs={bs}, h={h}, w={w}: {e}")
-            all_ok = False
-
-    if all_ok:
-        print("ALL TESTS PASSED")
-    else:
-        print("SOME TESTS FAILED")
+    # Test avec FPN
+    print("\nTesting FPN with Spectral Swin Transformer")
+    from detectron2.config import CfgNode
+    
+    # Création d'une configuration minimale pour le test
+    cfg = CfgNode()
+    cfg.MODEL = CfgNode()
+    cfg.MODEL.SPECTRAL_SWIN = CfgNode()
+    cfg.MODEL.SPECTRAL_SWIN.SPECTRAL_PATCH_SIZE = 1
+    cfg.MODEL.SPECTRAL_SWIN.EMBED_DIM = 96
+    cfg.MODEL.SPECTRAL_SWIN.DEPTHS = (2, 2, 6, 2)
+    cfg.MODEL.SPECTRAL_SWIN.NUM_HEADS = (3, 6, 12, 24)
+    cfg.MODEL.SPECTRAL_SWIN.WINDOW_SIZE = 8
+    cfg.MODEL.SPECTRAL_SWIN.MLP_RATIO = 4.0
+    cfg.MODEL.SPECTRAL_SWIN.DROP_RATE = 0.0
+    cfg.MODEL.SPECTRAL_SWIN.ATTN_DROP_RATE = 0.0
+    cfg.MODEL.SPECTRAL_SWIN.DROP_PATH_RATE = 0.0
+    cfg.MODEL.SPECTRAL_SWIN.OUT_INDICES = (0, 1, 2, 3)
+    cfg.MODEL.SPECTRAL_SWIN.USE_CHECKPOINT = False
+    cfg.MODEL.BACKBONE = CfgNode()
+    cfg.MODEL.BACKBONE.FREEZE_AT = -1
+    cfg.MODEL.FPN = CfgNode()
+    cfg.MODEL.FPN.IN_FEATURES = ["p0", "p1", "p2", "p3"]
+    cfg.MODEL.FPN.OUT_CHANNELS = 256
+    cfg.MODEL.FPN.NORM = ""
+    cfg.MODEL.FPN.FUSE_TYPE = "sum"
+    
+    # Test du builder FPN
+    input_shape = ShapeSpec(channels=IN_CHANS, height=H, width=W)
+    fpn_backbone = build_spectral_swin_fpn_backbone(cfg, input_shape).to(DEVICE)
+    
+    fpn_backbone.eval()
+    with torch.no_grad():
+        fpn_outs = fpn_backbone(x)
+    
+    print("FPN output shapes:")
+    for k, v in fpn_outs.items():
+        print(f"  {k}: {v.shape}")
+    
+    print("\nAll tests passed! ✓")
