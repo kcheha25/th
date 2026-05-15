@@ -229,6 +229,39 @@ class SpectralPatchEmbed(nn.Module):
         return x, H, W
 
 
+# =====================================================================
+# NOUVEAU MODULE : Réduction spatiale Depthwise Separable Convolution
+# =====================================================================
+class SpatialReduction(nn.Module):
+    """
+    Réduction spatiale avec depthwise separable convolution.
+    Réduit la résolution spatiale de moitié (stride=2) tout en
+    préservant la qualité des features via un mélange spatial puis inter-canaux.
+    """
+    def __init__(self, dim, stride=2):
+        super().__init__()
+        # Depthwise conv : mélange spatial, chaque canal traité indépendamment
+        self.depthwise = nn.Conv2d(
+            dim, dim,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            groups=dim,
+            bias=False
+        )
+        # Pointwise conv : mélange inter-canaux
+        self.pointwise = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.norm = nn.BatchNorm2d(dim)
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        x = self.norm(x)
+        x = self.act(x)
+        return x
+
+
 class SpectralSwinTransformer(Backbone):
     def __init__(self, in_chans=270, spectral_patch_size=1, embed_dim=96, depths=(2, 2, 6, 2),
                  num_heads=(3, 6, 12, 24), spectral_window_size=8, mlp_ratio=4.0, qkv_bias=True,
@@ -257,6 +290,12 @@ class SpectralSwinTransformer(Backbone):
         self._out_feature_strides = {}
         self._out_feature_channels = {}
 
+        # =====================================================================
+        # NOUVEAU : Définition des strides pour matcher ResNeXt-101
+        # ResNeXt-101 : stage2=H/4, stage3=H/8, stage4=H/16, stage5=H/32
+        # =====================================================================
+        self._spatial_strides = [4, 8, 16, 32]
+
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
             layer = BasicSpectralLayer(
@@ -277,18 +316,53 @@ class SpectralSwinTransformer(Backbone):
 
             stage = f"stage{i_layer + 2}"
             if stage in self.out_features:
-                self._out_feature_channels[stage] = int(embed_dim * 2**i_layer)
-                self._out_feature_strides[stage] = 2 ** (i_layer + 2)
+                dim_stage = int(embed_dim * 2**i_layer)
+                self._out_feature_channels[stage] = dim_stage
+                self._out_feature_strides[stage] = self._spatial_strides[i_layer]
 
         num_features = [int(embed_dim * 2**i) for i in range(self.num_layers)]
         self.num_features = num_features
 
+        # =====================================================================
+        # NOUVEAU : Créer les modules de réduction spatiale pour chaque stage
+        # =====================================================================
+        self.spatial_reductions = nn.ModuleList()
         for i_layer in range(self.num_layers):
             stage = f"stage{i_layer + 2}"
             if stage in self.out_features:
-                layer = norm_layer(num_features[i_layer])
+                dim_stage = int(embed_dim * 2**i_layer)
+
+                if i_layer == 0:
+                    # Stage 2 : stride 4 = deux réductions 2x successives
+                    self.spatial_reductions.append(nn.Sequential(
+                        SpatialReduction(dim_stage, stride=2),
+                        SpatialReduction(dim_stage, stride=2)
+                    ))
+                elif i_layer == 1:
+                    # Stage 3 : stride 8 = une réduction 2x (4 -> 8)
+                    self.spatial_reductions.append(
+                        SpatialReduction(dim_stage, stride=2)
+                    )
+                elif i_layer == 2:
+                    # Stage 4 : stride 16 = une réduction 2x (8 -> 16)
+                    self.spatial_reductions.append(
+                        SpatialReduction(dim_stage, stride=2)
+                    )
+                else:
+                    # Stage 5 : stride 32 = une réduction 2x (16 -> 32)
+                    self.spatial_reductions.append(
+                        SpatialReduction(dim_stage, stride=2)
+                    )
+            else:
+                self.spatial_reductions.append(nn.Identity())
+
+        # Couches de normalisation par stage (existant)
+        for i_layer in range(self.num_layers):
+            stage = f"stage{i_layer + 2}"
+            if stage in self.out_features:
+                layer_norm = norm_layer(num_features[i_layer])
                 layer_name = f"norm{i_layer}"
-                self.add_module(layer_name, layer)
+                self.add_module(layer_name, layer_norm)
 
         self._freeze_stages()
         self.apply(self._init_weights)
@@ -319,17 +393,38 @@ class SpectralSwinTransformer(Backbone):
         x, H, W = self.patch_embed(x)
         x = self.pos_drop(x)
         outs = {}
+
+        # Variables pour suivre la résolution spatiale courante
+        H_curr, W_curr = H, W
+
         for i in range(self.num_layers):
             layer = self.layers[i]
             x_out, x_down = layer(x)
+
             stage = f"stage{i + 2}"
             if stage in self.out_features:
                 norm_layer = getattr(self, f"norm{i}")
-                out = x_out.mean(dim=1)        # ← manquait
+
+                # Moyenne sur la dimension spectrale
+                out = x_out.mean(dim=1)
                 out = norm_layer(out)
-                out = out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
+
+                # Reshape en features spatiales 2D
+                out = out.view(-1, H_curr, W_curr, self.num_features[i])
+                out = out.permute(0, 3, 1, 2).contiguous()
+
+                # =====================================================================
+                # NOUVEAU : Appliquer la réduction spatiale
+                # =====================================================================
+                out = self.spatial_reductions[i](out)
+
+                # Mettre à jour les dimensions spatiales pour le prochain stage
+                H_curr, W_curr = out.shape[2], out.shape[3]
+
                 outs[stage] = out
+
             x = x_down
+
         return outs
 
     def train(self, mode=True):
@@ -425,9 +520,11 @@ if __name__ == "__main__":
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     BATCH_SIZE = 2
     IN_CHANS = 270
-    H, W = 32, 32
+    H, W = 256, 256  # Augmenté pour mieux voir les réductions spatiales
 
-    print("Testing SpectralSwinTransformer")
+    print("=" * 60)
+    print("Testing SpectralSwinTransformer avec Réduction Spatiale")
+    print("=" * 60)
     print(f"Device: {DEVICE}")
     print(f"Input shape: ({BATCH_SIZE}, {IN_CHANS}, {H}, {W})")
 
@@ -451,7 +548,7 @@ if __name__ == "__main__":
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
+    print(f"\nTotal parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
     x = torch.randn(BATCH_SIZE, IN_CHANS, H, W).to(DEVICE)
@@ -459,27 +556,36 @@ if __name__ == "__main__":
     with torch.no_grad():
         outs = model(x)
 
-    print("Output shapes:")
+    print("\nOutput shapes (doit matcher ResNeXt-101) :")
+    print(f"  Input : ({BATCH_SIZE}, {IN_CHANS}, {H}, {W})")
     for k, v in outs.items():
         print(f"  {k}: {v.shape}")
 
+    # Dimensions attendues comme ResNeXt-101
     expected = {
-        "stage2": (BATCH_SIZE, 96,  H, W),
-        "stage3": (BATCH_SIZE, 192, H, W),
-        "stage4": (BATCH_SIZE, 384, H, W),
-        "stage5": (BATCH_SIZE, 768, H, W),
+        "stage2": (BATCH_SIZE, 96,  H // 4, W // 4),    # 64x64
+        "stage3": (BATCH_SIZE, 192, H // 8, W // 8),    # 32x32
+        "stage4": (BATCH_SIZE, 384, H // 16, W // 16),  # 16x16
+        "stage5": (BATCH_SIZE, 768, H // 32, W // 32),  # 8x8
     }
+
+    print("\nComparaison avec ResNeXt-101 standard :")
     all_ok = True
     for k, exp in expected.items():
         if k not in outs:
-            print(f"MISSING {k}")
+            print(f"  {k}: MISSING")
             all_ok = False
         elif tuple(outs[k].shape) != exp:
-            print(f"SHAPE MISMATCH {k}: got {tuple(outs[k].shape)}, expected {exp}")
+            print(f"  {k}: MISMATCH - got {tuple(outs[k].shape)}, expected {exp}")
             all_ok = False
+        else:
+            print(f"  {k}: OK {tuple(outs[k].shape)}")
 
-    print("output_shape():", model.output_shape())
+    print("\noutput_shape():")
+    for k, v in model.output_shape().items():
+        print(f"  {k}: channels={v.channels}, stride={v.stride}")
 
+    # Test backward pass
     model.train()
     x = torch.randn(BATCH_SIZE, IN_CHANS, H, W).to(DEVICE)
     outs = model(x)
@@ -496,13 +602,15 @@ if __name__ == "__main__":
                 nan_grad.append(name)
 
     if no_grad:
-        print(f"Parameters without gradient: {len(no_grad)}")
+        print(f"\nParameters without gradient: {len(no_grad)}")
         all_ok = False
     if nan_grad:
-        print(f"Parameters with NaN gradient: {len(nan_grad)}")
+        print(f"\nParameters with NaN gradient: {len(nan_grad)}")
         all_ok = False
 
-    test_configs = [(1, 270, 64, 64), (4, 270, 16, 16), (2, 270, 48, 48)]
+    # Test avec différentes tailles d'entrée
+    test_configs = [(1, 270, 128, 128), (4, 270, 512, 512), (2, 270, 256, 320)]
+    print("\nTest avec différentes tailles d'entrée :")
     for bs, c, h, w in test_configs:
         try:
             with torch.no_grad():
@@ -510,18 +618,24 @@ if __name__ == "__main__":
                 outs_test = model(x_test)
                 shapes_ok = all(
                     outs_test[s].shape[0] == bs and
-                    outs_test[s].shape[2] == h and
-                    outs_test[s].shape[3] == w
-                    for s in model.out_features
+                    outs_test[s].shape[2] == h // model._spatial_strides[i] and
+                    outs_test[s].shape[3] == w // model._spatial_strides[i]
+                    for i, s in enumerate(model.out_features)
                 )
-                if not shapes_ok:
-                    print(f"Failed for bs={bs}, h={h}, w={w}")
+                if shapes_ok:
+                    print(f"  bs={bs}, h={h}, w={w}: OK")
+                else:
+                    print(f"  bs={bs}, h={h}, w={w}: FAILED")
+                    for s in model.out_features:
+                        print(f"    {s}: {outs_test[s].shape}")
                     all_ok = False
         except Exception as e:
-            print(f"Error for bs={bs}, h={h}, w={w}: {e}")
+            print(f"  bs={bs}, h={h}, w={w}: ERROR - {e}")
             all_ok = False
 
+    print("\n" + "=" * 60)
     if all_ok:
         print("ALL TESTS PASSED")
     else:
         print("SOME TESTS FAILED")
+    print("=" * 60)
