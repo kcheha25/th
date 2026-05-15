@@ -3,13 +3,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
+
+import fvcore.nn.weight_init as weight_init
+from timm.models.layers import DropPath, trunc_normal_
+
 from detectron2.modeling.backbone.backbone import Backbone
 from detectron2.modeling.backbone.build import BACKBONE_REGISTRY
 from detectron2.modeling.backbone.fpn import FPN, LastLevelMaxPool, LastLevelP6P7
 from detectron2.layers import ShapeSpec
-import fvcore.nn.weight_init as weight_init
 
 _to_2tuple = nn.modules.utils._ntuple(2)
+
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.0):
@@ -68,7 +72,7 @@ class SpectralWindowAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+        trunc_normal_(self.relative_position_bias_table, std=0.02)
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, mask=None):
@@ -77,7 +81,8 @@ class SpectralWindowAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
         q = q * self.scale
         attn = q @ k.transpose(-2, -1)
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(self.window_size, self.window_size, -1)
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size, self.window_size, -1)
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
         attn = attn + relative_position_bias.unsqueeze(0)
         if mask is not None:
@@ -95,7 +100,9 @@ class SpectralWindowAttention(nn.Module):
 
 
 class SpectralSwinTransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, window_size=8, shift_size=0, mlp_ratio=4.0, qkv_bias=True, qk_scale=None, drop=0.0, attn_drop=0.0, drop_path=0.0, act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+    def __init__(self, dim, num_heads, window_size=8, shift_size=0, mlp_ratio=4.0, qkv_bias=True,
+                 qk_scale=None, drop=0.0, attn_drop=0.0, drop_path=0.0, act_layer=nn.GELU,
+                 norm_layer=nn.LayerNorm):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -104,12 +111,10 @@ class SpectralSwinTransformerBlock(nn.Module):
         self.mlp_ratio = mlp_ratio
         assert 0 <= self.shift_size < self.window_size
         self.norm1 = norm_layer(dim)
-        self.attn = SpectralWindowAttention(dim, window_size=self.window_size, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-        if drop_path > 0.0:
-            from timm.models.layers import DropPath
-            self.drop_path = DropPath(drop_path)
-        else:
-            self.drop_path = nn.Identity()
+        self.attn = SpectralWindowAttention(
+            dim, window_size=self.window_size, num_heads=num_heads,
+            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
@@ -155,20 +160,34 @@ class SpectralPatchMerging(nn.Module):
 
 
 class BasicSpectralLayer(nn.Module):
-    def __init__(self, dim, depth, num_heads, window_size=8, mlp_ratio=4.0, qkv_bias=True, qk_scale=None, drop=0.0, attn_drop=0.0, drop_path=0.0, norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
+    def __init__(self, dim, depth, num_heads, window_size=8, mlp_ratio=4.0, qkv_bias=True,
+                 qk_scale=None, drop=0.0, attn_drop=0.0, drop_path=0.0, norm_layer=nn.LayerNorm,
+                 downsample=None, use_checkpoint=False):
         super().__init__()
         self.window_size = window_size
         self.shift_size = window_size // 2
         self.depth = depth
         self.use_checkpoint = use_checkpoint
-        self.blocks = nn.ModuleList([SpectralSwinTransformerBlock(dim=dim, num_heads=num_heads, window_size=window_size, shift_size=0 if (i % 2 == 0) else window_size // 2, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop, attn_drop=attn_drop, drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path, norm_layer=norm_layer) for i in range(depth)])
+        self.blocks = nn.ModuleList([
+            SpectralSwinTransformerBlock(
+                dim=dim, num_heads=num_heads, window_size=window_size,
+                shift_size=0 if (i % 2 == 0) else window_size // 2,
+                mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop, attn_drop=attn_drop,
+                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                norm_layer=norm_layer)
+            for i in range(depth)])
         self.downsample = downsample(dim=dim, norm_layer=norm_layer) if downsample is not None else None
 
     def forward(self, x):
         B, N, D = x.shape
         N_padded = int(np.ceil(N / self.window_size)) * self.window_size
         img_mask = torch.zeros((1, N_padded, 1), device=x.device)
-        n_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
+        n_slices = (
+            slice(0, -self.window_size),
+            slice(-self.window_size, -self.shift_size),
+            slice(-self.shift_size, None),
+        )
         cnt = 0
         for s in n_slices:
             img_mask[:, s, :] = cnt
@@ -211,41 +230,67 @@ class SpectralPatchEmbed(nn.Module):
 
 
 class SpectralSwinTransformer(Backbone):
-    def __init__(self, in_chans=270, spectral_patch_size=1, embed_dim=96, depths=(2, 2, 6, 2), num_heads=(3, 6, 12, 24), spectral_window_size=8, mlp_ratio=4.0, qkv_bias=True, qk_scale=None, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.2, norm_layer=nn.LayerNorm, patch_norm=True, out_indices=(0, 1, 2, 3), frozen_stages=-1, use_checkpoint=False, out_features=None):
+    def __init__(self, in_chans=270, spectral_patch_size=1, embed_dim=96, depths=(2, 2, 6, 2),
+                 num_heads=(3, 6, 12, 24), spectral_window_size=8, mlp_ratio=4.0, qkv_bias=True,
+                 qk_scale=None, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.2,
+                 norm_layer=nn.LayerNorm, patch_norm=True, frozen_stages=-1,
+                 use_checkpoint=False, out_features=None):
         super().__init__()
+
         self.num_layers = len(depths)
         self.embed_dim = embed_dim
         self.patch_norm = patch_norm
-        self.out_indices = out_indices
         self.frozen_stages = frozen_stages
         self.in_chans = in_chans
         self.spectral_patch_size = spectral_patch_size
         self.spectral_window_size = spectral_window_size
-        
-        # Gérer les out_features pour la compatibilité avec le registry
-        if out_features is None:
-            self._out_features = ["p{}".format(i) for i in self.out_indices]
-        else:
-            self._out_features = out_features
-        
-        self.patch_embed = SpectralPatchEmbed(in_chans=in_chans, spectral_patch_size=spectral_patch_size, embed_dim=embed_dim, norm_layer=norm_layer if self.patch_norm else None)
+        self.out_features = out_features
+
+        self.patch_embed = SpectralPatchEmbed(
+            in_chans=in_chans, spectral_patch_size=spectral_patch_size,
+            embed_dim=embed_dim, norm_layer=norm_layer if self.patch_norm else None)
+
         self.pos_drop = nn.Dropout(p=drop_rate)
+
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+
+        self._out_feature_strides = {}
+        self._out_feature_channels = {}
+
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            layer = BasicSpectralLayer(dim=int(embed_dim * 2**i_layer), depth=depths[i_layer], num_heads=num_heads[i_layer], window_size=spectral_window_size, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])], norm_layer=norm_layer, downsample=SpectralPatchMerging if (i_layer < self.num_layers - 1) else None, use_checkpoint=use_checkpoint)
+            layer = BasicSpectralLayer(
+                dim=int(embed_dim * 2**i_layer),
+                depth=depths[i_layer],
+                num_heads=num_heads[i_layer],
+                window_size=spectral_window_size,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                norm_layer=norm_layer,
+                downsample=SpectralPatchMerging if (i_layer < self.num_layers - 1) else None,
+                use_checkpoint=use_checkpoint)
             self.layers.append(layer)
+
+            stage = f"stage{i_layer + 2}"
+            if stage in self.out_features:
+                self._out_feature_channels[stage] = int(embed_dim * 2**i_layer)
+                self._out_feature_strides[stage] = 2 ** (i_layer + 2)
+
         num_features = [int(embed_dim * 2**i) for i in range(self.num_layers)]
         self.num_features = num_features
-        for i_layer in out_indices:
-            layer = norm_layer(num_features[i_layer])
-            layer_name = f"norm{i_layer}"
-            self.add_module(layer_name, layer)
+
+        for i_layer in range(self.num_layers):
+            stage = f"stage{i_layer + 2}"
+            if stage in self.out_features:
+                layer = norm_layer(num_features[i_layer])
+                layer_name = f"norm{i_layer}"
+                self.add_module(layer_name, layer)
+
         self._freeze_stages()
-        
-        self._out_feature_channels = {"p{}".format(i): int(embed_dim * 2**i) for i in self.out_indices if "p{}".format(i) in self._out_features}
-        self._out_feature_strides = {"p{}".format(i): 2 ** (i + 2) for i in self.out_indices if "p{}".format(i) in self._out_features}
-        self._size_divisibility = 1
         self.apply(self._init_weights)
 
     def _freeze_stages(self):
@@ -263,16 +308,12 @@ class SpectralSwinTransformer(Backbone):
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
+            trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-
-    @property
-    def size_divisibility(self):
-        return self._size_divisibility
 
     def forward(self, x):
         x, H, W = self.patch_embed(x)
@@ -281,95 +322,67 @@ class SpectralSwinTransformer(Backbone):
         for i in range(self.num_layers):
             layer = self.layers[i]
             x_out, x_down = layer(x)
-            name = "p{}".format(i)
-            if i in self.out_indices and name in self._out_features:
+            stage = f"stage{i + 2}"
+            if stage in self.out_features:
                 norm_layer = getattr(self, f"norm{i}")
-                out = x_out.mean(dim=1)
-                out = norm_layer(out)
+                out = norm_layer(x_out)
                 out = out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
-                outs[name] = out
+                outs[stage] = out
             x = x_down
         return outs
+
+    def train(self, mode=True):
+        super(SpectralSwinTransformer, self).train(mode)
+        self._freeze_stages()
 
     def output_shape(self):
         return {
             name: ShapeSpec(
-                channels=self._out_feature_channels[name], 
+                channels=self._out_feature_channels[name],
                 stride=self._out_feature_strides[name]
             )
-            for name in self._out_features
+            for name in self.out_features
         }
 
 
 class LastLevelP6(nn.Module):
-    """
-    This module is used in FCOS and RetinaNet to generate extra layers
-    """
-    def __init__(self, in_channels, out_channels, in_features="p3"):
+    def __init__(self, in_channels, out_channels, in_features="p5"):
         super().__init__()
         self.num_levels = 1
         self.in_feature = in_features
         self.p6 = nn.Conv2d(in_channels, out_channels, 3, 2, 1)
-        for module in [self.p6]:
-            weight_init.c2_xavier_fill(module)
+        weight_init.c2_xavier_fill(self.p6)
 
     def forward(self, x):
-        p6 = self.p6(x)
-        return [p6]
+        return [self.p6(x)]
 
 
 @BACKBONE_REGISTRY.register()
-def build_spectral_swin_backbone(cfg, input_shape):
-    """
-    Create a SpectralSwinTransformer instance from config.
-    
-    Args:
-        cfg: a detectron2 CfgNode
-        input_shape: ShapeSpec of input
-        
-    Returns:
-        SpectralSwinTransformer: a SpectralSwinTransformer instance
-    """
-    # Valeurs par défaut si la section SPECTRAL_SWIN n'existe pas dans la config
-    spectral_swin_cfg = getattr(cfg.MODEL, 'SPECTRAL_SWIN', None)
-    
-    out_features = spectral_swin_cfg.OUT_FEATURES if spectral_swin_cfg else None
-    
+def build_spectral_swint_backbone(cfg, input_shape):
+    out_features = cfg.MODEL.SPECTRAL_SWINT.OUT_FEATURES
     return SpectralSwinTransformer(
-        in_chans=input_shape.channels,
-        spectral_patch_size=spectral_swin_cfg.SPECTRAL_PATCH_SIZE if spectral_swin_cfg else 1,
-        embed_dim=spectral_swin_cfg.EMBED_DIM if spectral_swin_cfg else 96,
-        depths=spectral_swin_cfg.DEPTHS if spectral_swin_cfg else (2, 2, 6, 2),
-        num_heads=spectral_swin_cfg.NUM_HEADS if spectral_swin_cfg else (3, 6, 12, 24),
-        spectral_window_size=spectral_swin_cfg.WINDOW_SIZE if spectral_swin_cfg else 8,
-        mlp_ratio=spectral_swin_cfg.MLP_RATIO if spectral_swin_cfg else 4.0,
+        in_chans=cfg.MODEL.SPECTRAL_SWINT.IN_CHANS,
+        spectral_patch_size=cfg.MODEL.SPECTRAL_SWINT.PATCH_SIZE,
+        embed_dim=cfg.MODEL.SPECTRAL_SWINT.EMBED_DIM,
+        depths=cfg.MODEL.SPECTRAL_SWINT.DEPTHS,
+        num_heads=cfg.MODEL.SPECTRAL_SWINT.NUM_HEADS,
+        spectral_window_size=cfg.MODEL.SPECTRAL_SWINT.WINDOW_SIZE,
+        mlp_ratio=cfg.MODEL.SPECTRAL_SWINT.MLP_RATIO,
         qkv_bias=True,
         qk_scale=None,
-        drop_rate=spectral_swin_cfg.DROP_RATE if spectral_swin_cfg else 0.0,
-        attn_drop_rate=spectral_swin_cfg.ATTN_DROP_RATE if spectral_swin_cfg else 0.0,
-        drop_path_rate=spectral_swin_cfg.DROP_PATH_RATE if spectral_swin_cfg else 0.2,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=cfg.MODEL.SPECTRAL_SWINT.DROP_PATH_RATE,
         norm_layer=nn.LayerNorm,
         patch_norm=True,
-        out_indices=spectral_swin_cfg.OUT_INDICES if spectral_swin_cfg else (0, 1, 2, 3),
-        frozen_stages=cfg.MODEL.BACKBONE.FREEZE_AT if hasattr(cfg.MODEL, 'BACKBONE') else -1,
-        use_checkpoint=spectral_swin_cfg.USE_CHECKPOINT if spectral_swin_cfg else False,
-        out_features=out_features
+        frozen_stages=cfg.MODEL.BACKBONE.FREEZE_AT,
+        out_features=out_features,
     )
 
 
 @BACKBONE_REGISTRY.register()
-def build_spectral_swin_fpn_backbone(cfg, input_shape: ShapeSpec):
-    """
-    Build a FPN backbone with SpectralSwinTransformer as bottom-up backbone.
-    
-    Args:
-        cfg: a detectron2 CfgNode
-        input_shape: ShapeSpec of input
-        
-    Returns:
-        backbone (Backbone): backbone module with FPN, must be a subclass of :class:`Backbone`.
-    """
-    bottom_up = build_spectral_swin_backbone(cfg, input_shape)
+def build_spectral_swint_fpn_backbone(cfg, input_shape: ShapeSpec):
+    bottom_up = build_spectral_swint_backbone(cfg, input_shape)
     in_features = cfg.MODEL.FPN.IN_FEATURES
     out_channels = cfg.MODEL.FPN.OUT_CHANNELS
     backbone = FPN(
@@ -384,32 +397,18 @@ def build_spectral_swin_fpn_backbone(cfg, input_shape: ShapeSpec):
 
 
 @BACKBONE_REGISTRY.register()
-def build_retinanet_spectral_swin_fpn_backbone(cfg, input_shape: ShapeSpec):
-    """
-    Build a FPN backbone with SpectralSwinTransformer for RetinaNet/FCOS.
-    
-    Args:
-        cfg: a detectron2 CfgNode
-        input_shape: ShapeSpec of input
-        
-    Returns:
-        backbone (Backbone): backbone module with FPN, must be a subclass of :class:`Backbone`.
-    """
-    bottom_up = build_spectral_swin_backbone(cfg, input_shape)
+def build_retinanet_spectral_swint_fpn_backbone(cfg, input_shape: ShapeSpec):
+    bottom_up = build_spectral_swint_backbone(cfg, input_shape)
     in_features = cfg.MODEL.FPN.IN_FEATURES
     out_channels = cfg.MODEL.FPN.OUT_CHANNELS
-    top_levels = cfg.MODEL.FPN.TOP_LEVELS if hasattr(cfg.MODEL.FPN, 'TOP_LEVELS') else 2
+    top_levels = cfg.MODEL.FPN.TOP_LEVELS
     in_channels_top = out_channels
-    
     if top_levels == 2:
-        top_block = LastLevelP6P7(in_channels_top, out_channels, in_features[-1])
+        top_block = LastLevelP6P7(in_channels_top, out_channels, "p5")
     elif top_levels == 1:
-        top_block = LastLevelP6(in_channels_top, out_channels, in_features[-1])
-    elif top_levels == 0:
-        top_block = None
+        top_block = LastLevelP6(in_channels_top, out_channels, "p5")
     else:
-        top_block = LastLevelMaxPool()
-    
+        top_block = None
     backbone = FPN(
         bottom_up=bottom_up,
         in_features=in_features,
@@ -427,27 +426,26 @@ if __name__ == "__main__":
     IN_CHANS = 270
     H, W = 32, 32
 
-    print("Testing Spectral Swin Transformer Backbone")
+    print("Testing SpectralSwinTransformer")
     print(f"Device: {DEVICE}")
     print(f"Input shape: ({BATCH_SIZE}, {IN_CHANS}, {H}, {W})")
 
-    # Test du backbone simple
     model = SpectralSwinTransformer(
-        in_chans=IN_CHANS, 
-        spectral_patch_size=1, 
-        embed_dim=96, 
-        depths=(2, 2, 6, 2), 
-        num_heads=(3, 6, 12, 24), 
-        spectral_window_size=8, 
-        mlp_ratio=4.0, 
-        qkv_bias=True, 
-        drop_rate=0.0, 
-        attn_drop_rate=0.0, 
-        drop_path_rate=0.0, 
-        patch_norm=True, 
-        out_indices=(0, 1, 2, 3), 
-        frozen_stages=-1, 
-        use_checkpoint=False
+        in_chans=IN_CHANS,
+        spectral_patch_size=1,
+        embed_dim=96,
+        depths=(2, 2, 6, 2),
+        num_heads=(3, 6, 12, 24),
+        spectral_window_size=8,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        patch_norm=True,
+        out_features=["stage2", "stage3", "stage4", "stage5"],
+        frozen_stages=-1,
+        use_checkpoint=False,
     ).to(DEVICE)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -455,53 +453,74 @@ if __name__ == "__main__":
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
-    # Test du backbone simple
     x = torch.randn(BATCH_SIZE, IN_CHANS, H, W).to(DEVICE)
     model.eval()
     with torch.no_grad():
         outs = model(x)
 
-    print("Backbone output shapes:")
+    print("Output shapes:")
     for k, v in outs.items():
         print(f"  {k}: {v.shape}")
 
-    # Test avec FPN
-    print("\nTesting FPN with Spectral Swin Transformer")
-    from detectron2.config import CfgNode
-    
-    # Création d'une configuration minimale pour le test
-    cfg = CfgNode()
-    cfg.MODEL = CfgNode()
-    cfg.MODEL.SPECTRAL_SWIN = CfgNode()
-    cfg.MODEL.SPECTRAL_SWIN.SPECTRAL_PATCH_SIZE = 1
-    cfg.MODEL.SPECTRAL_SWIN.EMBED_DIM = 96
-    cfg.MODEL.SPECTRAL_SWIN.DEPTHS = (2, 2, 6, 2)
-    cfg.MODEL.SPECTRAL_SWIN.NUM_HEADS = (3, 6, 12, 24)
-    cfg.MODEL.SPECTRAL_SWIN.WINDOW_SIZE = 8
-    cfg.MODEL.SPECTRAL_SWIN.MLP_RATIO = 4.0
-    cfg.MODEL.SPECTRAL_SWIN.DROP_RATE = 0.0
-    cfg.MODEL.SPECTRAL_SWIN.ATTN_DROP_RATE = 0.0
-    cfg.MODEL.SPECTRAL_SWIN.DROP_PATH_RATE = 0.0
-    cfg.MODEL.SPECTRAL_SWIN.OUT_INDICES = (0, 1, 2, 3)
-    cfg.MODEL.SPECTRAL_SWIN.USE_CHECKPOINT = False
-    cfg.MODEL.BACKBONE = CfgNode()
-    cfg.MODEL.BACKBONE.FREEZE_AT = -1
-    cfg.MODEL.FPN = CfgNode()
-    cfg.MODEL.FPN.IN_FEATURES = ["p0", "p1", "p2", "p3"]
-    cfg.MODEL.FPN.OUT_CHANNELS = 256
-    cfg.MODEL.FPN.NORM = ""
-    cfg.MODEL.FPN.FUSE_TYPE = "sum"
-    
-    # Test du builder FPN
-    input_shape = ShapeSpec(channels=IN_CHANS, height=H, width=W)
-    fpn_backbone = build_spectral_swin_fpn_backbone(cfg, input_shape).to(DEVICE)
-    
-    fpn_backbone.eval()
-    with torch.no_grad():
-        fpn_outs = fpn_backbone(x)
-    
-    print("FPN output shapes:")
-    for k, v in fpn_outs.items():
-        print(f"  {k}: {v.shape}")
-    
-    print("\nAll tests passed! ✓")
+    expected = {
+        "stage2": (BATCH_SIZE, 96,  H, W),
+        "stage3": (BATCH_SIZE, 192, H, W),
+        "stage4": (BATCH_SIZE, 384, H, W),
+        "stage5": (BATCH_SIZE, 768, H, W),
+    }
+    all_ok = True
+    for k, exp in expected.items():
+        if k not in outs:
+            print(f"MISSING {k}")
+            all_ok = False
+        elif tuple(outs[k].shape) != exp:
+            print(f"SHAPE MISMATCH {k}: got {tuple(outs[k].shape)}, expected {exp}")
+            all_ok = False
+
+    print("output_shape():", model.output_shape())
+
+    model.train()
+    x = torch.randn(BATCH_SIZE, IN_CHANS, H, W).to(DEVICE)
+    outs = model(x)
+    loss = sum(v.sum() for v in outs.values())
+    loss.backward()
+
+    no_grad = []
+    nan_grad = []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if param.grad is None:
+                no_grad.append(name)
+            elif torch.isnan(param.grad).any():
+                nan_grad.append(name)
+
+    if no_grad:
+        print(f"Parameters without gradient: {len(no_grad)}")
+        all_ok = False
+    if nan_grad:
+        print(f"Parameters with NaN gradient: {len(nan_grad)}")
+        all_ok = False
+
+    test_configs = [(1, 270, 64, 64), (4, 270, 16, 16), (2, 270, 48, 48)]
+    for bs, c, h, w in test_configs:
+        try:
+            with torch.no_grad():
+                x_test = torch.randn(bs, c, h, w).to(DEVICE)
+                outs_test = model(x_test)
+                shapes_ok = all(
+                    outs_test[s].shape[0] == bs and
+                    outs_test[s].shape[2] == h and
+                    outs_test[s].shape[3] == w
+                    for s in model.out_features
+                )
+                if not shapes_ok:
+                    print(f"Failed for bs={bs}, h={h}, w={w}")
+                    all_ok = False
+        except Exception as e:
+            print(f"Error for bs={bs}, h={h}, w={w}: {e}")
+            all_ok = False
+
+    if all_ok:
+        print("ALL TESTS PASSED")
+    else:
+        print("SOME TESTS FAILED")
