@@ -209,7 +209,7 @@ class BasicSpectralLayer(nn.Module):
 
 
 class SpectralPatchEmbed(nn.Module):
-    def __init__(self, in_chans=270, spectral_patch_size=1, embed_dim=256, norm_layer=None):
+    def __init__(self, in_chans=256, spectral_patch_size=1, embed_dim=256, norm_layer=None):
         super().__init__()
         self.in_chans = in_chans
         self.spectral_patch_size = spectral_patch_size
@@ -302,10 +302,7 @@ class SpectralSwinTransformer(Backbone):
 
         for i_layer in range(self.num_layers):
             layer_dim = num_features[i_layer]
-            if i_layer == 0:
-                self.spatial_downsamples.append(nn.Identity())
-            else:
-                self.spatial_downsamples.append(SpatialDownsample(channels=layer_dim))
+            self.spatial_downsamples.append(SpatialDownsample(channels=layer_dim))
 
             layer = BasicSpectralLayer(
                 dim=layer_dim,
@@ -377,8 +374,7 @@ class SpectralSwinTransformer(Backbone):
         cur_H, cur_W = H, W
         outs = {}
         for i in range(self.num_layers):
-            if not isinstance(self.spatial_downsamples[i], nn.Identity):
-                x, cur_H, cur_W = self.spatial_downsamples[i](x, cur_H, cur_W, B)
+            x, cur_H, cur_W = self.spatial_downsamples[i](x, cur_H, cur_W, B)
             x_out, x_down = self.layers[i](x)
             stage = f"stage{i + 2}"
             if stage in self.out_features:
