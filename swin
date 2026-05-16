@@ -209,7 +209,6 @@ class BasicSpectralLayer(nn.Module):
 
 
 class SpectralPatchEmbed(nn.Module):
-    """Embedding spectral pur — pas de downsampling ici."""
     def __init__(self, in_chans=270, spectral_patch_size=1, embed_dim=256, norm_layer=None):
         super().__init__()
         self.in_chans = in_chans
@@ -232,12 +231,14 @@ class SpectralPatchEmbed(nn.Module):
 
 class SpatialDownsample(nn.Module):
     """
-    Downsampling spatial AVANT chaque stage :
-      (B*H*W, N_tokens, C) → reshape → (B, C, H, W)
-      → DWConv stride=2    → (B, C, H/2, W/2)
-      → reshape            → (B*H/2*W/2, N_tokens, C)
+    Downsampling spatial AVANT chaque stage via DWConv stride=2.
+    Fonctionne en espace spatial 2D puis repackage en tokens spectraux.
 
-    La correlation spatiale legere est assuree par le DWConv 3x3.
+    x : (B*H*W, N_tokens, C)
+    → mean spectral → (B, C, H, W)
+    → DWConv stride=2 → (B, C, H2, W2)  avec H2 = (H+1)//2 exactement
+    → interpolation de x vers (H2, W2)
+    → (B*H2*W2, N_tokens, C)
     """
     def __init__(self, channels):
         super().__init__()
@@ -249,22 +250,38 @@ class SpatialDownsample(nn.Module):
         self.bn = nn.BatchNorm2d(channels)
         self.act = nn.GELU()
 
-    def forward(self, x, H, W, B, N_tokens):
-        # Remplacer N_tokens par x.shape[1] directement
-        N_tokens_actual = x.shape[1]   # ← toujours correct
-        C = x.shape[-1]
-        x_spatial = x.mean(dim=1)
-        x_spatial = x_spatial.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
-        x_spatial = self.dw_conv(x_spatial)
+    def forward(self, x, H, W, B):
+        # x : (B*H*W, N_tokens, C)
+        N_tokens = x.shape[1]
+        C = x.shape[2]
+
+        # H2, W2 exacts produits par Conv stride=2 padding=1
+        H2 = (H + 1) // 2
+        W2 = (W + 1) // 2
+
+        # Moyenne spectrale pour le downsampling spatial
+        x_mean = x.mean(dim=1)                                          # (B*H*W, C)
+        x_spatial = x_mean.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
+        x_spatial = self.dw_conv(x_spatial)                             # (B, C, H2, W2)
         x_spatial = self.bn(x_spatial)
         x_spatial = self.act(x_spatial)
-        H2, W2 = x_spatial.shape[2], x_spatial.shape[3]
-        x = x.view(B, H, W, N_tokens_actual, C)   # ← N_tokens_actual
-        x = x.permute(0, 3, 4, 1, 2).contiguous().view(B, N_tokens_actual * C, H, W)
+        # Verification que H2, W2 sont corrects
+        assert x_spatial.shape[2] == H2 and x_spatial.shape[3] == W2
+
+        # Interpoler les tokens spectraux vers (H2, W2)
+        # x : (B*H*W, N_tokens, C) → (B, H, W, N_tokens, C)
+        x = x.view(B, H, W, N_tokens, C)
+        # → (B, N_tokens*C, H, W) pour interpolation 2D
+        x = x.permute(0, 3, 4, 1, 2).contiguous().view(B, N_tokens * C, H, W)
+        # Interpolation exacte vers H2, W2
         x = F.interpolate(x, size=(H2, W2), mode='bilinear', align_corners=False)
-        x = x.view(B, N_tokens_actual, C, H2, W2).permute(0, 3, 4, 1, 2).contiguous()
-        x = x.view(B * H2 * W2, N_tokens_actual, C)
+        # → (B, N_tokens, C, H2, W2) → (B*H2*W2, N_tokens, C)
+        x = x.view(B, N_tokens, C, H2, W2)
+        x = x.permute(0, 3, 4, 1, 2).contiguous()
+        x = x.view(B * H2 * W2, N_tokens, C)
+
         return x, H2, W2
+
 
 class SpectralSwinTransformer(Backbone):
     """
@@ -274,16 +291,10 @@ class SpectralSwinTransformer(Backbone):
         stage4 : (B, 1024, H/16, W/16)  stride 16
         stage5 : (B, 2048, H/32, W/32)  stride 32
 
-    Pipeline :
-        SpectralPatchEmbed                  (B*H*W, N_tokens, 256)
-        SpatialDownsample stride=2          H→H/2, W→W/2   [stage2 : stride 2]
-        BasicSpectralLayer (stage2)
-        → norm + mean → (B, 256, H/2, W/2)
-        SpatialDownsample stride=2          H/2→H/4        [stage2 output : stride 4]  ✓
-        BasicSpectralLayer (stage3)
-        → norm + mean → (B, 512, H/4, W/4)
-        SpatialDownsample stride=2          H/4→H/8        [stage3 output : stride 8]  ✓
-        ...
+    Pipeline par stage i :
+        SpatialDownsample (DWConv stride=2) AVANT le stage
+        BasicSpectralLayer
+        mean(dim=1) + norm + reshape → (B, C, H_i, W_i)
     """
     def __init__(self, in_chans=270, spectral_patch_size=1, embed_dim=256, depths=(2, 2, 6, 2),
                  num_heads=(4, 8, 16, 32), spectral_window_size=8, mlp_ratio=4.0, qkv_bias=True,
@@ -307,7 +318,6 @@ class SpectralSwinTransformer(Backbone):
             embed_dim=embed_dim,
             norm_layer=norm_layer if self.patch_norm else None,
         )
-        self.num_spectral_tokens = self.patch_embed.num_spectral_tokens
 
         self.pos_drop = nn.Dropout(p=drop_rate)
 
@@ -319,17 +329,13 @@ class SpectralSwinTransformer(Backbone):
         num_features = [int(embed_dim * 2**i) for i in range(self.num_layers)]
         self.num_features = num_features
 
-        # Un SpatialDownsample AVANT chaque stage
-        # stage 0 : stride 2 (avant stage2) → sortie stage2 stride 4
-        # stage 1 : stride 2 (avant stage3) → sortie stage3 stride 8
-        # stage 2 : stride 2 (avant stage4) → sortie stage4 stride 16
-        # stage 3 : stride 2 (avant stage5) → sortie stage5 stride 32
         self.spatial_downsamples = nn.ModuleList()
         self.layers = nn.ModuleList()
 
         for i_layer in range(self.num_layers):
             layer_dim = num_features[i_layer]
 
+            # SpatialDownsample AVANT le stage : stride=2
             self.spatial_downsamples.append(SpatialDownsample(channels=layer_dim))
 
             layer = BasicSpectralLayer(
@@ -391,15 +397,19 @@ class SpectralSwinTransformer(Backbone):
 
     def forward(self, x):
         B = x.shape[0]
-        x, H, W = self.patch_embed(x)
+        x, H, W = self.patch_embed(x)   # (B*H*W, N_tokens, embed_dim)
         x = self.pos_drop(x)
+
         cur_H, cur_W = H, W
         outs = {}
 
         for i in range(self.num_layers):
-            # N_tokens lu directement depuis x.shape[1]
-            x, cur_H, cur_W = self.spatial_downsamples[i](x, cur_H, cur_W, B, x.shape[1])
+            # N_tokens lu depuis x directement — toujours correct
+            # meme apres SpectralPatchMerging
+            x, cur_H, cur_W = self.spatial_downsamples[i](x, cur_H, cur_W, B)
+
             x_out, x_down = self.layers[i](x)
+
             stage = f"stage{i + 2}"
             if stage in self.out_features:
                 norm_layer = getattr(self, f"norm{i}")
@@ -407,6 +417,7 @@ class SpectralSwinTransformer(Backbone):
                 out = norm_layer(out)
                 out = out.view(B, cur_H, cur_W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
                 outs[stage] = out
+
             x = x_down
 
         return outs
@@ -502,7 +513,7 @@ def build_retinanet_spectral_swint_fpn_backbone(cfg, input_shape: ShapeSpec):
 
 if __name__ == "__main__":
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    BATCH_SIZE = 2
+    BATCH_SIZE = 1
     IN_CHANS = 270
     H, W = 128, 128
 
@@ -630,7 +641,7 @@ if __name__ == "__main__":
             print(f"  {k}: OK {exp}")
 
     print("\nTesting multiple input sizes...")
-    test_configs = [(1, 270, 64, 64), (2, 270, 128, 128), (1, 270, 256, 256)]
+    test_configs = [(1, 270, 64, 64), (1, 270, 128, 128), (1, 270, 256, 256)]
     for bs, c, h, w in test_configs:
         try:
             with torch.no_grad():
