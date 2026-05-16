@@ -250,28 +250,21 @@ class SpatialDownsample(nn.Module):
         self.act = nn.GELU()
 
     def forward(self, x, H, W, B, N_tokens):
-        # x : (B*H*W, N_tokens, C)
+        # Remplacer N_tokens par x.shape[1] directement
+        N_tokens_actual = x.shape[1]   # ← toujours correct
         C = x.shape[-1]
-        # mean sur tokens spectraux → (B*H*W, C)
         x_spatial = x.mean(dim=1)
-        # reshape → (B, C, H, W)
         x_spatial = x_spatial.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
-        # DWConv stride=2 → (B, C, H/2, W/2)
         x_spatial = self.dw_conv(x_spatial)
         x_spatial = self.bn(x_spatial)
         x_spatial = self.act(x_spatial)
         H2, W2 = x_spatial.shape[2], x_spatial.shape[3]
-        # redistribuer vers tokens spectraux : on interpole x vers H2,W2
-        # x original : (B*H*W, N_tokens, C) → (B, H, W, N_tokens, C)
-        x = x.view(B, H, W, N_tokens, C)
-        # → (B, N_tokens*C, H, W) pour interpolation
-        x = x.permute(0, 3, 4, 1, 2).contiguous().view(B, N_tokens * C, H, W)
+        x = x.view(B, H, W, N_tokens_actual, C)   # ← N_tokens_actual
+        x = x.permute(0, 3, 4, 1, 2).contiguous().view(B, N_tokens_actual * C, H, W)
         x = F.interpolate(x, size=(H2, W2), mode='bilinear', align_corners=False)
-        # → (B, N_tokens, C, H2, W2) → (B*H2*W2, N_tokens, C)
-        x = x.view(B, N_tokens, C, H2, W2).permute(0, 3, 4, 1, 2).contiguous()
-        x = x.view(B * H2 * W2, N_tokens, C)
+        x = x.view(B, N_tokens_actual, C, H2, W2).permute(0, 3, 4, 1, 2).contiguous()
+        x = x.view(B * H2 * W2, N_tokens_actual, C)
         return x, H2, W2
-
 
 class SpectralSwinTransformer(Backbone):
     """
@@ -398,35 +391,23 @@ class SpectralSwinTransformer(Backbone):
 
     def forward(self, x):
         B = x.shape[0]
-        x, H, W = self.patch_embed(x)   # (B*H*W, N_tokens, embed_dim)
+        x, H, W = self.patch_embed(x)
         x = self.pos_drop(x)
-
         cur_H, cur_W = H, W
-        N_tokens = self.num_spectral_tokens
         outs = {}
 
         for i in range(self.num_layers):
-            # 1. Downsampling spatial AVANT le stage
-            #    (B*H*W, N_tokens, C) → (B*H/2*W/2, N_tokens, C)
-            x, cur_H, cur_W = self.spatial_downsamples[i](x, cur_H, cur_W, B, N_tokens)
-
-            # 2. Attention spectrale
+            # N_tokens lu directement depuis x.shape[1]
+            x, cur_H, cur_W = self.spatial_downsamples[i](x, cur_H, cur_W, B, x.shape[1])
             x_out, x_down = self.layers[i](x)
-
-            # 3. Sortie du stage vers FPN
             stage = f"stage{i + 2}"
             if stage in self.out_features:
                 norm_layer = getattr(self, f"norm{i}")
-                out = x_out.mean(dim=1)              # (B*H*W, C)
+                out = x_out.mean(dim=1)
                 out = norm_layer(out)
                 out = out.view(B, cur_H, cur_W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
                 outs[stage] = out
-
             x = x_down
-
-            # Apres SpectralPatchMerging : N_tokens reduit de moitie
-            if i < self.num_layers - 1:
-                N_tokens = N_tokens // 2
 
         return outs
 
