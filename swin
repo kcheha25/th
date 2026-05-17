@@ -267,17 +267,15 @@ class SpatialDownsample(nn.Module):
     def forward(self, x, H, W, B):
         N_tokens = x.shape[1]
         C = x.shape[2]
-
-        # Dimensions exactes produites par Conv stride=2 padding=1
         H2 = (H + 1) // 2
         W2 = (W + 1) // 2
 
         # Downsampling spatial via DWConv
-        x_mean = x.mean(dim=1)                                                # (B*H*W, C)
-        x_spatial = x_mean.view(B, H, W, C).permute(0, 3, 1, 2).contiguous() # (B, C, H, W)
-        x_spatial = self.dw_conv(x_spatial)                                   # (B, C, H2, W2)
+        x_mean = x.mean(dim=1)                                                 # (B*H*W, C)
+        x_spatial = x_mean.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
+        x_spatial = self.dw_conv(x_spatial)                                    # (B, C, H2, W2)
         x_spatial = self.bn(x_spatial)
-        x_spatial = self.act(x_spatial)
+        x_spatial = self.act(x_spatial)                                        # (B, C, H2, W2)
 
         # Interpoler les tokens spectraux vers (H2, W2)
         x = x.view(B, H, W, N_tokens, C)
@@ -285,7 +283,10 @@ class SpatialDownsample(nn.Module):
         x = F.interpolate(x, size=(H2, W2), mode='bilinear', align_corners=False)
         x = x.view(B, N_tokens, C, H2, W2)
         x = x.permute(0, 3, 4, 1, 2).contiguous()
-        x = x.view(B * H2 * W2, N_tokens, C)
+        x = x.view(B * H2 * W2, N_tokens, C)                                  # (B*H2*W2, N_tokens, C)
+
+        # Ajouter la correction spatiale (broadcast sur N_tokens)
+        x = x + x_spatial.permute(0, 2, 3, 1).contiguous().view(B * H2 * W2, 1, C)
 
         return x, H2, W2
 
