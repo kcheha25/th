@@ -543,117 +543,107 @@ def build_retinanet_spectral_swint_fpn_backbone(cfg, input_shape: ShapeSpec):
 
 
 if __name__ == "__main__":
+    import traceback
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     BATCH_SIZE = 1
     IN_CHANS = 270
     H, W = 128, 128
+    failures = []
 
-    print("Testing SpectralSwinTransformer (ResNeXt101-compatible)")
+    def check(name, got, expected):
+        if got != expected:
+            failures.append(f"[FAIL] {name}\n       got      {got}\n       expected {expected}")
+            return False
+        print(f"[OK]   {name}  {got}")
+        return True
+
     print(f"Device: {DEVICE}")
-    print(f"Input shape: ({BATCH_SIZE}, {IN_CHANS}, {H}, {W})")
 
-    model = SpectralSwinTransformer(
-        in_chans=IN_CHANS,
-        spectral_patch_size=1,
-        embed_dim=256,
-        depths=(2, 2, 6, 2),
-        num_heads=(4, 8, 16, 32),
-        spectral_window_size=8,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        drop_rate=0.0,
-        attn_drop_rate=0.0,
-        drop_path_rate=0.0,
-        patch_norm=True,
-        out_features=["stage2", "stage3", "stage4", "stage5"],
-        frozen_stages=-1,
-        use_checkpoint=False,
-    ).to(DEVICE)
+    # ── 1. Build model ────────────────────────────────────────────────
+    try:
+        model = SpectralSwinTransformer(
+            in_chans=IN_CHANS, spectral_patch_size=1, embed_dim=256,
+            depths=(2, 2, 6, 2), num_heads=(4, 8, 16, 32),
+            spectral_window_size=8, mlp_ratio=4.0,
+            qkv_bias=True, drop_rate=0.0, attn_drop_rate=0.0,
+            drop_path_rate=0.0, patch_norm=True,
+            out_features=["stage2", "stage3", "stage4", "stage5"],
+            frozen_stages=-1, use_checkpoint=False,
+        ).to(DEVICE)
+        print("[OK]   model instantiation")
+    except Exception:
+        failures.append("[FAIL] model instantiation\n" + traceback.format_exc())
+        print("\n".join(failures)); raise SystemExit(1)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"       params total={total:,}  trainable={trainable:,}")
 
-    x = torch.randn(BATCH_SIZE, IN_CHANS, H, W).to(DEVICE)
-    model.eval()
-    with torch.no_grad():
-        outs = model(x)
-
-    print("\nOutput shapes:")
-    for k, v in outs.items():
-        print(f"  {k}: {tuple(v.shape)}")
-
-    expected = {
+    # ── 2. Forward pass (eval) ────────────────────────────────────────
+    expected_shapes = {
         "stage2": (BATCH_SIZE, 256,  H // 4,  W // 4),
         "stage3": (BATCH_SIZE, 512,  H // 8,  W // 8),
         "stage4": (BATCH_SIZE, 1024, H // 16, W // 16),
         "stage5": (BATCH_SIZE, 2048, H // 32, W // 32),
     }
+    print("\n── eval forward ──")
+    try:
+        x = torch.randn(BATCH_SIZE, IN_CHANS, H, W).to(DEVICE)
+        model.eval()
+        with torch.no_grad():
+            outs = model(x)
+        for stage, exp in expected_shapes.items():
+            if stage not in outs:
+                failures.append(f"[FAIL] {stage} missing from output")
+                print(f"[FAIL] {stage} MISSING")
+            else:
+                check(stage, tuple(outs[stage].shape), exp)
+    except Exception:
+        failures.append("[FAIL] eval forward\n" + traceback.format_exc())
+        print(traceback.format_exc())
 
-    print("\nExpected (ResNeXt101 reference):")
-    all_ok = True
-    for k, exp in expected.items():
-        if k not in outs:
-            print(f"  MISSING {k}")
-            all_ok = False
-        elif tuple(outs[k].shape) != exp:
-            print(f"  SHAPE MISMATCH {k}: got {tuple(outs[k].shape)}, expected {exp}")
-            all_ok = False
+    # ── 3. output_shape() ─────────────────────────────────────────────
+    print("\n── output_shape() ──")
+    try:
+        for k, v in model.output_shape().items():
+            print(f"       {k}: channels={v.channels}, stride={v.stride}")
+    except Exception:
+        failures.append("[FAIL] output_shape()\n" + traceback.format_exc())
+        print(traceback.format_exc())
+
+    # ── 4. Backward pass ──────────────────────────────────────────────
+    print("\n── backward ──")
+    try:
+        model.train()
+        x = torch.randn(BATCH_SIZE, IN_CHANS, H, W).to(DEVICE)
+        outs = model(x)
+        loss = sum(v.sum() for v in outs.values())
+        loss.backward()
+        no_grad, nan_grad = [], []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if param.grad is None:
+                    no_grad.append(name)
+                elif torch.isnan(param.grad).any():
+                    nan_grad.append(name)
+        if no_grad:
+            failures.append(f"[FAIL] {len(no_grad)} params without gradient:\n  " + "\n  ".join(no_grad))
+            print(f"[FAIL] params without gradient ({len(no_grad)}):")
+            for n in no_grad: print(f"  {n}")
         else:
-            print(f"  {k}: OK {exp}")
+            print("[OK]   all params have gradients")
+        if nan_grad:
+            failures.append(f"[FAIL] {len(nan_grad)} params with NaN gradient:\n  " + "\n  ".join(nan_grad))
+            print(f"[FAIL] params with NaN gradient ({len(nan_grad)}):")
+            for n in nan_grad: print(f"  {n}")
+        else:
+            print("[OK]   no NaN gradients")
+    except Exception:
+        failures.append("[FAIL] backward\n" + traceback.format_exc())
+        print(traceback.format_exc())
 
-    print("\noutput_shape():")
-    for k, v in model.output_shape().items():
-        print(f"  {k}: channels={v.channels}, stride={v.stride}")
-
-    model.train()
-    x = torch.randn(BATCH_SIZE, IN_CHANS, H, W).to(DEVICE)
-    outs = model(x)
-    loss = sum(v.sum() for v in outs.values())
-    loss.backward()
-
-    no_grad = []
-    nan_grad = []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if param.grad is None:
-                no_grad.append(name)
-            elif torch.isnan(param.grad).any():
-                nan_grad.append(name)
-
-    if no_grad:
-        print(f"\nParameters without gradient: {len(no_grad)}")
-        all_ok = False
-    if nan_grad:
-        print(f"\nParameters with NaN gradient: {len(nan_grad)}")
-        all_ok = False
-
-    print("\nTesting FPN wrapper...")
-    model_fpn_base = SpectralSwinTransformer(
-        in_chans=IN_CHANS,
-        spectral_patch_size=1,
-        embed_dim=256,
-        depths=(2, 2, 6, 2),
-        num_heads=(4, 8, 16, 32),
-        spectral_window_size=8,
-        out_features=["stage2", "stage3", "stage4", "stage5"],
-    ).to(DEVICE)
-
-    fpn = FPN(
-        bottom_up=model_fpn_base,
-        in_features=["stage2", "stage3", "stage4", "stage5"],
-        out_channels=256,
-        norm="",
-        top_block=LastLevelMaxPool(),
-        fuse_type="sum",
-    ).to(DEVICE)
-
-    fpn.eval()
-    with torch.no_grad():
-        fpn_outs = fpn(torch.randn(BATCH_SIZE, IN_CHANS, H, W).to(DEVICE))
-
-    print("FPN output shapes:")
+    # ── 5. FPN wrapper ────────────────────────────────────────────────
+    print("\n── FPN ──")
     expected_fpn = {
         "p2": (BATCH_SIZE, 256, H // 4,  W // 4),
         "p3": (BATCH_SIZE, 256, H // 8,  W // 8),
@@ -661,43 +651,58 @@ if __name__ == "__main__":
         "p5": (BATCH_SIZE, 256, H // 32, W // 32),
         "p6": (BATCH_SIZE, 256, H // 64, W // 64),
     }
-    for k, exp in expected_fpn.items():
-        if k not in fpn_outs:
-            print(f"  MISSING {k}")
-            all_ok = False
-        elif tuple(fpn_outs[k].shape) != exp:
-            print(f"  SHAPE MISMATCH {k}: got {tuple(fpn_outs[k].shape)}, expected {exp}")
-            all_ok = False
-        else:
-            print(f"  {k}: OK {exp}")
+    try:
+        base = SpectralSwinTransformer(
+            in_chans=IN_CHANS, spectral_patch_size=1, embed_dim=256,
+            depths=(2, 2, 6, 2), num_heads=(4, 8, 16, 32),
+            spectral_window_size=8,
+            out_features=["stage2", "stage3", "stage4", "stage5"],
+        ).to(DEVICE)
+        fpn = FPN(
+            bottom_up=base,
+            in_features=["stage2", "stage3", "stage4", "stage5"],
+            out_channels=256, norm="",
+            top_block=LastLevelMaxPool(), fuse_type="sum",
+        ).to(DEVICE)
+        fpn.eval()
+        with torch.no_grad():
+            fpn_outs = fpn(torch.randn(BATCH_SIZE, IN_CHANS, H, W).to(DEVICE))
+        for k, exp in expected_fpn.items():
+            if k not in fpn_outs:
+                failures.append(f"[FAIL] FPN {k} missing")
+                print(f"[FAIL] FPN {k} MISSING")
+            else:
+                check(f"FPN {k}", tuple(fpn_outs[k].shape), exp)
+    except Exception:
+        failures.append("[FAIL] FPN\n" + traceback.format_exc())
+        print(traceback.format_exc())
 
-    # Tests tailles multiples — H,W doivent etre divisibles par 32
-    print("\nTesting multiple input sizes...")
-    test_configs = [(1, 270, 128, 128), (1, 270, 256, 256), (2, 270, 128, 128)]
-    for bs, c, h, w in test_configs:
+    # ── 6. Multi-size ─────────────────────────────────────────────────
+    print("\n── multi-size ──")
+    for bs, c, h, w in [(1, 270, 64, 64), (1, 270, 128, 128), (1, 270, 256, 256)]:
+        tag = f"bs={bs} h={h} w={w}"
         try:
+            model.eval()
             with torch.no_grad():
-                x_test = torch.randn(bs, c, h, w).to(DEVICE)
-                outs_test = model(x_test)
-                shapes_ok = all(
-                    outs_test[s].shape[0] == bs and
-                    outs_test[s].shape[2] == h // (4 * 2**i) and
-                    outs_test[s].shape[3] == w // (4 * 2**i)
-                    for i, s in enumerate(model.out_features)
-                )
-                if not shapes_ok:
-                    print(f"  Failed for bs={bs}, h={h}, w={w}")
-                    for s, v in outs_test.items():
-                        print(f"    {s}: {tuple(v.shape)}")
-                    all_ok = False
-                else:
-                    print(f"  bs={bs}, h={h}, w={w}: OK")
-        except Exception as e:
-            print(f"  Error for bs={bs}, h={h}, w={w}: {e}")
-            all_ok = False
+                outs_t = model(torch.randn(bs, c, h, w).to(DEVICE))
+            ok = True
+            for i, s in enumerate(model.out_features):
+                exp = (bs, model.num_features[i], h // (4 * 2**i), w // (4 * 2**i))
+                if tuple(outs_t[s].shape) != exp:
+                    failures.append(f"[FAIL] multi-size {tag} {s}: got {tuple(outs_t[s].shape)} exp {exp}")
+                    print(f"[FAIL] {tag} {s}: got {tuple(outs_t[s].shape)} exp {exp}")
+                    ok = False
+            if ok:
+                print(f"[OK]   {tag}")
+        except Exception:
+            failures.append(f"[FAIL] multi-size {tag}\n" + traceback.format_exc())
+            print(f"[FAIL] {tag}"); print(traceback.format_exc())
 
-    print()
-    if all_ok:
-        print("ALL TESTS PASSED")
+    # ── Summary ───────────────────────────────────────────────────────
+    print("\n" + "="*60)
+    if failures:
+        print(f"FAILED  ({len(failures)} issue(s)):\n")
+        for f in failures:
+            print(f)
     else:
-        print("SOME TESTS FAILED")
+        print("ALL TESTS PASSED")
