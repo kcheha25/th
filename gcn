@@ -1,0 +1,1338 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jul  7 07:59:48 2026
+@author: karim
+Mise à jour : remplacement de ST-GCN par l'architecture 2s-AGCN améliorée
+             (graphe adaptatif, triple attention, ViewAdaptive)
+"""
+
+import os
+import copy
+import math
+import pickle
+import numpy as np
+import pandas as pd
+from scipy.interpolate import interp1d
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+from tqdm import tqdm
+import wandb
+
+# ----------------------------------------------------------------------
+# Paramètres généraux
+# ----------------------------------------------------------------------
+INFERENCE_ONLY = False  # Changé à False pour l'entraînement
+BEST_RUN_ID = 3
+USE_KFOLD = True
+N_FOLDS = 5
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+if device.type == 'cuda':
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+NUM_CLASSES = 13
+os.environ.setdefault("WANDB_MODE", "offline")
+wandb.init(project="hand_gesture_multistream_agcn_moe", config={"num_classes": NUM_CLASSES})
+data_path = 'hand-gesture-recognition-challenge/'
+
+# ----------------------------------------------------------------------
+# Fonctions d'initialisation (tirées de l'architecture 2s-AGCN)
+# ----------------------------------------------------------------------
+def conv_branch_init(conv, branches):
+    weight = conv.weight
+    n = weight.size(0)
+    k1 = weight.size(1)
+    k2 = weight.size(2)
+    nn.init.normal_(weight, 0, math.sqrt(2. / (n * k1 * k2 * branches)))
+    nn.init.constant_(conv.bias, 0)
+
+def conv_init(conv):
+    nn.init.kaiming_normal_(conv.weight, mode='fan_out')
+    nn.init.constant_(conv.bias, 0)
+
+def bn_init(bn, scale):
+    nn.init.constant_(bn.weight, scale)
+    nn.init.constant_(bn.bias, 0)
+
+# ----------------------------------------------------------------------
+# Chargement des données (inchangé)
+# ----------------------------------------------------------------------
+def linear_interpolation(landmarks, t_from, t_to):
+    if len(landmarks) == 0:
+        return np.zeros((len(t_to), landmarks.shape[1]))
+    interpolated = np.zeros((len(t_to), landmarks.shape[1]))
+    for i in range(landmarks.shape[1]):
+        f = interp1d(t_from, landmarks[:, i], kind='linear', bounds_error=False, fill_value='extrapolate')
+        interpolated[:, i] = f(t_to)
+    return interpolated
+
+def load_train_data():
+    data_dir = os.path.join(data_path, 'data_train/')
+    data_txt_file = os.path.join(data_path, 'data_train/train_annotations.txt')
+    max_len = 80
+    all_landmarks = []
+    labels = []
+    to_discard = []
+    with open(data_txt_file, 'r') as f:
+        files = f.readlines()
+    for i, file in tqdm(enumerate(files), desc="Loading training data"):
+        try:
+            parts = file.strip().split(', ')
+            if len(parts) >= 4:
+                video_path, landmarks_path, label, nframes = parts
+            else:
+                continue
+            labels.append(label)
+            landmark_file = os.path.join(data_dir, landmarks_path)
+            if not os.path.exists(landmark_file):
+                to_discard.append(i)
+                continue
+            with open(landmark_file) as f:
+                lines = f.readlines()
+            landmarks = []
+            is_available = []
+            for line in lines:
+                lands = list(filter(lambda x: len(x), line.strip('\n').strip(' ').split(';')))
+                if len(lands):
+                    is_available.append(True)
+                    landmarks.append([float(x) for x in lands])
+                else:
+                    landmarks.append(np.zeros(63))
+                    is_available.append(False)
+            if sum(is_available) > 1:
+                landmarks = np.array(landmarks).astype('float32')
+                is_available = np.array(is_available)
+                t_from = np.arange(len(landmarks))[is_available]
+                landmarks = linear_interpolation(landmarks[is_available], t_from=t_from,
+                                                  t_to=np.linspace(min(t_from), max(t_from), max_len + 1))
+                all_landmarks.append(landmarks)
+            else:
+                to_discard.append(i)
+        except Exception as e:
+            print(f"Error processing file {i}: {e}")
+            to_discard.append(i)
+    train_landmarks = np.array(all_landmarks).reshape(-1, 81, 21, 3)
+    y_true = np.array([labels[i] for i in range(len(labels)) if i not in to_discard])
+    return train_landmarks, y_true
+
+def load_test_data():
+    data_dir = os.path.join(data_path, 'data_test/')
+    data_txt_file = os.path.join(data_path, 'data_test/test_annotations.txt')
+    max_len = 80
+    all_landmarks = []
+    with open(data_txt_file, 'r') as f:
+        files = f.readlines()
+    for i, file in tqdm(enumerate(files), desc="Loading test data"):
+        try:
+            parts = file.strip().split(', ')
+            if len(parts) >= 3:
+                video_path, landmarks_path, nframes = parts
+            else:
+                continue
+            landmark_file = os.path.join(data_dir, landmarks_path)
+            if not os.path.exists(landmark_file):
+                all_landmarks.append(np.zeros((81, 63)))
+                continue
+            with open(landmark_file) as f:
+                lines = f.readlines()
+            landmarks = []
+            is_available = []
+            for line in lines:
+                lands = list(filter(lambda x: len(x), line.strip('\n').strip(' ').split(';')))
+                if len(lands):
+                    is_available.append(True)
+                    landmarks.append([float(x) for x in lands])
+                else:
+                    landmarks.append(np.zeros(63))
+                    is_available.append(False)
+            if sum(is_available) > 1:
+                landmarks = np.array(landmarks).astype('float32')
+                is_available = np.array(is_available)
+                t_from = np.arange(len(landmarks))[is_available]
+                landmarks = linear_interpolation(landmarks[is_available], t_from=t_from,
+                                                  t_to=np.linspace(min(t_from), max(t_from), max_len + 1))
+                all_landmarks.append(landmarks)
+            else:
+                all_landmarks.append(np.zeros((81, 63)))
+        except Exception as e:
+            print(f"Error processing test file {i}: {e}")
+            all_landmarks.append(np.zeros((81, 63)))
+    test_landmarks = np.array(all_landmarks).reshape(-1, 81, 21, 3)
+    return test_landmarks
+
+# ----------------------------------------------------------------------
+# Feature engineering (inchangé)
+# ----------------------------------------------------------------------
+AREAS = {0: [[0, 4, 5], [4, 5, 8]], 1: [[5, 8, 9], [8, 9, 12]],
+         2: [[9, 12, 13], [12, 13, 16]], 3: [[13, 16, 17], [16, 17, 20]]}
+
+def areas_landmarks(vids):
+    areas = np.zeros((vids.shape[0], vids.shape[1], 4))
+    for i, v in AREAS.items():
+        vec_1_1 = vids[:, :, v[0][1]] - vids[:, :, v[0][0]]
+        vec_1_2 = vids[:, :, v[0][2]] - vids[:, :, v[0][0]]
+        vec_2_1 = vids[:, :, v[1][1]] - vids[:, :, v[1][0]]
+        vec_2_2 = vids[:, :, v[1][2]] - vids[:, :, v[1][0]]
+        areas[:, :, i] = (np.linalg.norm(np.cross(vec_1_1, vec_1_2, axis=2), axis=2) / 2 +
+                          np.linalg.norm(np.cross(vec_2_1, vec_2_2, axis=2), axis=2) / 2)
+    return areas
+
+FINGERS = [[0, 1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20]]
+
+def fingers_deployment(vids):
+    features = np.zeros((vids.shape[0], vids.shape[1], len(FINGERS)))
+    for i, f in enumerate(FINGERS):
+        features[:, :, i] = np.linalg.norm(vids[:, :, f[-1]] - vids[:, :, f[0]], axis=2)
+    return features
+
+HARDCODED = [[0, 12], [0, 16], [4, 12], [4, 16], [4, 20], [4, 8], [8, 12], [12, 16], [16, 20], [2, 17]]
+
+def remarkable_distances(vids):
+    features = np.zeros((vids.shape[0], vids.shape[1], len(HARDCODED)))
+    for i, (p1, p2) in enumerate(HARDCODED):
+        features[:, :, i] = np.linalg.norm(vids[:, :, p1] - vids[:, :, p2], axis=2)
+    return features
+
+def diff(vids):
+    return vids[:, 1:] - vids[:, :-1]
+
+def angle(vids):
+    center = np.sum(vids[:, :, [0, 17, 13, 9, 5]], axis=2) / 5
+    center = np.repeat(center[:, :, np.newaxis, :], 5, axis=-2)
+    vectors = vids[:, :, [4, 8, 12, 16, 20]] - center
+    dot_product = np.sum(vectors[:, :, :-1] * vectors[:, :, 1:], axis=-1)
+    norm_product = (np.linalg.norm(vectors[:, :, :-1], axis=-1) * np.linalg.norm(vectors[:, :, 1:], axis=-1))
+    norm_product = np.where(norm_product == 0, 1e-8, norm_product)
+    dot_product = np.clip(dot_product / norm_product, -1, 1)
+    return np.arccos(dot_product)
+
+def normalize(vids):
+    bases = vids[:, :1]
+    normalized = vids.copy()
+    normalized[:, 1:] -= bases
+    return normalized
+
+def direction(landmarks):
+    mean_land_9_13 = np.mean(landmarks[:, :, [9, 13]], axis=-2)
+    hand_direction = mean_land_9_13 - landmarks[:, :, 0]
+    phi = np.arctan2(hand_direction[:, :, 0], hand_direction[:, :, 2])
+    theta = np.arccos(np.clip(hand_direction[:, :, 1] / np.linalg.norm(hand_direction, axis=-1), -1, 1))
+    return np.concatenate((hand_direction, np.expand_dims(phi, axis=-1), np.expand_dims(theta, axis=-1)), axis=-1)
+
+def rotate(arr, theta, axis):
+    if axis == 0:
+        rot_mat = np.array([[1, 0, 0], [0, np.cos(theta), -np.sin(theta)], [0, np.sin(theta), np.cos(theta)]])
+    elif axis == 1:
+        rot_mat = np.array([[np.cos(theta), 0, np.sin(theta)], [0, 1, 0], [-np.sin(theta), 0, np.cos(theta)]])
+    else:
+        rot_mat = np.array([[np.cos(theta), -np.sin(theta), 0], [np.sin(theta), np.cos(theta), 0], [0, 0, 1]])
+    return (rot_mat @ arr.T).T
+
+def scale_normalize(vids):
+    ref = np.linalg.norm(vids[:, :, 9] - vids[:, :, 0], axis=-1, keepdims=True)
+    ref = np.where(ref < 1e-6, 1e-6, ref)
+    ref = ref[:, :, np.newaxis]
+    return vids / ref
+
+def create_features(landmarks, with_normalized=True):
+    differences = diff(landmarks)
+    if with_normalized:
+        normalized = normalize(landmarks)
+        features = np.zeros((landmarks.shape[0], landmarks.shape[1], 31))
+    else:
+        features = np.zeros((landmarks.shape[0], landmarks.shape[1], 28))
+    features[:, :, :4] = areas_landmarks(landmarks)
+    features[:, :, 4:9] = fingers_deployment(landmarks)
+    features[:, :, 9:13] = angle(landmarks)
+    features[:, :, 13:23] = remarkable_distances(landmarks)
+    features[:, :, 23:28] = direction(landmarks)
+    if with_normalized:
+        features[:, :, 28:31] = normalized[:, :, 0]
+        return [landmarks, normalized, differences, features]
+    return [landmarks, differences, features]
+
+# Data augmentation (inchangée)
+def time_warp(landmarks, warp_factor):
+    n = landmarks.shape[0]
+    t_orig = np.arange(n)
+    t_warped = np.power(np.linspace(0, 1, n), warp_factor) * (n - 1)
+    flat = landmarks.reshape(n, -1)
+    f = interp1d(t_orig, flat, axis=0, kind='linear', fill_value='extrapolate')
+    return f(t_warped).reshape(landmarks.shape)
+
+def frame_dropout(landmarks, drop_ratio):
+    n = landmarks.shape[0]
+    n_drop = max(1, int(n * drop_ratio))
+    idx_all = np.arange(n)
+    drop_idx = np.random.choice(idx_all[1:-1], size=min(n_drop, n - 2), replace=False)
+    keep_idx = np.setdiff1d(idx_all, drop_idx)
+    kept = landmarks[keep_idx].reshape(len(keep_idx), -1)
+    f = interp1d(keep_idx, kept, axis=0, kind='linear', fill_value='extrapolate')
+    return f(idx_all).reshape(landmarks.shape)
+
+def global_translate(landmarks, max_shift):
+    shift = np.random.uniform(-max_shift, max_shift, size=(1, 1, 3))
+    return landmarks + shift
+
+def augment_gesture_advanced(seq):
+    out = seq.copy()
+    ang = np.random.uniform(-np.pi/6, np.pi/6)
+    axis = np.random.choice([0, 1, 2])
+    scale = np.random.uniform(0.9, 1.1)
+    for f in range(out.shape[0]):
+        out[f] = rotate(out[f], ang, axis) * scale
+    if np.random.random() < 0.3:
+        wf = np.random.uniform(0.8, 1.25)
+        out = time_warp(out, wf)
+    if np.random.random() < 0.2:
+        out = frame_dropout(out, drop_ratio=np.random.uniform(0.03, 0.08))
+    if np.random.random() < 0.2:
+        out = global_translate(out, max_shift=0.01)
+    out = out + np.random.normal(0, 0.005, out.shape)
+    return out
+
+def augment_data_balanced_advanced(landmarks, labels, target_count=450):
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    print(f"Classes avant augmentation: {dict(zip(unique_labels, counts))}")
+    print(f"Target: {target_count} echantillons par classe")
+    X_added, y_added = [], []
+    for lab in unique_labels:
+        lab_indices = np.where(labels == lab)[0]
+        current = len(lab_indices)
+        if current < target_count:
+            n_to_add = target_count - current
+            print(f"Classe {lab}: {current} -> {target_count} (+{n_to_add})")
+            for _ in range(n_to_add):
+                idx = np.random.choice(lab_indices)
+                aug = augment_gesture_advanced(landmarks[idx])
+                X_added.append(aug)
+                y_added.append(lab)
+        else:
+            print(f"Classe {lab}: {current} (aucun ajout)")
+    if X_added:
+        landmarks_aug = np.vstack((landmarks, np.array(X_added)))
+        labels_aug = np.concatenate((labels, np.array(y_added)))
+        unique_after, counts_after = np.unique(labels_aug, return_counts=True)
+        print(f"Classes apres augmentation: {dict(zip(unique_after, counts_after))}")
+        return landmarks_aug, labels_aug
+    return landmarks, labels
+
+# ----------------------------------------------------------------------
+# Construction du graphe multi-subset
+# ----------------------------------------------------------------------
+EDGES = [(0, 1), (1, 2), (2, 3), (3, 4),
+         (0, 5), (5, 6), (6, 7), (7, 8),
+         (0, 9), (9, 10), (10, 11), (11, 12),
+         (0, 13), (13, 14), (14, 15), (15, 16),
+         (0, 17), (17, 18), (18, 19), (19, 20),
+         (5, 9), (9, 13), (13, 17)]
+
+def build_multi_subset_adjacency(num_nodes=21):
+    """
+    Construit la matrice d'adjacence 3-subset attendue par unit_gcn.
+    Retourne un np.array de forme (3, V, V).
+    Subset 0 : self-connections.
+    Subset 1 : centripète (voisin plus proche du poignet).
+    Subset 2 : centrifuge  (voisin plus éloigné du poignet).
+    """
+    # Distance au poignet (articulation 0)
+    dist = np.zeros(num_nodes)
+    visited = np.zeros(num_nodes, dtype=bool)
+    queue = [(0, 0)]
+    visited[0] = True
+    while queue:
+        u, d = queue.pop(0)
+        dist[u] = d
+        for v in range(num_nodes):
+            if ((u, v) in EDGES or (v, u) in EDGES) and not visited[v]:
+                visited[v] = True
+                queue.append((v, d+1))
+
+    A = np.zeros((3, num_nodes, num_nodes), dtype=np.float32)
+    # self-connections
+    for i in range(num_nodes):
+        A[0, i, i] = 1.0
+    # edges
+    for i, j in EDGES:
+        if dist[j] < dist[i]:
+            A[1, i, j] = 1.0
+            A[1, j, i] = 1.0
+        elif dist[j] > dist[i]:
+            A[2, i, j] = 1.0
+            A[2, j, i] = 1.0
+        else:
+            A[1, i, j] = 1.0
+            A[1, j, i] = 1.0
+    # Normalisation par ligne
+    for k in range(3):
+        D = np.sum(A[k], axis=1)
+        D[D == 0] = 1
+        D_inv = np.diag(1.0 / D)
+        A[k] = D_inv @ A[k]
+    return A
+
+# ----------------------------------------------------------------------
+# Préparation des flux
+# ----------------------------------------------------------------------
+def compute_velocity(x):
+    vel = np.zeros_like(x)
+    vel[:, 1:] = x[:, 1:] - x[:, :-1]
+    return vel
+
+def prepare_graph_stream(x):
+    vel = compute_velocity(x)
+    combined = np.concatenate([x, vel], axis=-1)
+    combined = combined.transpose(0, 3, 1, 2)
+    return combined.astype('float32')
+
+# ----------------------------------------------------------------------
+# Loss et EMA
+# ----------------------------------------------------------------------
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.2, label_smoothing=0.08):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+
+    def forward(self, inputs, targets):
+        num_classes = inputs.size(-1)
+        log_probs = F.log_softmax(inputs, dim=-1)
+        probs = log_probs.exp()
+        if self.label_smoothing > 0:
+            with torch.no_grad():
+                true_dist = torch.zeros_like(log_probs)
+                true_dist.fill_(self.label_smoothing / (num_classes - 1))
+                true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
+            ce = -(true_dist * log_probs).sum(dim=-1)
+            pt = (true_dist * probs).sum(dim=-1)
+        else:
+            ce = F.nll_loss(log_probs, targets, reduction='none')
+            pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        focal_term = (1 - pt).clamp(min=1e-6) ** self.gamma
+        loss = focal_term * ce
+        if self.alpha is not None:
+            at = self.alpha.gather(0, targets)
+            loss = at * loss
+        return loss.mean()
+
+def compute_focal_alpha(labels_int, num_classes, device):
+    counts = np.array([np.sum(labels_int == c) for c in range(1, num_classes + 1)], dtype=np.float32)
+    counts = np.where(counts == 0, 1, counts)
+    alpha = (counts.sum() / (num_classes * counts)) ** 1.5
+    alpha = alpha / alpha.mean()
+    return torch.FloatTensor(alpha).to(device)
+
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model.state_dict())
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            if v.dtype.is_floating_point:
+                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1 - self.decay)
+            else:
+                self.shadow[k] = v.clone()
+    def state_dict(self):
+        return self.shadow
+
+# ----------------------------------------------------------------------
+# Modules du 2s-AGCN amélioré
+# ----------------------------------------------------------------------
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+    def forward(self, x):
+        if not self.training or self.drop_prob == 0.0:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = keep_prob + torch.rand(shape, device=x.device, dtype=x.dtype)
+        mask.floor_()
+        return x.div(keep_prob) * mask
+
+class unit_tcn(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=9, stride=1, dropout=0.35):
+        super(unit_tcn, self).__init__()
+        pad = int((kernel_size - 1) / 2)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=(kernel_size, 1), padding=(pad, 0),
+                              stride=(stride, 1))
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(dropout)
+        conv_init(self.conv)
+        bn_init(self.bn, 1)
+
+    def forward(self, x):
+        x = self.bn(self.conv(x))
+        return x
+
+class unit_gcn(nn.Module):
+    def __init__(self, in_channels, out_channels, A, coff_embedding=4, num_subset=3,
+                 adaptive=True, attention=True, dropout=0.35):
+        super(unit_gcn, self).__init__()
+        inter_channels = out_channels // coff_embedding
+        self.inter_c = inter_channels
+        self.out_c = out_channels
+        self.in_c = in_channels
+        self.num_subset = num_subset
+        num_jpts = A.shape[-1]
+
+        self.conv_d = nn.ModuleList()
+        for i in range(self.num_subset):
+            self.conv_d.append(nn.Conv2d(in_channels, out_channels, 1))
+
+        if adaptive:
+            # A doit être un ndarray numpy
+            self.PA = nn.Parameter(torch.from_numpy(A.astype(np.float32)))
+            self.alpha = nn.Parameter(torch.zeros(1))
+            self.conv_a = nn.ModuleList()
+            self.conv_b = nn.ModuleList()
+            for i in range(self.num_subset):
+                self.conv_a.append(nn.Conv2d(in_channels, inter_channels, 1))
+                self.conv_b.append(nn.Conv2d(in_channels, inter_channels, 1))
+        else:
+            self.A = torch.from_numpy(A.astype(np.float32))
+        self.adaptive = adaptive
+
+        if attention:
+            # temporal attention
+            self.conv_ta = nn.Conv1d(out_channels, 1, 9, padding=4)
+            nn.init.constant_(self.conv_ta.weight, 0)
+            nn.init.constant_(self.conv_ta.bias, 0)
+            # spatial attention
+            ker_jpt = num_jpts - 1 if not num_jpts % 2 else num_jpts
+            pad = (ker_jpt - 1) // 2
+            self.conv_sa = nn.Conv1d(out_channels, 1, ker_jpt, padding=pad)
+            nn.init.xavier_normal_(self.conv_sa.weight)
+            nn.init.constant_(self.conv_sa.bias, 0)
+            # channel attention
+            rr = 2
+            self.fc1c = nn.Linear(out_channels, out_channels // rr)
+            self.fc2c = nn.Linear(out_channels // rr, out_channels)
+            nn.init.kaiming_normal_(self.fc1c.weight)
+            nn.init.constant_(self.fc1c.bias, 0)
+            nn.init.constant_(self.fc2c.weight, 0)
+            nn.init.constant_(self.fc2c.bias, 0)
+        self.attention = attention
+
+        if in_channels != out_channels:
+            self.down = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1),
+                nn.BatchNorm2d(out_channels)
+            )
+        else:
+            self.down = lambda x: x
+
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.tan = nn.Tanh()
+        self.sigmoid = nn.Sigmoid()
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(dropout)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                conv_init(m)
+            elif isinstance(m, nn.BatchNorm2d):
+                bn_init(m, 1)
+        bn_init(self.bn, 1e-6)
+        for i in range(self.num_subset):
+            conv_branch_init(self.conv_d[i], self.num_subset)
+
+    def forward(self, x):
+        N, C, T, V = x.size()
+        y = None
+        if self.adaptive:
+            A = self.PA
+            for i in range(self.num_subset):
+                A1 = self.conv_a[i](x).permute(0, 3, 1, 2).contiguous().view(N, V, self.inter_c * T)
+                A2 = self.conv_b[i](x).view(N, self.inter_c * T, V)
+                A1 = self.tan(torch.matmul(A1, A2) / A1.size(-1))
+                A1 = A[i] + A1 * self.alpha
+                A2 = x.view(N, C * T, V)
+                z = self.conv_d[i](torch.matmul(A2, A1).view(N, C, T, V))
+                y = z + y if y is not None else z
+        else:
+            A = self.A.to(x.device)
+            for i in range(self.num_subset):
+                A1 = A[i]
+                A2 = x.view(N, C * T, V)
+                z = self.conv_d[i](torch.matmul(A2, A1).view(N, C, T, V))
+                y = z + y if y is not None else z
+
+        y = self.bn(y)
+        y += self.down(x)
+        y = self.relu(y)
+
+        if self.attention:
+            # spatial attention
+            se = y.mean(-2)
+            se1 = self.sigmoid(self.conv_sa(se))
+            y = y * se1.unsqueeze(-2) + y
+            # temporal attention
+            se = y.mean(-1)
+            se1 = self.sigmoid(self.conv_ta(se))
+            y = y * se1.unsqueeze(-1) + y
+            # channel attention
+            se = y.mean(-1).mean(-1)
+            se1 = self.relu(self.fc1c(se))
+            se2 = self.sigmoid(self.fc2c(se1))
+            y = y * se2.unsqueeze(-1).unsqueeze(-1) + y
+        y = self.dropout(y)
+        return y
+
+class TCN_GCN_unit_enhanced(nn.Module):
+    """Un bloc AGCN + TCN avec DropPath et dropout."""
+    def __init__(self, in_channels, out_channels, A, stride=1, residual=True,
+                 adaptive=True, attention=True, dropout=0.35, drop_path=0.2):
+        super().__init__()
+        self.gcn1 = unit_gcn(in_channels, out_channels, A, adaptive=adaptive,
+                             attention=attention, dropout=dropout)
+        self.tcn1 = unit_tcn(out_channels, out_channels, stride=stride, dropout=dropout)
+        self.relu = nn.ReLU(inplace=True)
+        if not residual:
+            self.residual = lambda x: 0
+        elif (in_channels == out_channels) and (stride == 1):
+            self.residual = lambda x: x
+        else:
+            self.residual = unit_tcn(in_channels, out_channels, kernel_size=1, stride=stride, dropout=dropout)
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+
+    def forward(self, x):
+        y = self.relu(self.tcn1(self.gcn1(x)) + self.drop_path(self.residual(x)))
+        return y
+
+# ----------------------------------------------------------------------
+# ViewAdaptive
+# ----------------------------------------------------------------------
+class ViewAdaptive(nn.Module):
+    """Transforme le squelette vers un point de vue canonique."""
+    def __init__(self, input_dim):
+        super(ViewAdaptive, self).__init__()
+        self.rot_lstm = nn.LSTM(input_dim, 100, batch_first=True)
+        self.rot_dropout = nn.Dropout(0.5, inplace=False)
+        self.rot_fc = nn.Linear(100, 3)
+        self.init_weights()
+
+    def forward(self, x):
+        # x : (N, T, D)
+        rot, _ = self.rot_lstm(x)
+        rot = self.rot_dropout(rot)
+        rot_reshape = rot.contiguous().view(-1, rot.size(-1))
+        rot_y = self.rot_fc(rot_reshape)
+        rot = rot_y.contiguous().view(rot.size(0), -1, rot_y.size(-1))
+        x = self._va_transform(x, rot)
+        return x
+
+    def init_weights(self):
+        for layer in [self.rot_lstm]:
+            for name, param in layer.named_parameters():
+                if 'weight' in name:
+                    nn.init.orthogonal_(param, 0.001)
+                if 'bias' in name:
+                    param.data.zero_()
+
+    def _va_transform(self, output, theta):
+        # output: (N, T, D) where D = V*C
+        batch, step, dim = output.shape
+        # Centre de masse
+        cx = torch.mean(output[:, :, 0::3], dim=1, keepdim=True)
+        cy = torch.mean(output[:, :, 1::3], dim=1, keepdim=True)
+        cz = torch.mean(output[:, :, 2::3], dim=1, keepdim=True)
+        # Translation au centre
+        output = output - torch.cat([cx, cy, cz], dim=-1).repeat(1, 1, dim//3)
+        # Rotation
+        M = self._fusion(theta)
+        # Appliquer la rotation
+        o = output.view(batch*step, dim//3, 3).permute(0,2,1)
+        ones = torch.ones(batch*step, 1, dim//3, device=output.device)
+        o = torch.cat([o, ones], dim=1)
+        o = torch.bmm(M, o)[:, :3, :]
+        output = o.permute(0,2,1).contiguous().view(batch, step, dim)
+        # Translation retour
+        output = output + torch.cat([cx, cy, cz], dim=-1).repeat(1, 1, dim//3)
+        return output
+
+    def _fusion(self, theta):
+        rx = self._rot_x(theta)
+        ry = self._rot_y(theta)
+        rz = self._rot_z(theta)
+        rot = torch.bmm(rz, ry)
+        rot = torch.bmm(rot, rx)
+        return rot
+
+    def _rot_x(self, theta):
+        r = theta[:,:,0:1].sum(dim=1)
+        cos_r = torch.cos(r).unsqueeze(1)
+        sin_r = torch.sin(r).unsqueeze(1)
+        zero = torch.zeros_like(cos_r)
+        one = torch.ones_like(cos_r)
+        R = torch.cat([
+            torch.cat([one, zero, zero, zero], dim=2),
+            torch.cat([zero, cos_r, -sin_r, zero], dim=2),
+            torch.cat([zero, sin_r, cos_r, zero], dim=2),
+            torch.cat([zero, zero, zero, one], dim=2)
+        ], dim=1)
+        return R
+
+    def _rot_y(self, theta):
+        r = theta[:,:,1:2].sum(dim=1)
+        cos_r = torch.cos(r).unsqueeze(1)
+        sin_r = torch.sin(r).unsqueeze(1)
+        zero = torch.zeros_like(cos_r)
+        one = torch.ones_like(cos_r)
+        R = torch.cat([
+            torch.cat([cos_r, zero, sin_r, zero], dim=2),
+            torch.cat([zero, one, zero, zero], dim=2),
+            torch.cat([-sin_r, zero, cos_r, zero], dim=2),
+            torch.cat([zero, zero, zero, one], dim=2)
+        ], dim=1)
+        return R
+
+    def _rot_z(self, theta):
+        r = theta[:,:,2:3].sum(dim=1)
+        cos_r = torch.cos(r).unsqueeze(1)
+        sin_r = torch.sin(r).unsqueeze(1)
+        zero = torch.zeros_like(cos_r)
+        one = torch.ones_like(cos_r)
+        R = torch.cat([
+            torch.cat([cos_r, -sin_r, zero, zero], dim=2),
+            torch.cat([sin_r, cos_r, zero, zero], dim=2),
+            torch.cat([zero, zero, one, zero], dim=2),
+            torch.cat([zero, zero, zero, one], dim=2)
+        ], dim=1)
+        return R
+
+# ----------------------------------------------------------------------
+# Nouveau stream AGCN remplaçant STGCNStream
+# ----------------------------------------------------------------------
+class AdaptiveSTGCNStream(nn.Module):
+    def __init__(self, in_channels, num_point, num_blocks, drop_path_rate=0.2, dropout=0.35,
+                 adaptive=True, attention=True, use_view_adaptive=False):
+        super().__init__()
+        self.in_channels = in_channels
+        self.num_point = num_point
+        self.use_view_adaptive = use_view_adaptive
+        # ViewAdaptive optionnel
+        if use_view_adaptive:
+            self.va = ViewAdaptive(input_dim=num_point * in_channels)
+        else:
+            self.va = None
+
+        self.data_bn = nn.BatchNorm1d(in_channels * num_point)
+        bn_init(self.data_bn, 1)
+
+        # Construction des blocs
+        channels = [in_channels] + num_blocks
+        strides = [1, 1, 2, 1, 2, 1][:len(num_blocks)]
+        dpr = np.linspace(0, drop_path_rate, len(num_blocks))
+        # Construire la matrice d'adjacence (tableau NumPy)
+        A_np = build_multi_subset_adjacency(num_point)  # (3, V, V)
+        self.register_buffer('A_base', torch.from_numpy(A_np.astype(np.float32)))
+        blocks = []
+        for i in range(len(num_blocks)):
+            blocks.append(
+                TCN_GCN_unit_enhanced(
+                    channels[i], channels[i+1], A_np,  # passer le ndarray
+                    stride=strides[i],
+                    residual=True,
+                    adaptive=adaptive,
+                    attention=attention,
+                    dropout=dropout,
+                    drop_path=float(dpr[i])
+                )
+            )
+        self.blocks = nn.ModuleList(blocks)
+        self.out_channels = num_blocks[-1]
+
+    def forward(self, x):
+        # x : (N, C, T, V)
+        N, C, T, V = x.shape
+        # Préparation pour ViewAdaptive : (N, T, V*C)
+        if self.va is not None:
+            x_va = x.permute(0, 3, 1, 2).contiguous().view(N, V * C, T).permute(0, 2, 1)
+            x_va = self.va(x_va)
+            x = x_va.permute(0, 2, 1).view(N, V, C, T).permute(0, 2, 3, 1).contiguous()
+        # Normalisation et reshape pour les blocs
+        x = x.permute(0, 3, 1, 2).contiguous().view(N, V * C, T)
+        x = self.data_bn(x)
+        x = x.view(N, V, C, T).permute(0, 2, 3, 1).contiguous()
+        for block in self.blocks:
+            x = block(x)
+        # Global pooling
+        x = x.mean(dim=[2, 3])
+        return x
+
+# ----------------------------------------------------------------------
+# Transformer et Mixture of Experts
+# ----------------------------------------------------------------------
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads, mlp_ratio, dropout, drop_path):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        self.drop_path1 = DropPath(drop_path)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
+            nn.Dropout(dropout)
+        )
+        self.drop_path2 = DropPath(drop_path)
+    def forward(self, x):
+        normed = self.norm1(x)
+        attn_out, _ = self.attn(normed, normed, normed)
+        x = x + self.drop_path1(attn_out)
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        return x
+
+class TransformerBranch(nn.Module):
+    def __init__(self, patch_dim, seq_len, embed_dim=80, num_heads=5, num_layers=3,
+                 mlp_ratio=4.0, dropout=0.1, drop_path_rate=0.1):
+        super().__init__()
+        self.patch_embed = nn.Linear(patch_dim, embed_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, seq_len + 1, embed_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        dpr = np.linspace(0, drop_path_rate, num_layers)
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads, mlp_ratio, dropout, float(dpr[i]))
+            for i in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout)
+    def forward(self, x):
+        batch = x.size(0)
+        x = self.patch_embed(x)
+        cls_tokens = self.cls_token.expand(batch, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = x + self.pos_embed
+        x = self.dropout(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm(x)
+        return x[:, 0]
+
+class Expert(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout_rate=0.35):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, output_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class Router(nn.Module):
+    def __init__(self, input_dim, num_experts):
+        super().__init__()
+        self.router = nn.Linear(input_dim, num_experts)
+        self.softmax = nn.Softmax(dim=-1)
+    def forward(self, x):
+        return self.softmax(self.router(x))
+
+class MixtureOfExpertsLayer(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_experts, k, dropout_rate=0.35):
+        super().__init__()
+        self.num_experts = num_experts
+        self.k = k
+        self.experts = nn.ModuleList([
+            Expert(input_dim, hidden_dim, input_dim, dropout_rate)
+            for _ in range(num_experts)
+        ])
+        self.router = Router(input_dim, num_experts)
+        self.noise_std = 0.05
+    def forward(self, x):
+        batch_size, seq_len, input_dim = x.shape
+        x_flat = x.view(-1, input_dim)
+        router_probs = self.router(x_flat)
+        if self.training:
+            noise = torch.randn_like(router_probs) * self.noise_std
+            router_probs = torch.softmax(router_probs + noise, dim=-1)
+        top_k_probs, top_k_indices = torch.topk(router_probs, self.k, dim=-1)
+        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        all_expert_outputs = torch.stack([expert(x_flat) for expert in self.experts], dim=1)
+        gathered = torch.gather(
+            all_expert_outputs, 1,
+            top_k_indices.unsqueeze(-1).expand(-1, -1, input_dim)
+        )
+        output = (gathered * top_k_probs.unsqueeze(-1)).sum(dim=1)
+        output = output.view(batch_size, seq_len, input_dim)
+        aux_loss = self._calculate_aux_loss(router_probs)
+        return output, {'aux_loss': aux_loss}
+    def _calculate_aux_loss(self, router_probs):
+        expert_usage = router_probs.mean(dim=0)
+        expert_weights = router_probs.sum(dim=0) / router_probs.sum()
+        return (expert_usage * expert_weights).sum() * self.num_experts
+
+# ----------------------------------------------------------------------
+# Backbone et modèle complet
+# ----------------------------------------------------------------------
+class HandGestureMultiStreamBackbone(nn.Module):
+    def __init__(self, num_point, num_blocks, transformer_embed_dim=80, transformer_heads=5,
+                 transformer_layers=3, transformer_mlp_ratio=4.0, dropout=0.35,
+                 drop_path_rate=0.2, output_dim=384, adaptive=True, attention=True,
+                 use_view_adaptive=False):
+        super().__init__()
+        self.landmark_branch = AdaptiveSTGCNStream(
+            in_channels=6, num_point=num_point, num_blocks=num_blocks,
+            drop_path_rate=drop_path_rate, dropout=dropout,
+            adaptive=adaptive, attention=attention, use_view_adaptive=use_view_adaptive
+        )
+        self.norm_branch = AdaptiveSTGCNStream(
+            in_channels=6, num_point=num_point, num_blocks=num_blocks,
+            drop_path_rate=drop_path_rate, dropout=dropout,
+            adaptive=adaptive, attention=attention, use_view_adaptive=False
+        )
+        self.diff_branch = AdaptiveSTGCNStream(
+            in_channels=6, num_point=num_point, num_blocks=num_blocks,
+            drop_path_rate=drop_path_rate, dropout=dropout,
+            adaptive=adaptive, attention=attention, use_view_adaptive=False
+        )
+        self.feature_branch = TransformerBranch(
+            patch_dim=31, seq_len=81, embed_dim=transformer_embed_dim,
+            num_heads=transformer_heads, num_layers=transformer_layers,
+            mlp_ratio=transformer_mlp_ratio, dropout=dropout,
+            drop_path_rate=drop_path_rate
+        )
+        fusion_dim = num_blocks[-1] * 3 + transformer_embed_dim
+        self.combiner = nn.Sequential(
+            nn.Linear(fusion_dim, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(512, output_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout)
+        )
+    def forward(self, landmark_in, norm_in, diff_in, feat_in):
+        l = self.landmark_branch(landmark_in)
+        n = self.norm_branch(norm_in)
+        d = self.diff_branch(diff_in)
+        f = self.feature_branch(feat_in)
+        combined = torch.cat([l, n, d, f], dim=1)
+        return self.combiner(combined)
+
+class GestureMultiStreamMoEModel(nn.Module):
+    def __init__(self, num_classes, num_point, num_blocks, transformer_embed_dim=80, transformer_heads=5,
+                 transformer_layers=3, transformer_mlp_ratio=4.0, hidden_size=384, num_experts=10,
+                 k=4, num_moe_layers=2, dropout=0.35, drop_path_rate=0.2,
+                 adaptive=True, attention=True, use_view_adaptive=False):
+        super().__init__()
+        self.backbone = HandGestureMultiStreamBackbone(
+            num_point=num_point, num_blocks=num_blocks,
+            transformer_embed_dim=transformer_embed_dim,
+            transformer_heads=transformer_heads,
+            transformer_layers=transformer_layers,
+            transformer_mlp_ratio=transformer_mlp_ratio,
+            dropout=dropout,
+            drop_path_rate=drop_path_rate,
+            output_dim=hidden_size,
+            adaptive=adaptive,
+            attention=attention,
+            use_view_adaptive=use_view_adaptive
+        )
+        self.moe_layers = nn.ModuleList([
+            MixtureOfExpertsLayer(hidden_size, hidden_size * 2, num_experts, k, dropout)
+            for _ in range(num_moe_layers)
+        ])
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(hidden_size, num_classes)
+    def forward(self, landmark_in, norm_in, diff_in, feat_in):
+        features = self.backbone(landmark_in, norm_in, diff_in, feat_in).unsqueeze(1)
+        total_aux_loss = 0
+        for moe_layer in self.moe_layers:
+            features, info = moe_layer(features)
+            features = self.layer_norm(features)
+            features = self.dropout(features)
+            total_aux_loss += info['aux_loss']
+        features = features.squeeze(1)
+        output = self.classifier(features)
+        return output, {'aux_loss': total_aux_loss}
+
+# ----------------------------------------------------------------------
+# Dataset et fonctions d'évaluation
+# ----------------------------------------------------------------------
+class HandGestureMultiStreamDataset(Dataset):
+    def __init__(self, landmark_in, norm_in, diff_in, feat_in, labels=None):
+        self.landmark_in = torch.FloatTensor(landmark_in)
+        self.norm_in = torch.FloatTensor(norm_in)
+        self.diff_in = torch.FloatTensor(diff_in)
+        self.feat_in = torch.FloatTensor(feat_in)
+        self.labels = torch.LongTensor(labels.astype(int) - 1) if labels is not None else None
+    def __len__(self):
+        return len(self.landmark_in)
+    def __getitem__(self, idx):
+        if self.labels is not None:
+            return (self.landmark_in[idx], self.norm_in[idx], self.diff_in[idx], self.feat_in[idx]), self.labels[idx]
+        return (self.landmark_in[idx], self.norm_in[idx], self.diff_in[idx], self.feat_in[idx])
+
+def evaluate(model, loader, criterion, aux_loss_weight):
+    model.eval()
+    correct, total, running_loss = 0, 0, 0.0
+    all_preds, all_targets = [], []
+    with torch.no_grad():
+        for inputs, targets in loader:
+            landmark_in, norm_in, diff_in, feat_in = [inp.to(device) for inp in inputs]
+            targets = targets.to(device)
+            outputs, moe_info = model(landmark_in, norm_in, diff_in, feat_in)
+            loss = criterion(outputs, targets) + aux_loss_weight * moe_info['aux_loss']
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+            all_preds.extend(predicted.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+    return 100. * correct / total, running_loss / len(loader), np.array(all_preds), np.array(all_targets)
+
+def rotate_sequence(seq, ang, axis):
+    out = seq.copy()
+    if axis == 0:
+        R = np.array([[1, 0, 0], [0, np.cos(ang), -np.sin(ang)], [0, np.sin(ang), np.cos(ang)]], dtype=np.float32)
+    elif axis == 1:
+        R = np.array([[np.cos(ang), 0, np.sin(ang)], [0, 1, 0], [-np.sin(ang), 0, np.cos(ang)]], dtype=np.float32)
+    else:
+        R = np.array([[np.cos(ang), -np.sin(ang), 0], [np.sin(ang), np.cos(ang), 0], [0, 0, 1]], dtype=np.float32)
+    out = out.reshape(-1, 3) @ R.T
+    return out.reshape(seq.shape)
+
+def scale_sequence(seq, scale):
+    return seq * scale
+
+def build_tta_inputs(landmarks_batch, scaler):
+    lm, norm, diff_, feat = create_features(landmarks_batch, with_normalized=True)
+    feat = scaler.transform(feat.reshape(-1, 31)).reshape(feat.shape)
+    landmark_in = torch.FloatTensor(prepare_graph_stream(lm)).to(device)
+    norm_in = torch.FloatTensor(prepare_graph_stream(norm)).to(device)
+    diff_in = torch.FloatTensor(prepare_graph_stream(diff_)).to(device)
+    feat = torch.FloatTensor(feat).to(device)
+    return landmark_in, norm_in, diff_in, feat
+
+# ----------------------------------------------------------------------
+# Entraînement
+# ----------------------------------------------------------------------
+def train_single_config(run_id, cfg, train_landmarks_raw, train_labels_raw, val_landmarks_raw, val_labels):
+    print(f"\n========== RUN {run_id}: {cfg['name']} ==========")
+    print(cfg)
+    torch.manual_seed(cfg.get('seed', 42) + run_id)
+    np.random.seed(cfg.get('seed', 42) + run_id)
+    target_count = cfg.get('target_count', 450)
+
+    train_landmarks_aug, train_labels_aug = augment_data_balanced_advanced(
+        train_landmarks_raw, train_labels_raw, target_count=target_count
+    )
+    train_landmarks_f, train_normalized_f, train_differences_f, train_features_f = create_features(
+        train_landmarks_aug, with_normalized=True
+    )
+    val_landmarks_f, val_normalized_f, val_differences_f, val_features_f = create_features(
+        val_landmarks_raw, with_normalized=True
+    )
+
+    scaler = StandardScaler()
+    train_features_reshaped = train_features_f.reshape(-1, 31)
+    scaler.fit(train_features_reshaped)
+    scaler_path = f'scaler_run{run_id}.pkl'
+    with open(scaler_path, 'wb') as f:
+        pickle.dump(scaler, f)
+    train_features_f = scaler.transform(train_features_reshaped).reshape(train_features_f.shape)
+    val_features_f = scaler.transform(val_features_f.reshape(-1, 31)).reshape(val_features_f.shape)
+
+    train_landmark_in = prepare_graph_stream(train_landmarks_f)
+    train_norm_in = prepare_graph_stream(train_normalized_f)
+    train_diff_in = prepare_graph_stream(train_differences_f)
+    val_landmark_in = prepare_graph_stream(val_landmarks_f)
+    val_norm_in = prepare_graph_stream(val_normalized_f)
+    val_diff_in = prepare_graph_stream(val_differences_f)
+
+    train_dataset = HandGestureMultiStreamDataset(train_landmark_in, train_norm_in, train_diff_in, train_features_f, train_labels_aug)
+    val_dataset = HandGestureMultiStreamDataset(val_landmark_in, val_norm_in, val_diff_in, val_features_f, val_labels)
+    train_loader = DataLoader(train_dataset, batch_size=cfg['batch_size'], shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=cfg['batch_size'], shuffle=False, num_workers=0)
+
+    alpha = compute_focal_alpha(train_labels_aug.astype(int), NUM_CLASSES, device)
+
+    model = GestureMultiStreamMoEModel(
+        num_classes=NUM_CLASSES,
+        num_point=21,
+        num_blocks=[int(x) for x in cfg['num_blocks']],
+        transformer_embed_dim=int(cfg['transformer_embed_dim']),
+        transformer_heads=int(cfg['transformer_heads']),
+        transformer_layers=int(cfg['transformer_layers']),
+        transformer_mlp_ratio=float(cfg['transformer_mlp_ratio']),
+        hidden_size=int(cfg['hidden_size']),
+        num_experts=int(cfg['num_experts']),
+        k=int(cfg['k']),
+        num_moe_layers=int(cfg['num_moe_layers']),
+        dropout=float(cfg['dropout']),
+        drop_path_rate=float(cfg['drop_path_rate']),
+        adaptive=cfg.get('adaptive', True),
+        attention=cfg.get('attention', True),
+        use_view_adaptive=cfg.get('use_view_adaptive', False)
+    ).to(device)
+
+    ema_model = GestureMultiStreamMoEModel(
+        num_classes=NUM_CLASSES,
+        num_point=21,
+        num_blocks=[int(x) for x in cfg['num_blocks']],
+        transformer_embed_dim=int(cfg['transformer_embed_dim']),
+        transformer_heads=int(cfg['transformer_heads']),
+        transformer_layers=int(cfg['transformer_layers']),
+        transformer_mlp_ratio=float(cfg['transformer_mlp_ratio']),
+        hidden_size=int(cfg['hidden_size']),
+        num_experts=int(cfg['num_experts']),
+        k=int(cfg['k']),
+        num_moe_layers=int(cfg['num_moe_layers']),
+        dropout=float(cfg['dropout']),
+        drop_path_rate=float(cfg['drop_path_rate']),
+        adaptive=cfg.get('adaptive', True),
+        attention=cfg.get('attention', True),
+        use_view_adaptive=cfg.get('use_view_adaptive', False)
+    ).to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Run {run_id} total parameters: {total_params:,}")
+
+    criterion = FocalLoss(alpha=alpha, gamma=cfg['focal_gamma'], label_smoothing=cfg['label_smoothing'])
+    optimizer = optim.AdamW(model.parameters(), lr=cfg['learning_rate'], weight_decay=cfg['weight_decay'])
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=cfg['T_0'], T_mult=1, eta_min=1e-6)
+    ema = EMA(model, decay=cfg['ema_decay'])
+
+    best_val_acc = 0.0
+    best_train_acc = 0.0
+    best_epoch = 0
+    patience_counter = 0
+    save_path = f'best_model_run{run_id}.pth'
+
+    for epoch in range(cfg['epochs']):
+        model.train()
+        correct, total, running_loss = 0, 0, 0.0
+        for inputs, targets in train_loader:
+            landmark_in, norm_in, diff_in, feat_in = [inp.to(device) for inp in inputs]
+            targets = targets.to(device)
+            optimizer.zero_grad()
+            outputs, moe_info = model(landmark_in, norm_in, diff_in, feat_in)
+            main_loss = criterion(outputs, targets)
+            total_loss = main_loss + cfg['aux_loss_weight'] * moe_info['aux_loss']
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            ema.update(model)
+            running_loss += main_loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+        scheduler.step()
+        train_acc = 100. * correct / total
+        train_loss = running_loss / len(train_loader)
+        ema_model.load_state_dict(ema.state_dict())
+        val_acc, val_loss, _, _ = evaluate(ema_model, val_loader, criterion, cfg['aux_loss_weight'])
+        print(f'Run {run_id} Epoch {epoch+1}/{cfg["epochs"]}: Train Loss {train_loss:.4f} Acc {train_acc:.2f}% | EMA Val Loss {val_loss:.4f} Acc {val_acc:.2f}%')
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_train_acc = train_acc
+            best_epoch = epoch + 1
+            patience_counter = 0
+            torch.save(ema_model.state_dict(), save_path)
+            with open(f'scaler_best_run{run_id}.pkl', 'wb') as f:
+                pickle.dump(scaler, f)
+        else:
+            patience_counter += 1
+            if patience_counter >= cfg['patience']:
+                print(f'Run {run_id} early stopping at epoch {epoch+1}')
+                break
+    del model
+    torch.cuda.empty_cache()
+    return {
+        'run_id': run_id,
+        'name': cfg['name'],
+        'best_epoch': best_epoch,
+        'best_train_acc': best_train_acc,
+        'best_val_acc': best_val_acc,
+        'save_path': save_path,
+        'scaler_path': f'scaler_best_run{run_id}.pkl',
+        'total_params': total_params,
+        **cfg
+    }
+
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
+BASE = {
+    'batch_size': 32,
+    'epochs': 150,
+    'patience': 15,
+    'learning_rate': 7e-5,
+    'weight_decay': 8e-4,
+    'dropout': 0.35,
+    'drop_path_rate': 0.2,
+    'aux_loss_weight': 0.02,
+    'num_blocks': [64, 64, 128, 128, 256, 384],
+    'transformer_embed_dim': 80,
+    'transformer_heads': 4,
+    'transformer_layers': 3,
+    'transformer_mlp_ratio': 4.0,
+    'hidden_size': 384,
+    'num_experts': 10,
+    'k': 4,
+    'num_moe_layers': 2,
+    'focal_gamma': 2.2,
+    'label_smoothing': 0.08,
+    'ema_decay': 0.999,
+    'T_0': 25,
+    'target_count': 650,
+    'seed': 42,
+    'adaptive': True,
+    'attention': True,
+    'use_view_adaptive': False,
+}
+
+CONFIGS = [
+    {**BASE, 'name': 'fixed_v2_agcn', 'learning_rate': 1e-4, 'target_count': 800},
+]
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    if not INFERENCE_ONLY:
+        print("Loading training data...")
+        train_landmarks, train_labels = load_train_data()
+        print(f"train_landmarks shape: {train_landmarks.shape}")
+        train_landmarks = scale_normalize(train_landmarks)
+
+        if USE_KFOLD:
+            print(f"\nUtilisation de la validation croisée {N_FOLDS}-fold")
+            skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+            all_val_scores = []
+            for fold, (train_idx, val_idx) in enumerate(skf.split(train_landmarks, train_labels.astype(int))):
+                print(f"\n{'='*60}\nFOLD {fold+1}/{N_FOLDS}\n{'='*60}")
+                cfg = CONFIGS[0].copy()
+                cfg['name'] = f"{cfg['name']}_fold{fold+1}"
+                res = train_single_config(fold+1, cfg, train_landmarks[train_idx], train_labels[train_idx],
+                                          train_landmarks[val_idx], train_labels[val_idx])
+                all_val_scores.append(res['best_val_acc'])
+            print(f"\n{'='*60}\nRÉSULTATS VALIDATION CROISÉE {N_FOLDS}-FOLD\n{'='*60}")
+            print(f"Scores par fold: {[f'{s:.2f}%' for s in all_val_scores]}")
+            print(f"Moyenne: {np.mean(all_val_scores):.2f}% ± {np.std(all_val_scores):.2f}%")
+        else:
+            indices = np.arange(len(train_landmarks))
+            train_idx, val_idx = train_test_split(indices, test_size=0.2, random_state=42, stratify=train_labels.astype(int))
+            results = []
+            for i, cfg in enumerate(CONFIGS, start=1):
+                res = train_single_config(i, cfg, train_landmarks[train_idx], train_labels[train_idx],
+                                          train_landmarks[val_idx], train_labels[val_idx])
+                results.append(res)
+            df = pd.DataFrame(results).sort_values('best_val_acc', ascending=False).reset_index(drop=True)
+            print(f"\n=== RESULTATS ===\n{df[['run_id','name','best_val_acc','best_train_acc','best_epoch','total_params']].to_string(index=False)}")
+            best_row = df.iloc[0]
+            best_run_id = int(best_row['run_id'])
+            print(f"\nMEILLEUR MODELE: {best_row['name']} (run {best_run_id})")
+            print(f"Val acc: {float(best_row['best_val_acc']):.2f}%")
+            print(f"Poids: best_model_run{best_run_id}.pth")
+            print(f"Scaler: {best_row['scaler_path']}")
+
+    else:
+        print("\n" + "="*60)
+        print("MODE INFERENCE AVEC SCALER SAUVEGARDÉ")
+        print("="*60)
+        best_run_id = BEST_RUN_ID
+        model_path = f"best_model_run{best_run_id}.pth"
+        scaler_path = f"scaler_best_run{best_run_id}.pkl"
+        if not os.path.exists(scaler_path):
+            scaler_path = f"scaler_run{best_run_id}.pkl"
+        if not os.path.exists(scaler_path):
+            print(f"ERREUR: Aucun scaler trouvé pour le run {best_run_id}!")
+            exit(1)
+        print(f"Chargement du scaler depuis {scaler_path}")
+        with open(scaler_path, 'rb') as f:
+            scaler_final = pickle.load(f)
+
+        train_landmarks, train_labels = load_train_data()
+        train_landmarks = scale_normalize(train_landmarks)
+        best_cfg = CONFIGS[BEST_RUN_ID - 1]
+
+        best_model = GestureMultiStreamMoEModel(
+            num_classes=NUM_CLASSES,
+            num_point=21,
+            num_blocks=[int(x) for x in best_cfg['num_blocks']],
+            transformer_embed_dim=int(best_cfg['transformer_embed_dim']),
+            transformer_heads=int(best_cfg['transformer_heads']),
+            transformer_layers=int(best_cfg['transformer_layers']),
+            transformer_mlp_ratio=float(best_cfg['transformer_mlp_ratio']),
+            hidden_size=int(best_cfg['hidden_size']),
+            num_experts=int(best_cfg['num_experts']),
+            k=int(best_cfg['k']),
+            num_moe_layers=int(best_cfg['num_moe_layers']),
+            dropout=float(best_cfg['dropout']),
+            drop_path_rate=float(best_cfg['drop_path_rate']),
+            adaptive=best_cfg.get('adaptive', True),
+            attention=best_cfg.get('attention', True),
+            use_view_adaptive=best_cfg.get('use_view_adaptive', False)
+        ).to(device)
+
+        if os.path.exists(model_path):
+            best_model.load_state_dict(torch.load(model_path, map_location=device))
+            print(f"Modèle chargé depuis {model_path}")
+        else:
+            print(f"ERREUR: {model_path} introuvable!")
+            exit(1)
+        best_model.eval()
+
+        print("Loading test data...")
+        test_landmarks = load_test_data()
+        test_landmarks = scale_normalize(test_landmarks)
+        test_landmarks_f, test_normalized_f, test_differences_f, test_features_f = create_features(test_landmarks, with_normalized=True)
+        test_features_f = scaler_final.transform(test_features_f.reshape(-1, 31)).reshape(test_features_f.shape)
+        test_landmark_in = torch.FloatTensor(prepare_graph_stream(test_landmarks_f)).to(device)
+        test_norm_in = torch.FloatTensor(prepare_graph_stream(test_normalized_f)).to(device)
+        test_diff_in = torch.FloatTensor(prepare_graph_stream(test_differences_f)).to(device)
+        test_dataset = HandGestureMultiStreamDataset(test_landmark_in.cpu().numpy(), test_norm_in.cpu().numpy(),
+                                                     test_diff_in.cpu().numpy(), test_features_f)
+        test_loader = DataLoader(test_dataset, batch_size=int(best_cfg['batch_size']), shuffle=False, num_workers=0)
+
+        print("Generating predictions with TTA (sans flip)...")
+        predictions = []
+        tta_configs = [
+            {"angle": 0.0, "axis": 2, "scale": 1.00},
+            {"angle": np.pi/18, "axis": 2, "scale": 1.00},
+            {"angle": -np.pi/18, "axis": 2, "scale": 1.00},
+            {"angle": np.pi/36, "axis": 1, "scale": 1.05},
+            {"angle": -np.pi/36, "axis": 1, "scale": 0.95},
+            {"angle": np.pi/24, "axis": 0, "scale": 1.00},
+            {"angle": -np.pi/24, "axis": 0, "scale": 1.00},
+        ]
+        with torch.no_grad():
+            for start in tqdm(range(0, len(test_landmarks), best_cfg["batch_size"]), desc="TTA Prediction"):
+                batch_landmarks = test_landmarks[start:start+best_cfg["batch_size"]]
+                probs_all = []
+                for cfg_tta in tta_configs:
+                    aug = batch_landmarks.copy()
+                    for i in range(len(aug)):
+                        aug[i] = rotate_sequence(aug[i], cfg_tta["angle"], cfg_tta["axis"])
+                        aug[i] = scale_sequence(aug[i], cfg_tta["scale"])
+                    landmark_in, norm_in, diff_in, feat_in = build_tta_inputs(aug, scaler_final)
+                    outputs, _ = best_model(landmark_in, norm_in, diff_in, feat_in)
+                    probs_all.append(F.softmax(outputs, dim=1))
+                avg_probs = torch.stack(probs_all).mean(0)
+                pred = avg_probs.argmax(1)
+                predictions.extend(pred.cpu().numpy())
+        predictions = np.array(predictions) + 1
+        submission = pd.DataFrame({'Id': range(len(predictions)), 'Gesture': predictions})
+        submission.to_csv('submission_agcn_final.csv', index=False)
+        print("Submission saved: submission_agcn_final.csv")
+        print(submission.head())
+    wandb.finish()
