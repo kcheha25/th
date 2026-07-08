@@ -13,7 +13,7 @@ import pandas as pd
 from scipy.interpolate import interp1d
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.metrics import confusion_matrix, classification_report, precision_recall_fscore_support
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -23,10 +23,18 @@ from tqdm import tqdm
 import wandb
 import random
 
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+import seaborn as sns
+
+sns.set_style("whitegrid")
+
 INFERENCE_ONLY = True
 BEST_RUN_ID = 2
 USE_KFOLD = True
 N_FOLDS = 5
+MAKE_PLOTS = True
+PLOTS_DIR = 'plots'
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
@@ -37,6 +45,19 @@ NUM_CLASSES = 13
 os.environ.setdefault("WANDB_MODE", "offline")
 wandb.init(project="hand_gesture_multistream_stgcn_moe_fixed", config={"num_classes": NUM_CLASSES})
 data_path = 'hand-gesture-recognition-challenge/'
+
+
+def save_and_show(name):
+    if MAKE_PLOTS:
+        os.makedirs(PLOTS_DIR, exist_ok=True)
+        path = os.path.join(PLOTS_DIR, f"{name}.png")
+        plt.savefig(path, dpi=120, bbox_inches='tight')
+        print(f"Plot sauvegarde: {path}")
+    try:
+        plt.show()
+    except Exception:
+        pass
+    plt.close()
 
 
 def linear_interpolation(landmarks, t_from, t_to):
@@ -314,6 +335,109 @@ def augment_data_balanced_advanced(landmarks, labels, target_count=450):
         print(f"Classes apres augmentation: {dict(zip(unique_after, counts_after))}")
         return landmarks_aug, labels_aug
     return landmarks, labels
+
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17),
+]
+
+
+def plot_hand_skeleton(ax, landmarks_frame, color="#1f77b4", title=None):
+    xs, ys = landmarks_frame[:, 0], landmarks_frame[:, 1]
+    for a, b in HAND_CONNECTIONS:
+        ax.plot([xs[a], xs[b]], [ys[a], ys[b]], color=color, linewidth=1.5, zorder=1)
+    ax.scatter(xs, ys, color=color, s=25, zorder=2)
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.set_xticks([]); ax.set_yticks([])
+    if title:
+        ax.set_title(title, fontsize=10)
+
+
+def plot_data_exploration(train_landmarks, train_labels):
+    if not MAKE_PLOTS:
+        return
+    unique, counts = np.unique(train_labels.astype(int), return_counts=True)
+
+    plt.figure(figsize=(9, 4))
+    bars = plt.bar(unique, counts, color="#1f77b4", edgecolor="white")
+    plt.xlabel("Gesture class")
+    plt.ylabel("Number of sequences")
+    plt.title("Class distribution - training set (before augmentation)")
+    plt.xticks(unique)
+    for b, c in zip(bars, counts):
+        plt.text(b.get_x() + b.get_width() / 2, c + 0.5, str(c), ha="center", va="bottom", fontsize=8)
+    plt.tight_layout()
+    save_and_show("01_class_distribution_before_aug")
+
+    fig, axes = plt.subplots(1, 5, figsize=(16, 4))
+    example_classes = unique[:5]
+    for ax, cls in zip(axes, example_classes):
+        idx = np.where(train_labels.astype(int) == cls)[0][0]
+        mid_frame = train_landmarks[idx, train_landmarks.shape[1] // 2]
+        plot_hand_skeleton(ax, mid_frame, title=f"Class {cls}")
+    plt.suptitle("Example hand skeleton (middle frame) for several gesture classes")
+    plt.tight_layout()
+    save_and_show("02_hand_skeletons")
+
+    sample_idx = 0
+    traj = train_landmarks[sample_idx, :, 0, :]
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sc = ax.scatter(traj[:, 0], traj[:, 1], c=np.arange(len(traj)), cmap="viridis", s=15)
+    ax.plot(traj[:, 0], traj[:, 1], color="gray", alpha=0.3, linewidth=1)
+    ax.invert_yaxis()
+    ax.set_title(f"Wrist trajectory over 81 frames - sample #{sample_idx} "
+                 f"(class {int(train_labels[sample_idx])})")
+    ax.set_xlabel("x"); ax.set_ylabel("y")
+    plt.colorbar(sc, ax=ax, label="frame index")
+    plt.tight_layout()
+    save_and_show("03_wrist_trajectory")
+
+
+def plot_augmentation_effect(train_landmarks, train_labels, target_count):
+    if not MAKE_PLOTS:
+        return
+    print("\n--- Demonstration de l'augmentation (pour les plots) ---")
+    train_landmarks_aug, train_labels_aug = augment_data_balanced_advanced(
+        train_landmarks, train_labels, target_count=target_count
+    )
+    print(f"Before augmentation: {train_landmarks.shape[0]} sequences")
+    print(f"After augmentation:  {train_landmarks_aug.shape[0]} sequences")
+
+    unique_before, counts_before = np.unique(train_labels.astype(int), return_counts=True)
+    unique_after, counts_after = np.unique(train_labels_aug.astype(int), return_counts=True)
+    all_classes = unique_after
+    cb = np.array([counts_before[list(unique_before).index(c)] if c in unique_before else 0
+                   for c in all_classes])
+    ca = counts_after
+    x = np.arange(len(all_classes))
+    width = 0.35
+    plt.figure(figsize=(10, 4))
+    plt.bar(x - width / 2, cb, width, label="Before augmentation", color="#1f77b4")
+    plt.bar(x + width / 2, ca, width, label="After augmentation", color="#ff7f0e")
+    plt.xticks(x, all_classes)
+    plt.xlabel("Gesture class")
+    plt.ylabel("Number of sequences")
+    plt.title(f"Class distribution before vs. after augmentation (target_count={target_count})")
+    plt.legend()
+    plt.tight_layout()
+    save_and_show("04_class_distribution_before_vs_after")
+
+    orig_idx = 1
+    orig_frame = train_landmarks[orig_idx, train_landmarks.shape[1] // 2]
+    aug_seq = augment_gesture_advanced(train_landmarks[orig_idx])
+    aug_frame = aug_seq[aug_seq.shape[0] // 2]
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+    plot_hand_skeleton(axes[0], orig_frame, color="#1f77b4", title="Original")
+    plot_hand_skeleton(axes[1], aug_frame, color="#ff7f0e", title="Augmented")
+    plt.suptitle("Augmentation - before vs. after")
+    plt.tight_layout()
+    save_and_show("05_original_vs_augmented_skeleton")
 
 
 EDGES = [(0, 1), (1, 2), (2, 3), (3, 4),
@@ -754,6 +878,200 @@ class GestureMultiStreamMoEModel(nn.Module):
         return output, {'aux_loss': total_aux_loss}
 
 
+def count_parameters(module):
+    total = sum(p.numel() for p in module.parameters())
+    trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+    return total, trainable
+
+
+def plot_model_complexity(cfg):
+    if not MAKE_PLOTS:
+        return
+
+    fig, ax = plt.subplots(figsize=(13, 7.5))
+    ax.axis("off")
+
+    def box(x, y, w, h, text, color, fontsize=9):
+        rect = FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.02,rounding_size=0.08",
+                              linewidth=1.2, edgecolor="#333333", facecolor=color)
+        ax.add_patch(rect)
+        ax.text(x + w / 2, y + h / 2, text, ha="center", va="center", fontsize=fontsize, wrap=True)
+        return (x + w / 2, y, x + w / 2, y + h)
+
+    def arrow(x1, y1, x2, y2):
+        ax.add_patch(FancyArrowPatch((x1, y1), (x2, y2), arrowstyle="-|>",
+                                     mutation_scale=12, color="#555555", linewidth=1.2))
+
+    inputs = [
+        ("landmarks\n(6,81,21)", "#cfe8ff"),
+        ("normalized\n(6,81,21)", "#cfe8ff"),
+        ("differences\n(6,80,21)", "#ffe1c4"),
+        ("features\n(81,31)", "#d9f2d9"),
+    ]
+    in_x = [0.3, 3.3, 6.3, 9.3]
+    in_centers = []
+    for x, (label, color) in zip(in_x, inputs):
+        cx, by, cx2, ty = box(x, 6.4, 2.6, 0.9, label, color)
+        in_centers.append((cx, by))
+
+    proc_labels = ["ST-GCN stream", "ST-GCN stream", "ST-GCN stream", "Transformer branch"]
+    proc_colors = ["#cfe8ff", "#cfe8ff", "#ffe1c4", "#d9f2d9"]
+    proc_centers = []
+    for x, label, color, (icx, iby) in zip(in_x, proc_labels, proc_colors, in_centers):
+        cx, by, cx2, ty = box(x, 4.9, 2.6, 0.9, label, color, fontsize=8)
+        arrow(icx, iby, cx, ty)
+        proc_centers.append((cx, by))
+
+    ccx, cby, ccx2, cty = box(4.5, 3.4, 4.0, 0.9,
+                              "Combiner (concat -> MLP)\n-> hidden_size embedding", "#f5d0d0")
+    for cx, by in proc_centers:
+        arrow(cx, by, ccx, cty)
+
+    m1x, m1y, m1x2, m1y2 = box(4.5, 2.1, 4.0, 0.9,
+                               f"MoE layer 1\n(router + top-{cfg['k']} experts)", "#e6d0f5")
+    arrow(ccx, cby, m1x, m1y2)
+    m2x, m2y, m2x2, m2y2 = box(4.5, 1.1, 4.0, 0.9,
+                               f"MoE layer 2\n(router + top-{cfg['k']} experts)", "#e6d0f5")
+
+    box(4.5, 0.1, 4.0, 0.7, "Linear classifier -> 13 classes", "#ffe8a3")
+
+    ax.set_xlim(0, 13)
+    ax.set_ylim(-0.1, 7.6)
+    plt.title("GestureMultiStreamMoEModel - multi-stream ST-GCN/Transformer + MoE head",
+              fontsize=12)
+    plt.tight_layout()
+    save_and_show("06_architecture_diagram")
+
+    A = build_adjacency(21).to(device)
+    model_probe = GestureMultiStreamMoEModel(
+        num_classes=NUM_CLASSES, A=A,
+        num_blocks=cfg['num_blocks'],
+        transformer_embed_dim=cfg['transformer_embed_dim'],
+        transformer_heads=cfg['transformer_heads'],
+        transformer_layers=cfg['transformer_layers'],
+        transformer_mlp_ratio=cfg['transformer_mlp_ratio'],
+        hidden_size=cfg['hidden_size'],
+        num_experts=cfg['num_experts'],
+        k=cfg['k'],
+        num_moe_layers=cfg['num_moe_layers'],
+        dropout=cfg['dropout'],
+        drop_path_rate=cfg['drop_path_rate']
+    ).to(device)
+
+    blocks = {
+        "backbone": model_probe.backbone,
+        "moe_layers": model_probe.moe_layers,
+        "layer_norm": model_probe.layer_norm,
+        "classifier": model_probe.classifier,
+    }
+    names, counts = [], []
+    print(f"{'Block':<15}{'Parameters':>15}")
+    print("-" * 30)
+    for name, block in blocks.items():
+        total, _ = count_parameters(block)
+        print(f"{name:<15}{total:>15,}")
+        names.append(name)
+        counts.append(total)
+    total_params, trainable_params = count_parameters(model_probe)
+    print("-" * 30)
+    print(f"{'TOTAL':<15}{total_params:>15,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+
+    plt.figure(figsize=(7, 4))
+    plt.bar(names, counts, color=["#cfe8ff", "#e6d0f5", "#d9f2d9", "#ffe8a3"])
+    plt.ylabel("Number of parameters")
+    plt.title("Parameter count per model block")
+    for i, c in enumerate(counts):
+        plt.text(i, c + max(counts) * 0.01, f"{c:,}", ha="center", fontsize=8)
+    plt.tight_layout()
+    save_and_show("07_parameter_count")
+
+    model_probe.eval()
+    b = 2
+    dummy_lm = torch.randn(b, 6, 81, 21, device=device)
+    dummy_norm = torch.randn(b, 6, 81, 21, device=device)
+    dummy_diff = torch.randn(b, 6, 80, 21, device=device)
+    dummy_feat = torch.randn(b, 81, 31, device=device)
+    with torch.no_grad():
+        logits, info = model_probe(dummy_lm, dummy_norm, dummy_diff, dummy_feat)
+    print(f"Output logits shape: {tuple(logits.shape)}  (expected: ({b}, {NUM_CLASSES}))")
+    print(f"Aux loss (load balancing): {float(info['aux_loss']):.4f}")
+
+    del model_probe
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def plot_training_curves(history, run_id):
+    if not MAKE_PLOTS or len(history["train_loss"]) == 0:
+        return
+    epochs_range = range(1, len(history["train_loss"]) + 1)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+
+    axes[0].plot(epochs_range, history["train_loss"], label="Train", marker="o", markersize=3)
+    axes[0].plot(epochs_range, history["val_loss"], label="Validation", marker="o", markersize=3)
+    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Focal loss")
+    axes[0].set_title("Main classification loss")
+    axes[0].legend()
+
+    axes[1].plot(epochs_range, history["train_acc"], label="Train", marker="o", markersize=3)
+    axes[1].plot(epochs_range, history["val_acc"], label="Validation", marker="o", markersize=3)
+    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Accuracy (%)")
+    axes[1].set_title("Classification accuracy")
+    axes[1].legend()
+
+    plt.tight_layout()
+    save_and_show(f"08_training_curves_run{run_id}")
+
+
+def plot_val_evaluation(val_preds, val_targets, run_id):
+    if not MAKE_PLOTS:
+        return
+    val_preds_lbl = np.array(val_preds) + 1
+    val_targets_lbl = np.array(val_targets) + 1
+    class_labels = sorted(np.unique(val_targets_lbl))
+    print(f"[Run {run_id}] Validation accuracy: {(val_preds_lbl == val_targets_lbl).mean() * 100:.2f}%")
+
+    cm = confusion_matrix(val_targets_lbl, val_preds_lbl, labels=class_labels)
+    plt.figure(figsize=(8, 6.5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=class_labels, yticklabels=class_labels, cbar=True)
+    plt.xlabel("Predicted class")
+    plt.ylabel("True class")
+    plt.title(f"Confusion matrix - validation set (run {run_id})")
+    plt.tight_layout()
+    save_and_show(f"09_confusion_matrix_run{run_id}")
+
+    precision, recall, f1, support = precision_recall_fscore_support(
+        val_targets_lbl, val_preds_lbl, labels=class_labels, zero_division=0
+    )
+    metrics_df = pd.DataFrame({
+        "class": class_labels, "precision": precision,
+        "recall": recall, "f1_score": f1, "support": support,
+    })
+    print(metrics_df.to_string(index=False))
+    print("\nFull classification report:")
+    print(classification_report(val_targets_lbl, val_preds_lbl, labels=class_labels, zero_division=0))
+
+    x = np.arange(len(class_labels))
+    width = 0.25
+    plt.figure(figsize=(11, 4.5))
+    plt.bar(x - width, precision, width, label="Precision", color="#1f77b4")
+    plt.bar(x, recall, width, label="Recall", color="#ff7f0e")
+    plt.bar(x + width, f1, width, label="F1-score", color="#2ca02c")
+    plt.xticks(x, class_labels)
+    plt.xlabel("Gesture class"); plt.ylabel("Score"); plt.ylim(0, 1.05)
+    plt.title(f"Per-class precision / recall / F1-score - validation set (run {run_id})")
+    plt.legend()
+    plt.tight_layout()
+    save_and_show(f"10_prf_per_class_run{run_id}")
+
+    macro_f1 = f1.mean()
+    weighted_f1 = np.average(f1, weights=support)
+    print(f"Macro-average F1: {macro_f1:.4f}")
+    print(f"Weighted-average F1: {weighted_f1:.4f}")
+
+
 class HandGestureMultiStreamDataset(Dataset):
     def __init__(self, landmark_in, norm_in, diff_in, feat_in, labels=None):
         self.landmark_in = torch.FloatTensor(landmark_in)
@@ -929,6 +1247,8 @@ def train_single_config(run_id, cfg, train_landmarks_raw, train_labels_raw, val_
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=cfg['T_0'], T_mult=1, eta_min=1e-6)
     ema = EMA(model, decay=cfg['ema_decay'])
     
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+    
     best_val_acc = 0.0
     best_train_acc = 0.0
     best_epoch = 0
@@ -965,6 +1285,11 @@ def train_single_config(run_id, cfg, train_landmarks_raw, train_labels_raw, val_
         ema_model.load_state_dict(ema.state_dict())
         val_acc, val_loss, _, _ = evaluate(ema_model, val_loader, criterion, cfg['aux_loss_weight'])
         
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+        
         print(f'Run {run_id} Epoch {epoch+1}/{cfg["epochs"]}: Train Loss {train_loss:.4f} Acc {train_acc:.2f}% | EMA Val Loss {val_loss:.4f} Acc {val_acc:.2f}%')
         
         if val_acc > best_val_acc:
@@ -980,6 +1305,13 @@ def train_single_config(run_id, cfg, train_landmarks_raw, train_labels_raw, val_
             if patience_counter >= cfg['patience']:
                 print(f'Run {run_id} early stopping at epoch {epoch+1}')
                 break
+    
+    plot_training_curves(history, run_id)
+    
+    if os.path.exists(save_path):
+        ema_model.load_state_dict(torch.load(save_path, map_location=device))
+        _, _, val_preds, val_targets = evaluate(ema_model, val_loader, criterion, cfg['aux_loss_weight'])
+        plot_val_evaluation(val_preds, val_targets, run_id)
     
     del model
     torch.cuda.empty_cache()
@@ -1032,6 +1364,10 @@ if __name__ == "__main__":
         print("Loading training data...")
         train_landmarks, train_labels = load_train_data()
         print(f"train_landmarks shape: {train_landmarks.shape}")
+
+        plot_data_exploration(train_landmarks, train_labels)
+        plot_augmentation_effect(train_landmarks, train_labels, CONFIGS[0]['target_count'])
+        plot_model_complexity(CONFIGS[0])
         
         train_landmarks = scale_normalize(train_landmarks)
         
@@ -1224,5 +1560,16 @@ if __name__ == "__main__":
         print(submission.head())
         print(f"\nDistribution des prédictions:")
         print(pd.Series(predictions).value_counts().sort_index())
+
+        if MAKE_PLOTS:
+            pred_unique, pred_counts = np.unique(predictions, return_counts=True)
+            plt.figure(figsize=(9, 4))
+            plt.bar(pred_unique, pred_counts, color="#9467bd")
+            plt.xlabel("Predicted gesture class")
+            plt.ylabel("Number of test sequences")
+            plt.title("Predicted class distribution on the (unlabelled) test set")
+            plt.xticks(pred_unique)
+            plt.tight_layout()
+            save_and_show("11_test_prediction_distribution")
     
     wandb.finish()
