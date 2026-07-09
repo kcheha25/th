@@ -1,10 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-Created on Tue Jul  7 07:59:48 2026
+Hand Gesture Recognition - Multi-Stream ST-GCN + Transformer + Mixture of Experts
 
-@author: karim
+This script implements a complete pipeline for recognizing 13 hand gesture classes from
+3D landmark sequences. The architecture fuses four parallel information streams:
+  1. Raw landmark coordinates (processed by ST-GCN)
+  2. Normalized coordinates (processed by ST-GCN)
+  3. Frame-to-frame differences/velocity (processed by ST-GCN)
+  4. Hand-crafted geometric features (processed by a Transformer)
+
+The fused features pass through Mixture-of-Experts layers and a linear classifier.
+Training uses Focal Loss with label smoothing, EMA weight averaging, cosine annealing,
+and extensive data augmentation. Inference uses a 5-fold ensemble with Test-Time
+Augmentation (TTA). Optional plotting functions visualize data distribution, hand
+skeletons, architecture diagrams, training curves, and evaluation metrics.
 """
 
+# =============================================================================
+# IMPORTS AND GLOBAL CONFIGURATION
+# This block imports all necessary libraries (numerical computation, deep learning,
+# data handling, visualization) and sets up global flags, device selection (GPU/CPU),
+# Weights & Biases logging, and output directories.
+# =============================================================================
 import os
 import copy
 import pickle
@@ -46,7 +63,11 @@ os.environ.setdefault("WANDB_MODE", "offline")
 wandb.init(project="hand_gesture_multistream_stgcn_moe_fixed", config={"num_classes": NUM_CLASSES})
 data_path = 'hand-gesture-recognition-challenge/'
 
-
+# =============================================================================
+# UTILITY FUNCTION FOR PLOT SAVING
+# Saves the current matplotlib figure to the plots directory if MAKE_PLOTS is True,
+# then attempts to display it and closes the figure to free memory.
+# =============================================================================
 def save_and_show(name):
     if MAKE_PLOTS:
         os.makedirs(PLOTS_DIR, exist_ok=True)
@@ -59,7 +80,13 @@ def save_and_show(name):
         pass
     plt.close()
 
-
+# =============================================================================
+# LINEAR INTERPOLATION FOR TEMPORAL ALIGNMENT
+# Takes landmark data with irregular time points (t_from) and interpolates them
+# onto a uniform grid (t_to) using linear interpolation. This standardizes all
+# gesture sequences to a fixed length of 81 frames. Missing values at boundaries
+# are handled by extrapolation.
+# =============================================================================
 def linear_interpolation(landmarks, t_from, t_to):
     if len(landmarks) == 0:
         return np.zeros((len(t_to), landmarks.shape[1]))
@@ -69,7 +96,14 @@ def linear_interpolation(landmarks, t_from, t_to):
         interpolated[:, i] = f(t_to)
     return interpolated
 
-
+# =============================================================================
+# TRAINING DATA LOADER
+# Reads the training annotation file and corresponding landmark CSV files.
+# Extracts 21 hand landmarks (x,y,z per point = 63 values per frame). Handles
+# missing or empty frames by marking them as unavailable, then interpolates
+# available frames to a fixed sequence length of 81. Returns landmark array
+# of shape (N, 81, 21, 3) and corresponding string labels.
+# =============================================================================
 def load_train_data():
     data_dir = os.path.join(data_path, 'data_train/')
     data_txt_file = os.path.join(data_path, 'data_train/train_annotations.txt')
@@ -119,7 +153,12 @@ def load_train_data():
     y_true = np.array([labels[i] for i in range(len(labels)) if i not in to_discard])
     return train_landmarks, y_true
 
-
+# =============================================================================
+# TEST DATA LOADER
+# Similar to the training loader but for unlabeled test data. Returns landmark
+# array of shape (N, 81, 21, 3). Samples with insufficient valid frames are
+# replaced with zero arrays to maintain consistent output size.
+# =============================================================================
 def load_test_data():
     data_dir = os.path.join(data_path, 'data_test/')
     data_txt_file = os.path.join(data_path, 'data_test/test_annotations.txt')
@@ -165,7 +204,21 @@ def load_test_data():
     test_landmarks = np.array(all_landmarks).reshape(-1, 81, 21, 3)
     return test_landmarks
 
-
+# =============================================================================
+# HAND-CRAFTED GEOMETRIC FEATURE EXTRACTION
+# This block defines functions to compute domain-specific features from the 3D
+# landmark sequences. Features include:
+#   - areas_landmarks: Triangular areas between fingers (4 features)
+#   - fingers_deployment: Euclidean distance from finger base to tip (5 features)
+#   - remarkable_distances: Distances between key landmark pairs (10 features)
+#   - diff: Frame-to-frame differences (velocity)
+#   - angle: Inter-finger angles computed from palm center (4 features)
+#   - normalize: Centers landmarks relative to first frame
+#   - direction: Hand direction vector and its spherical coordinates (5 features)
+#   - rotate: 3D rotation around a specified axis
+#   - scale_normalize: Normalizes by the distance between landmarks 0 and 9
+#   - create_features: Assembles all features into a 31-dimensional vector per frame
+# =============================================================================
 AREAS = {0: [[0, 4, 5], [4, 5, 8]], 1: [[5, 8, 9], [8, 9, 12]],
          2: [[9, 12, 13], [12, 13, 16]], 3: [[13, 16, 17], [16, 17, 20]]}
 
@@ -266,7 +319,17 @@ def create_features(landmarks, with_normalized=True):
         return [landmarks, normalized, differences, features]
     return [landmarks, differences, features]
 
-
+# =============================================================================
+# ADVANCED DATA AUGMENTATION FUNCTIONS
+# This block implements several temporal and spatial augmentations:
+#   - time_warp: Non-linearly stretches/compresses the time axis
+#   - frame_dropout: Randomly removes frames and interpolates to fill gaps
+#   - global_translate: Applies a small random translation to all landmarks
+#   - augment_gesture_advanced: Combines rotation, scaling, time warping,
+#     frame dropout, translation, and Gaussian noise into a single augmentation
+#   - augment_data_balanced_advanced: Oversamples minority classes to reach
+#     a target count per class, creating a balanced training set
+# =============================================================================
 def time_warp(landmarks, warp_factor):
     n = landmarks.shape[0]
     t_orig = np.arange(n)
@@ -336,7 +399,21 @@ def augment_data_balanced_advanced(landmarks, labels, target_count=450):
         return landmarks_aug, labels_aug
     return landmarks, labels
 
-
+# =============================================================================
+# VISUALIZATION: HAND SKELETON AND DATA EXPLORATION PLOTS
+# These functions generate diagnostic plots to understand the dataset:
+#   - plot_hand_skeleton: Draws a 2D projection of the 21 hand landmarks with
+#     bone connections for a single frame
+#   - plot_data_exploration: Shows class distribution histogram and example
+#     hand skeletons from different gesture classes
+#   - plot_augmentation_effect: Compares class distribution before/after
+#     augmentation and shows an original vs. augmented hand skeleton side-by-side
+#   - plot_model_complexity: Creates an architecture diagram and bar chart of
+#     parameter counts per model component
+#   - plot_training_curves: Plots loss and accuracy over epochs for train/val
+#   - plot_val_evaluation: Generates confusion matrix, per-class precision/
+#     recall/F1 bar chart, and prints detailed classification report
+# =============================================================================
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -439,7 +516,15 @@ def plot_augmentation_effect(train_landmarks, train_labels, target_count):
     plt.tight_layout()
     save_and_show("05_original_vs_augmented_skeleton")
 
-
+# =============================================================================
+# GRAPH CONSTRUCTION FOR ST-GCN
+# Defines the hand skeleton as a graph with 21 nodes (landmarks) and 23 edges
+# (bone connections). build_adjacency creates a normalized adjacency matrix
+# using symmetric normalization (D^{-1/2} A D^{-1/2}) with self-loops.
+# compute_velocity calculates frame-to-frame differences for velocity input.
+# prepare_graph_stream concatenates position and velocity (6 channels) and
+# reshapes to the format expected by ST-GCN layers: (N, C, T, V).
+# =============================================================================
 EDGES = [(0, 1), (1, 2), (2, 3), (3, 4),
          (0, 5), (5, 6), (6, 7), (7, 8),
          (0, 9), (9, 10), (10, 11), (11, 12),
@@ -471,7 +556,14 @@ def prepare_graph_stream(x):
     combined = combined.transpose(0, 3, 1, 2)
     return combined.astype('float32')
 
-
+# =============================================================================
+# FOCAL LOSS WITH LABEL SMOOTHING
+# Implements Focal Loss to focus training on hard-to-classify examples by
+# down-weighting easy examples via the (1 - pt)^gamma term. Supports optional
+# class-balanced alpha weighting and label smoothing to improve generalization
+# and calibration. compute_focal_alpha calculates per-class alpha weights
+# inversely proportional to class frequency raised to power 1.5.
+# =============================================================================
 class FocalLoss(nn.Module):
     def __init__(self, alpha=None, gamma=2.2, label_smoothing=0.08):
         super().__init__()
@@ -508,7 +600,12 @@ def compute_focal_alpha(labels_int, num_classes, device):
     alpha = alpha / alpha.mean()
     return torch.FloatTensor(alpha).to(device)
 
-
+# =============================================================================
+# EXPONENTIAL MOVING AVERAGE (EMA) FOR MODEL WEIGHTS
+# Maintains a shadow copy of model parameters updated with exponential decay.
+# During evaluation, the EMA weights (which are more stable) are used instead
+# of the raw training weights, often yielding better generalization.
+# =============================================================================
 class EMA:
     def __init__(self, model, decay=0.999):
         self.decay = decay
@@ -524,7 +621,12 @@ class EMA:
     def state_dict(self):
         return self.shadow
 
-
+# =============================================================================
+# DROP PATH (STOCHASTIC DEPTH) REGULARIZATION
+# Randomly drops entire residual blocks during training with probability
+# drop_prob. Surviving paths have their output scaled by 1/(1-drop_prob)
+# to maintain expected value. Only active during training.
+# =============================================================================
 class DropPath(nn.Module):
     def __init__(self, drop_prob=0.0):
         super().__init__()
@@ -539,7 +641,19 @@ class DropPath(nn.Module):
         mask.floor_()
         return x.div(keep_prob) * mask
 
-
+# =============================================================================
+# ST-GCN BUILDING BLOCKS
+# UnitGCN: Graph Convolution layer that aggregates features from neighboring
+#   nodes using a learned adjacency matrix (A + A_res) with residual connection.
+# UnitTCN: Temporal Convolution layer operating along the time axis with a
+#   kernel_size temporal filter, keeping the spatial dimension fixed at 1.
+# STGCNBlock: Combines a UnitGCN and UnitTCN in sequence with a residual
+#   connection and DropPath regularization. Optionally uses stride in TCN
+#   to reduce temporal resolution.
+# STGCNStream: Stacks multiple STGCNBlocks with increasing channel dimensions.
+#   Includes initial BatchNorm1d and ends with global average pooling over
+#   time and node dimensions to produce a single feature vector.
+# =============================================================================
 class UnitGCN(nn.Module):
     def __init__(self, in_channels, out_channels, A, dropout=0.35):
         super().__init__()
@@ -644,7 +758,17 @@ class STGCNStream(nn.Module):
         x = x.mean(dim=[2, 3])
         return x
 
-
+# =============================================================================
+# TRANSFORMER BRANCH FOR GEOMETRIC FEATURES
+# TransformerBlock: Standard Transformer encoder block with multi-head self-
+#   attention, MLP with GELU activation, LayerNorm (pre-norm), and DropPath.
+# TransformerBranch: Processes the sequence of 31 hand-crafted features per
+#   frame (81 frames). Projects each frame to embed_dim, prepends a learnable
+#   [CLS] token, adds learned positional embeddings, passes through num_layers
+#   Transformer blocks, and extracts the final [CLS] token as the sequence
+#   representation. This branch captures long-range temporal dependencies in
+#   the geometric feature space.
+# =============================================================================
 class TransformerBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, mlp_ratio, dropout, drop_path):
         super().__init__()
@@ -699,7 +823,16 @@ class TransformerBranch(nn.Module):
         x = self.norm(x)
         return x[:, 0]
 
-
+# =============================================================================
+# MIXTURE OF EXPERTS (MoE) LAYERS
+# Expert: A small 2-layer MLP that processes a subset of the feature vector.
+# Router: A linear layer + softmax that decides which experts to use per token.
+# MixtureOfExpertsLayer: Implements sparse MoE with top-k gating. Routes each
+#   token to the k most relevant experts, combines their outputs weighted by
+#   gate probabilities. Adds Gaussian noise to router logits during training
+#   for load balancing exploration. Computes an auxiliary loss to encourage
+#   uniform expert usage, preventing collapse to a single expert.
+# =============================================================================
 class Expert(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, dropout_rate=0.35):
         super().__init__()
@@ -762,7 +895,11 @@ class MixtureOfExpertsLayer(nn.Module):
         expert_weights = router_probs.sum(dim=0) / router_probs.sum()
         return (expert_usage * expert_weights).sum() * self.num_experts
 
-
+# =============================================================================
+# TENSOR 3D ROTATION FOR ON-THE-FLY AUGMENTATION
+# Applies a 3D rotation to both position (first 3 channels) and velocity
+# (last 3 channels) of a tensor in format (B, 6, T, V). Used during TTA.
+# =============================================================================
 def rotate_tensor_3d(tensor, ang, axis):
     B, C, T, V = tensor.shape
     assert C == 6
@@ -799,7 +936,18 @@ def rotate_tensor_3d(tensor, ang, axis):
 
     return out
 
-
+# =============================================================================
+# MULTI-STREAM BACKBONE: HandGestureMultiStreamBackbone
+# Contains four parallel branches:
+#   1. landmark_branch: ST-GCN on raw coordinates (6 channels: xyz + velocity)
+#   2. norm_branch: ST-GCN on normalized coordinates (hand-centered)
+#   3. diff_branch: ST-GCN on frame differences
+#   4. feature_branch: Transformer on 31 hand-crafted geometric features
+# The outputs of all four branches are concatenated and projected through
+# a 2-layer MLP (combiner) to produce a unified feature vector of size
+# output_dim (384). The three ST-GCN branches share the same architecture
+# but have independent weights, allowing specialization.
+# =============================================================================
 class HandGestureMultiStreamBackbone(nn.Module):
     def __init__(self, A, num_blocks, transformer_embed_dim=80, transformer_heads=5,
                  transformer_layers=3, transformer_mlp_ratio=4.0, dropout=0.35,
@@ -841,7 +989,15 @@ class HandGestureMultiStreamBackbone(nn.Module):
         combined = torch.cat([l, n, d, f], dim=1)
         return self.combiner(combined)
 
-
+# =============================================================================
+# FULL MODEL: GestureMultiStreamMoEModel
+# Wraps the HandGestureMultiStreamBackbone with num_moe_layers Mixture of
+# Experts layers and a final linear classifier. The backbone output is
+# unsqueezed to (B, 1, hidden_size) to match the MoE expected 3D input.
+# Each MoE layer is followed by LayerNorm and Dropout. The auxiliary load
+# balancing losses from all MoE layers are summed and returned alongside
+# the classification logits.
+# =============================================================================
 class GestureMultiStreamMoEModel(nn.Module):
     def __init__(self, num_classes, A, num_blocks, transformer_embed_dim=80, transformer_heads=5,
                  transformer_layers=3, transformer_mlp_ratio=4.0, hidden_size=384, num_experts=10,
@@ -877,7 +1033,15 @@ class GestureMultiStreamMoEModel(nn.Module):
         output = self.classifier(features)
         return output, {'aux_loss': total_aux_loss}
 
-
+# =============================================================================
+# MODEL COMPLEXITY ANALYSIS AND ARCHITECTURE VISUALIZATION
+# count_parameters: Counts total and trainable parameters in a module.
+# plot_model_complexity: Creates two plots: (1) a schematic architecture
+#   diagram showing the four input streams, backbone branches, fusion,
+#   MoE layers, and classifier; (2) a bar chart of parameter counts per
+#   major component. Also performs a forward pass with dummy data to verify
+#   output shapes and auxiliary loss computation.
+# =============================================================================
 def count_parameters(module):
     total = sum(p.numel() for p in module.parameters())
     trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
@@ -1001,7 +1165,13 @@ def plot_model_complexity(cfg):
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-
+# =============================================================================
+# TRAINING CURVES AND EVALUATION VISUALIZATION
+# plot_training_curves: Plots training and validation loss/accuracy over epochs.
+# plot_val_evaluation: Generates confusion matrix heatmap, per-class precision/
+#   recall/F1 bar chart, and prints full classification report with macro and
+#   weighted average F1 scores.
+# =============================================================================
 def plot_training_curves(history, run_id):
     if not MAKE_PLOTS or len(history["train_loss"]) == 0:
         return
@@ -1071,7 +1241,14 @@ def plot_val_evaluation(val_preds, val_targets, run_id):
     print(f"Macro-average F1: {macro_f1:.4f}")
     print(f"Weighted-average F1: {weighted_f1:.4f}")
 
-
+# =============================================================================
+# DATASET CLASS AND EVALUATION FUNCTION
+# HandGestureMultiStreamDataset: PyTorch Dataset that returns the four input
+#   streams (landmark, norm, diff, feat) and optionally the label (mapped to
+#   0-based indexing). Used for both training and validation.
+# evaluate: Runs the model on a DataLoader, computes loss and accuracy, and
+#   collects all predictions and targets for later analysis.
+# =============================================================================
 class HandGestureMultiStreamDataset(Dataset):
     def __init__(self, landmark_in, norm_in, diff_in, feat_in, labels=None):
         self.landmark_in = torch.FloatTensor(landmark_in)
@@ -1113,7 +1290,14 @@ def evaluate(model, loader, criterion, aux_loss_weight):
             all_targets.extend(targets.cpu().numpy())
     return 100. * correct / total, running_loss / len(loader), np.array(all_preds), np.array(all_targets)
 
-
+# =============================================================================
+# TEST-TIME AUGMENTATION (TTA) UTILITIES
+# rotate_sequence: Applies 3D rotation to a numpy landmark sequence.
+# scale_sequence: Multiplies all coordinates by a scale factor.
+# build_tta_inputs: Creates the four input streams from a batch of landmarks,
+#   applies the fitted StandardScaler to geometric features, and converts
+#   everything to tensors on the target device.
+# =============================================================================
 def rotate_sequence(seq, ang, axis):
     out = seq.copy()
     if axis == 0:
@@ -1155,7 +1339,17 @@ def build_tta_inputs(landmarks_batch, scaler):
     feat = torch.FloatTensor(feat).to(device)
     return landmark_in, norm_in, diff_in, feat
 
-
+# =============================================================================
+# SINGLE TRAINING RUN FUNCTION
+# Orchestrates a complete training run for one configuration:
+#   1. Balances the training set via augmentation to target_count per class
+#   2. Extracts features and normalizes geometric features with StandardScaler
+#   3. Prepares graph-stream inputs for the three ST-GCN branches
+#   4. Builds model, EMA wrapper, FocalLoss, AdamW optimizer, cosine scheduler
+#   5. Trains for up to cfg['epochs'] with early stopping based on val accuracy
+#   6. Saves best model and scaler, generates training curves and evaluation plots
+#   7. Returns a dictionary with run results and configuration
+# =============================================================================
 def train_single_config(run_id, cfg, train_landmarks_raw, train_labels_raw, val_landmarks_raw, val_labels):
     print(f"\n========== RUN {run_id}: {cfg['name']} ==========")
     print(cfg)
@@ -1176,7 +1370,6 @@ def train_single_config(run_id, cfg, train_landmarks_raw, train_labels_raw, val_
         val_landmarks_raw, with_normalized=True
     )
     
-    # Fit et sauvegarde du scaler
     scaler = StandardScaler()
     train_features_reshaped = train_features_f.reshape(-1, 31)
     scaler.fit(train_features_reshaped)
@@ -1328,7 +1521,19 @@ def train_single_config(run_id, cfg, train_landmarks_raw, train_labels_raw, val_
         **cfg
     }
 
-
+# =============================================================================
+# CONFIGURATION AND MAIN EXECUTION
+# BASE: Default hyperparameters for the model and training process.
+# CONFIGS: List of configuration variants to evaluate (here, a single config
+#   with adjusted learning rate and target_count).
+# Main block:
+#   - TRAINING MODE: Loads data, generates exploration/augmentation/architecture
+#     plots, optionally runs Stratified K-Fold cross-validation or a single
+#     train/val split, trains models, and reports results.
+#   - INFERENCE MODE: Loads 5 saved models from cross-validation folds, applies
+#     ensemble averaging with Test-Time Augmentation (7 different rotation/scale
+#     configurations), and generates a submission CSV file.
+# =============================================================================
 BASE = {
     'batch_size': 32,
     'epochs': 150,
@@ -1435,16 +1640,14 @@ if __name__ == "__main__":
             print(f"Scaler: {best_row['scaler_path']}")
     
     else:
-        # Dans la section INFERENCE_ONLY
         print("\n" + "="*60)
         print("MODE INFERENCE AVEC ENSEMBLE DES 5 MODÈLES")
         print("="*60)
         
-        # Charger tous les modèles et scalers
         models = []
         scalers = []
         
-        for run_id in range(1, 6):  # Folds 1 à 5
+        for run_id in range(1, 6):
             model_path = f"best_model_run{run_id}.pth"
             scaler_path = f"scaler_best_run{run_id}.pkl"
             
@@ -1458,7 +1661,6 @@ if __name__ == "__main__":
                 scaler = pickle.load(f)
                 scalers.append(scaler)
             
-            # Charger la configuration
             cfg = CONFIGS[0].copy()
             
             A = build_adjacency(21).to(device)
@@ -1484,7 +1686,6 @@ if __name__ == "__main__":
         
         print(f"Chargé {len(models)} modèles avec succès")
         
-        # Préparer les données de test
         print("Loading test data...")
         test_landmarks = load_test_data()
         test_landmarks = scale_normalize(test_landmarks)
@@ -1493,7 +1694,6 @@ if __name__ == "__main__":
             test_landmarks, with_normalized=True
         )
         
-        # Préparer les prédictions avec TTA
         print("Generating predictions with ensemble + TTA...")
         predictions_ensemble = []
         
@@ -1513,13 +1713,11 @@ if __name__ == "__main__":
         for start in tqdm(range(0, len(test_landmarks), batch_size), desc="TTA + Ensemble Prediction"):
             batch_landmarks = test_landmarks[start:start+batch_size]
             
-            # Pour chaque modèle
             model_probs = []
             for model_idx, model in enumerate(models):
                 scaler = scalers[model_idx]
                 probs_all = []
                 
-                # TTA pour ce modèle
                 for cfg_tta in tta_configs:
                     aug = batch_landmarks.copy()
                     
@@ -1527,7 +1725,6 @@ if __name__ == "__main__":
                         aug[i] = rotate_sequence(aug[i], cfg_tta["angle"], cfg_tta["axis"])
                         aug[i] = scale_sequence(aug[i], cfg_tta["scale"])
                     
-                    # Transformer les données avec le scaler du modèle
                     lm, norm, diff_, feat = create_features(aug, with_normalized=True)
                     feat = scaler.transform(feat.reshape(-1, 31)).reshape(feat.shape)
                     
@@ -1541,18 +1738,15 @@ if __name__ == "__main__":
                         probs = F.softmax(outputs, dim=1)
                         probs_all.append(probs)
                 
-                # Moyenne des TTA pour ce modèle
                 probs_all = torch.stack(probs_all)
                 avg_probs = probs_all.mean(0)
                 model_probs.append(avg_probs)
             
-            # Moyenne des prédictions de tous les modèles
             if model_probs:
                 ensemble_probs = torch.stack(model_probs).mean(0)
                 pred = ensemble_probs.argmax(1)
                 all_probs.extend(pred.cpu().numpy())
         
-        # Sauvegarder la soumission
         predictions = np.array(all_probs) + 1
         submission = pd.DataFrame({'Id': range(len(predictions)), 'Gesture': predictions})
         submission.to_csv('submission_ensemble_final.csv', index=False)
