@@ -1,0 +1,1193 @@
+# -*- coding: utf-8 -*-
+"""
+Hand Gesture Recognition - Single Stream ST-GCN + Mixture of Experts
+
+This script implements a simplified pipeline that:
+  1. Loads 3D hand landmark sequences (21 points × 3 coordinates)
+  2. Prepares a single graph stream (position + velocity = 6 channels)
+  3. Processes through an ST-GCN backbone
+  4. Passes features through Mixture-of-Experts layers
+  5. Classifies into 13 gesture classes
+
+The architecture is: Landmarks → ST-GCN → MoE → Classifier
+Includes optional visualization plots for data exploration, training curves,
+and evaluation metrics.
+"""
+
+# =============================================================================
+# IMPORTS AND GLOBAL CONFIGURATION
+# Sets up all necessary libraries, device selection (GPU/CPU), and output paths.
+# =============================================================================
+import os
+import copy
+import pickle
+import numpy as np
+import pandas as pd
+from scipy.interpolate import interp1d
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import confusion_matrix, classification_report, precision_recall_fscore_support
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+from tqdm import tqdm
+import random
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+import seaborn as sns
+
+sns.set_style("whitegrid")
+
+MAKE_PLOTS = True
+PLOTS_DIR = 'plots'
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+if device.type == 'cuda':
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+NUM_CLASSES = 13
+data_path = 'hand-gesture-recognition-challenge/'
+
+# =============================================================================
+# UTILITY FUNCTION FOR PLOT SAVING
+# =============================================================================
+def save_and_show(name):
+    """Save plot to file and display it."""
+    if MAKE_PLOTS:
+        os.makedirs(PLOTS_DIR, exist_ok=True)
+        path = os.path.join(PLOTS_DIR, f"{name}.png")
+        plt.savefig(path, dpi=120, bbox_inches='tight')
+        print(f"Plot saved: {path}")
+    try:
+        plt.show()
+    except Exception:
+        pass
+    plt.close()
+
+# =============================================================================
+# DATA LOADING AND PREPROCESSING
+# =============================================================================
+def linear_interpolation(landmarks, t_from, t_to):
+    """Interpolate landmarks to a uniform temporal grid of 81 frames."""
+    if len(landmarks) == 0:
+        return np.zeros((len(t_to), landmarks.shape[1]))
+    interpolated = np.zeros((len(t_to), landmarks.shape[1]))
+    for i in range(landmarks.shape[1]):
+        f = interp1d(t_from, landmarks[:, i], kind='linear', bounds_error=False, fill_value='extrapolate')
+        interpolated[:, i] = f(t_to)
+    return interpolated
+
+
+def load_train_data():
+    """Load and preprocess training data with labels."""
+    data_dir = os.path.join(data_path, 'data_train/')
+    data_txt_file = os.path.join(data_path, 'data_train/train_annotations.txt')
+    max_len = 80
+    all_landmarks = []
+    labels = []
+    to_discard = []
+    
+    with open(data_txt_file, 'r') as f:
+        files = f.readlines()
+    
+    for i, file in tqdm(enumerate(files), desc="Loading training data"):
+        try:
+            parts = file.strip().split(', ')
+            if len(parts) >= 4:
+                video_path, landmarks_path, label, nframes = parts
+            else:
+                continue
+            labels.append(label)
+            landmark_file = os.path.join(data_dir, landmarks_path)
+            if not os.path.exists(landmark_file):
+                to_discard.append(i)
+                continue
+            
+            with open(landmark_file) as f:
+                lines = f.readlines()
+            
+            landmarks = []
+            is_available = []
+            for line in lines:
+                lands = list(filter(lambda x: len(x), line.strip('\n').strip(' ').split(';')))
+                if len(lands):
+                    is_available.append(True)
+                    landmarks.append([float(x) for x in lands])
+                else:
+                    landmarks.append(np.zeros(63))
+                    is_available.append(False)
+            
+            if sum(is_available) > 1:
+                landmarks = np.array(landmarks).astype('float32')
+                is_available = np.array(is_available)
+                t_from = np.arange(len(landmarks))[is_available]
+                landmarks = linear_interpolation(
+                    landmarks[is_available], t_from=t_from,
+                    t_to=np.linspace(min(t_from), max(t_from), max_len + 1)
+                )
+                all_landmarks.append(landmarks)
+            else:
+                to_discard.append(i)
+        except Exception as e:
+            print(f"Error processing file {i}: {e}")
+            to_discard.append(i)
+    
+    train_landmarks = np.array(all_landmarks).reshape(-1, 81, 21, 3)
+    y_true = np.array([labels[i] for i in range(len(labels)) if i not in to_discard])
+    return train_landmarks, y_true
+
+
+def load_test_data():
+    """Load and preprocess test data (no labels)."""
+    data_dir = os.path.join(data_path, 'data_test/')
+    data_txt_file = os.path.join(data_path, 'data_test/test_annotations.txt')
+    max_len = 80
+    all_landmarks = []
+    
+    with open(data_txt_file, 'r') as f:
+        files = f.readlines()
+    
+    for i, file in tqdm(enumerate(files), desc="Loading test data"):
+        try:
+            parts = file.strip().split(', ')
+            if len(parts) >= 3:
+                video_path, landmarks_path, nframes = parts
+            else:
+                continue
+            landmark_file = os.path.join(data_dir, landmarks_path)
+            if not os.path.exists(landmark_file):
+                all_landmarks.append(np.zeros((81, 63)))
+                continue
+            
+            with open(landmark_file) as f:
+                lines = f.readlines()
+            
+            landmarks = []
+            is_available = []
+            for line in lines:
+                lands = list(filter(lambda x: len(x), line.strip('\n').strip(' ').split(';')))
+                if len(lands):
+                    is_available.append(True)
+                    landmarks.append([float(x) for x in lands])
+                else:
+                    landmarks.append(np.zeros(63))
+                    is_available.append(False)
+            
+            if sum(is_available) > 1:
+                landmarks = np.array(landmarks).astype('float32')
+                is_available = np.array(is_available)
+                t_from = np.arange(len(landmarks))[is_available]
+                landmarks = linear_interpolation(
+                    landmarks[is_available], t_from=t_from,
+                    t_to=np.linspace(min(t_from), max(t_from), max_len + 1)
+                )
+                all_landmarks.append(landmarks)
+            else:
+                all_landmarks.append(np.zeros((81, 63)))
+        except Exception as e:
+            print(f"Error processing test file {i}: {e}")
+            all_landmarks.append(np.zeros((81, 63)))
+    
+    test_landmarks = np.array(all_landmarks).reshape(-1, 81, 21, 3)
+    return test_landmarks
+
+# =============================================================================
+# DATA AUGMENTATION
+# =============================================================================
+def rotate(arr, theta, axis):
+    """Apply 3D rotation to landmark array."""
+    if axis == 0:
+        rot_mat = np.array([[1, 0, 0], [0, np.cos(theta), -np.sin(theta)], [0, np.sin(theta), np.cos(theta)]])
+    elif axis == 1:
+        rot_mat = np.array([[np.cos(theta), 0, np.sin(theta)], [0, 1, 0], [-np.sin(theta), 0, np.cos(theta)]])
+    else:
+        rot_mat = np.array([[np.cos(theta), -np.sin(theta), 0], [np.sin(theta), np.cos(theta), 0], [0, 0, 1]])
+    return (rot_mat @ arr.T).T
+
+
+def scale_normalize(vids):
+    """Normalize by distance between landmarks 0 (wrist) and 9 (middle finger base)."""
+    ref = np.linalg.norm(vids[:, :, 9] - vids[:, :, 0], axis=-1, keepdims=True)
+    ref = np.where(ref < 1e-6, 1e-6, ref)
+    ref = ref[:, :, np.newaxis]
+    return vids / ref
+
+
+def augment_landmark(seq):
+    """Apply random rotation and scaling to a single landmark sequence."""
+    out = seq.copy()
+    ang = np.random.uniform(-np.pi/6, np.pi/6)
+    axis = np.random.choice([0, 1, 2])
+    scale = np.random.uniform(0.9, 1.1)
+    for f in range(out.shape[0]):
+        out[f] = rotate(out[f], ang, axis) * scale
+    out = out + np.random.normal(0, 0.005, out.shape)
+    return out
+
+
+def augment_data_balanced(landmarks, labels, target_count=450):
+    """Oversample minority classes to reach target_count per class."""
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    print(f"Classes before augmentation: {dict(zip(unique_labels, counts))}")
+    
+    X_added, y_added = [], []
+    for lab in unique_labels:
+        lab_indices = np.where(labels == lab)[0]
+        current = len(lab_indices)
+        if current < target_count:
+            n_to_add = target_count - current
+            print(f"Class {lab}: {current} -> {target_count} (+{n_to_add})")
+            for _ in range(n_to_add):
+                idx = np.random.choice(lab_indices)
+                aug = augment_landmark(landmarks[idx])
+                X_added.append(aug)
+                y_added.append(lab)
+    
+    if X_added:
+        landmarks_aug = np.vstack((landmarks, np.array(X_added)))
+        labels_aug = np.concatenate((labels, np.array(y_added)))
+        return landmarks_aug, labels_aug
+    return landmarks, labels
+
+# =============================================================================
+# VISUALIZATION: HAND SKELETON AND DATA EXPLORATION
+# =============================================================================
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17),
+]
+
+
+def plot_hand_skeleton(ax, landmarks_frame, color="#1f77b4", title=None):
+    """Draw 2D projection of hand skeleton with bone connections."""
+    xs, ys = landmarks_frame[:, 0], landmarks_frame[:, 1]
+    for a, b in HAND_CONNECTIONS:
+        ax.plot([xs[a], xs[b]], [ys[a], ys[b]], color=color, linewidth=1.5, zorder=1)
+    ax.scatter(xs, ys, color=color, s=25, zorder=2)
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.set_xticks([]); ax.set_yticks([])
+    if title:
+        ax.set_title(title, fontsize=10)
+
+
+def plot_data_exploration(train_landmarks, train_labels):
+    """Plot class distribution and example hand skeletons."""
+    if not MAKE_PLOTS:
+        return
+    
+    unique, counts = np.unique(train_labels.astype(int), return_counts=True)
+    
+    plt.figure(figsize=(9, 4))
+    bars = plt.bar(unique, counts, color="#1f77b4", edgecolor="white")
+    plt.xlabel("Gesture class")
+    plt.ylabel("Number of sequences")
+    plt.title("Class distribution - training set (before augmentation)")
+    plt.xticks(unique)
+    for b, c in zip(bars, counts):
+        plt.text(b.get_x() + b.get_width() / 2, c + 0.5, str(c), ha="center", va="bottom", fontsize=8)
+    plt.tight_layout()
+    save_and_show("01_class_distribution_before_aug")
+    
+    fig, axes = plt.subplots(1, 5, figsize=(16, 4))
+    example_classes = unique[:5]
+    for ax, cls in zip(axes, example_classes):
+        idx = np.where(train_labels.astype(int) == cls)[0][0]
+        mid_frame = train_landmarks[idx, train_landmarks.shape[1] // 2]
+        plot_hand_skeleton(ax, mid_frame, title=f"Class {cls}")
+    plt.suptitle("Example hand skeleton (middle frame) for several gesture classes")
+    plt.tight_layout()
+    save_and_show("02_hand_skeletons")
+    
+    sample_idx = 0
+    traj = train_landmarks[sample_idx, :, 0, :]
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sc = ax.scatter(traj[:, 0], traj[:, 1], c=np.arange(len(traj)), cmap="viridis", s=15)
+    ax.plot(traj[:, 0], traj[:, 1], color="gray", alpha=0.3, linewidth=1)
+    ax.invert_yaxis()
+    ax.set_title(f"Wrist trajectory over 81 frames - sample #{sample_idx} "
+                 f"(class {int(train_labels[sample_idx])})")
+    ax.set_xlabel("x"); ax.set_ylabel("y")
+    plt.colorbar(sc, ax=ax, label="frame index")
+    plt.tight_layout()
+    save_and_show("03_wrist_trajectory")
+
+
+def plot_augmentation_effect(train_landmarks, train_labels, target_count):
+    """Plot class distribution before/after augmentation and example augmented skeleton."""
+    if not MAKE_PLOTS:
+        return
+    
+    print("\n--- Augmentation demonstration (for plots) ---")
+    train_landmarks_aug, train_labels_aug = augment_data_balanced(
+        train_landmarks, train_labels, target_count=target_count
+    )
+    print(f"Before augmentation: {train_landmarks.shape[0]} sequences")
+    print(f"After augmentation:  {train_landmarks_aug.shape[0]} sequences")
+    
+    unique_before, counts_before = np.unique(train_labels.astype(int), return_counts=True)
+    unique_after, counts_after = np.unique(train_labels_aug.astype(int), return_counts=True)
+    all_classes = unique_after
+    cb = np.array([counts_before[list(unique_before).index(c)] if c in unique_before else 0
+                   for c in all_classes])
+    ca = counts_after
+    x = np.arange(len(all_classes))
+    width = 0.35
+    
+    plt.figure(figsize=(10, 4))
+    plt.bar(x - width / 2, cb, width, label="Before augmentation", color="#1f77b4")
+    plt.bar(x + width / 2, ca, width, label="After augmentation", color="#ff7f0e")
+    plt.xticks(x, all_classes)
+    plt.xlabel("Gesture class")
+    plt.ylabel("Number of sequences")
+    plt.title(f"Class distribution before vs. after augmentation (target_count={target_count})")
+    plt.legend()
+    plt.tight_layout()
+    save_and_show("04_class_distribution_before_vs_after")
+    
+    orig_idx = 1
+    orig_frame = train_landmarks[orig_idx, train_landmarks.shape[1] // 2]
+    aug_seq = augment_landmark(train_landmarks[orig_idx])
+    aug_frame = aug_seq[aug_seq.shape[0] // 2]
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+    plot_hand_skeleton(axes[0], orig_frame, color="#1f77b4", title="Original")
+    plot_hand_skeleton(axes[1], aug_frame, color="#ff7f0e", title="Augmented")
+    plt.suptitle("Augmentation - before vs. after")
+    plt.tight_layout()
+    save_and_show("05_original_vs_augmented_skeleton")
+
+# =============================================================================
+# GRAPH CONSTRUCTION FOR ST-GCN
+# =============================================================================
+EDGES = [(0, 1), (1, 2), (2, 3), (3, 4),
+         (0, 5), (5, 6), (6, 7), (7, 8),
+         (0, 9), (9, 10), (10, 11), (11, 12),
+         (0, 13), (13, 14), (14, 15), (15, 16),
+         (0, 17), (17, 18), (18, 19), (19, 20),
+         (5, 9), (9, 13), (13, 17)]
+
+
+def build_adjacency(num_nodes=21):
+    """Build symmetric normalized adjacency matrix D^{-1/2} A D^{-1/2}."""
+    A = np.eye(num_nodes)
+    for i, j in EDGES:
+        A[i, j] = 1
+        A[j, i] = 1
+    Deg = np.sum(A, axis=1)
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(Deg))
+    A_norm = D_inv_sqrt @ A @ D_inv_sqrt
+    return torch.FloatTensor(A_norm)
+
+
+def compute_velocity(x):
+    """Compute frame-to-frame velocity."""
+    vel = np.zeros_like(x)
+    vel[:, 1:] = x[:, 1:] - x[:, :-1]
+    return vel
+
+
+def prepare_graph_stream(x):
+    """Concatenate position and velocity (6 channels) and reshape to (N, C, T, V)."""
+    vel = compute_velocity(x)
+    combined = np.concatenate([x, vel], axis=-1)
+    combined = combined.transpose(0, 3, 1, 2)
+    return combined.astype('float32')
+
+# =============================================================================
+# FOCAL LOSS WITH LABEL SMOOTHING
+# =============================================================================
+class FocalLoss(nn.Module):
+    """Focal Loss with optional label smoothing and class-balanced alpha."""
+    def __init__(self, alpha=None, gamma=2.2, label_smoothing=0.08):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+
+    def forward(self, inputs, targets):
+        num_classes = inputs.size(-1)
+        log_probs = F.log_softmax(inputs, dim=-1)
+        probs = log_probs.exp()
+        
+        if self.label_smoothing > 0:
+            with torch.no_grad():
+                true_dist = torch.zeros_like(log_probs)
+                true_dist.fill_(self.label_smoothing / (num_classes - 1))
+                true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
+            ce = -(true_dist * log_probs).sum(dim=-1)
+            pt = (true_dist * probs).sum(dim=-1)
+        else:
+            ce = F.nll_loss(log_probs, targets, reduction='none')
+            pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        
+        focal_term = (1 - pt).clamp(min=1e-6) ** self.gamma
+        loss = focal_term * ce
+        
+        if self.alpha is not None:
+            at = self.alpha.gather(0, targets)
+            loss = at * loss
+        
+        return loss.mean()
+
+
+def compute_focal_alpha(labels_int, num_classes, device):
+    """Compute per-class alpha weights inversely proportional to frequency."""
+    counts = np.array([np.sum(labels_int == c) for c in range(1, num_classes + 1)], dtype=np.float32)
+    counts = np.where(counts == 0, 1, counts)
+    alpha = (counts.sum() / (num_classes * counts)) ** 1.5
+    alpha = alpha / alpha.mean()
+    return torch.FloatTensor(alpha).to(device)
+
+# =============================================================================
+# EMA (EXPONENTIAL MOVING AVERAGE)
+# =============================================================================
+class EMA:
+    """Maintains exponential moving average of model weights for stable evaluation."""
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model.state_dict())
+
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            if v.dtype.is_floating_point:
+                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1 - self.decay)
+            else:
+                self.shadow[k] = v.clone()
+
+    def state_dict(self):
+        return self.shadow
+
+# =============================================================================
+# DROP PATH REGULARIZATION
+# =============================================================================
+class DropPath(nn.Module):
+    """Randomly drops entire residual blocks during training (stochastic depth)."""
+    def __init__(self, drop_prob=0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if not self.training or self.drop_prob == 0.0:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = keep_prob + torch.rand(shape, device=x.device, dtype=x.dtype)
+        mask.floor_()
+        return x.div(keep_prob) * mask
+
+# =============================================================================
+# ST-GCN BUILDING BLOCKS
+# =============================================================================
+class UnitGCN(nn.Module):
+    """Graph Convolution layer with learnable adjacency residual."""
+    def __init__(self, in_channels, out_channels, A, dropout=0.35):
+        super().__init__()
+        self.register_buffer('A', A)
+        self.A_res = nn.Parameter(torch.zeros_like(A))
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(dropout)
+        if in_channels != out_channels:
+            self.down = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1),
+                nn.BatchNorm2d(out_channels)
+            )
+        else:
+            self.down = None
+
+    def forward(self, x):
+        A = self.A + self.A_res
+        x_res = x if self.down is None else self.down(x)
+        x = self.conv(x)
+        x = torch.einsum('nctv,vw->nctw', x, A)
+        x = self.bn(x)
+        x = self.relu(x + x_res)
+        x = self.dropout(x)
+        return x
+
+
+class UnitTCN(nn.Module):
+    """Temporal Convolution layer with kernel_size along time, 1 along space."""
+    def __init__(self, channels, kernel_size=9, stride=1, dropout=0.35):
+        super().__init__()
+        pad = (kernel_size - 1) // 2
+        self.conv = nn.Conv2d(
+            channels, channels,
+            kernel_size=(kernel_size, 1),
+            padding=(pad, 0),
+            stride=(stride, 1)
+        )
+        self.bn = nn.BatchNorm2d(channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        return x
+
+
+class STGCNBlock(nn.Module):
+    """ST-GCN Block: GCN -> TCN with residual connection and DropPath."""
+    def __init__(self, in_channels, out_channels, A, stride=1, dropout=0.35, drop_path=0.2):
+        super().__init__()
+        self.gcn = UnitGCN(in_channels, out_channels, A, dropout=dropout)
+        self.tcn = UnitTCN(out_channels, stride=stride, dropout=dropout)
+        if in_channels != out_channels or stride != 1:
+            self.residual = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(stride, 1)),
+                nn.BatchNorm2d(out_channels)
+            )
+        else:
+            self.residual = nn.Identity()
+        self.drop_path = DropPath(drop_path)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        res = self.residual(x)
+        x = self.gcn(x)
+        x = self.tcn(x)
+        x = self.relu(self.drop_path(x) + res)
+        return x
+
+
+class STGCNBackbone(nn.Module):
+    """ST-GCN Backbone: stacks blocks, ends with global average pooling."""
+    def __init__(self, in_channels, A, num_blocks, drop_path_rate=0.2, dropout=0.35):
+        super().__init__()
+        num_nodes = A.shape[0]
+        self.data_bn = nn.BatchNorm1d(in_channels * num_nodes)
+        channels = [in_channels] + num_blocks
+        strides = [1, 1, 2, 1, 2, 1][:len(num_blocks)]
+        dpr = np.linspace(0, drop_path_rate, len(num_blocks))
+        
+        blocks = []
+        for i in range(len(num_blocks)):
+            blocks.append(
+                STGCNBlock(
+                    channels[i], channels[i + 1], A,
+                    stride=strides[i],
+                    dropout=dropout,
+                    drop_path=float(dpr[i])
+                )
+            )
+        self.blocks = nn.ModuleList(blocks)
+        self.out_channels = num_blocks[-1]
+
+    def forward(self, x):
+        N, C, T, V = x.shape
+        x = x.permute(0, 3, 1, 2).contiguous().view(N, V * C, T)
+        x = self.data_bn(x)
+        x = x.view(N, V, C, T).permute(0, 2, 3, 1).contiguous()
+        for block in self.blocks:
+            x = block(x)
+        x = x.mean(dim=[2, 3])
+        return x
+
+# =============================================================================
+# MIXTURE OF EXPERTS (MoE) LAYERS
+# =============================================================================
+class Expert(nn.Module):
+    """Simple 2-layer MLP expert."""
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout_rate=0.35):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, output_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Router(nn.Module):
+    """Router that outputs expert selection probabilities."""
+    def __init__(self, input_dim, num_experts):
+        super().__init__()
+        self.router = nn.Linear(input_dim, num_experts)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        return self.softmax(self.router(x))
+
+
+class MixtureOfExpertsLayer(nn.Module):
+    """Sparse MoE layer with top-k expert selection."""
+    def __init__(self, input_dim, hidden_dim, num_experts, k, dropout_rate=0.35):
+        super().__init__()
+        self.num_experts = num_experts
+        self.k = k
+        self.experts = nn.ModuleList([
+            Expert(input_dim, hidden_dim, input_dim, dropout_rate)
+            for _ in range(num_experts)
+        ])
+        self.router = Router(input_dim, num_experts)
+        self.noise_std = 0.05
+
+    def forward(self, x):
+        batch_size, seq_len, input_dim = x.shape
+        x_flat = x.view(-1, input_dim)
+        
+        router_probs = self.router(x_flat)
+        if self.training:
+            noise = torch.randn_like(router_probs) * self.noise_std
+            router_probs = torch.softmax(router_probs + noise, dim=-1)
+        
+        top_k_probs, top_k_indices = torch.topk(router_probs, self.k, dim=-1)
+        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        
+        all_expert_outputs = torch.stack([expert(x_flat) for expert in self.experts], dim=1)
+        gathered = torch.gather(
+            all_expert_outputs, 1,
+            top_k_indices.unsqueeze(-1).expand(-1, -1, input_dim)
+        )
+        output = (gathered * top_k_probs.unsqueeze(-1)).sum(dim=1)
+        output = output.view(batch_size, seq_len, input_dim)
+        
+        aux_loss = self._calculate_aux_loss(router_probs)
+        return output, {'aux_loss': aux_loss}
+
+    def _calculate_aux_loss(self, router_probs):
+        """Load balancing loss to encourage uniform expert usage."""
+        expert_usage = router_probs.mean(dim=0)
+        expert_weights = router_probs.sum(dim=0) / router_probs.sum()
+        return (expert_usage * expert_weights).sum() * self.num_experts
+
+# =============================================================================
+# FULL MODEL: ST-GCN + MoE + CLASSIFIER
+# =============================================================================
+class GestureSTGCNMoEModel(nn.Module):
+    """
+    Single-stream model:
+    Input: Landmark graph stream (B, 6, T, 21)
+    Processing: ST-GCN backbone → MoE layers
+    Output: 13-class logits
+    """
+    def __init__(self, num_classes, A, num_blocks, hidden_size=384, 
+                 num_experts=10, k=4, num_moe_layers=2, dropout=0.35, drop_path_rate=0.2):
+        super().__init__()
+        
+        self.backbone = STGCNBackbone(
+            in_channels=6, A=A, num_blocks=num_blocks,
+            drop_path_rate=drop_path_rate, dropout=dropout
+        )
+        
+        self.moe_layers = nn.ModuleList([
+            MixtureOfExpertsLayer(hidden_size, hidden_size * 2, num_experts, k, dropout)
+            for _ in range(num_moe_layers)
+        ])
+        
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, x):
+        features = self.backbone(x)
+        features = features.unsqueeze(1)
+        
+        total_aux_loss = 0
+        for moe_layer in self.moe_layers:
+            features, info = moe_layer(features)
+            features = self.layer_norm(features)
+            features = self.dropout(features)
+            total_aux_loss += info['aux_loss']
+        
+        features = features.squeeze(1)
+        output = self.classifier(features)
+        
+        return output, {'aux_loss': total_aux_loss}
+
+# =============================================================================
+# MODEL COMPLEXITY ANALYSIS AND ARCHITECTURE VISUALIZATION
+# =============================================================================
+def count_parameters(module):
+    """Count total and trainable parameters in a module."""
+    total = sum(p.numel() for p in module.parameters())
+    trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+    return total, trainable
+
+
+def plot_model_complexity(config):
+    """Create architecture diagram and parameter count bar chart."""
+    if not MAKE_PLOTS:
+        return
+    
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.axis("off")
+    
+    def box(x, y, w, h, text, color, fontsize=9):
+        rect = FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.02,rounding_size=0.08",
+                              linewidth=1.2, edgecolor="#333333", facecolor=color)
+        ax.add_patch(rect)
+        ax.text(x + w / 2, y + h / 2, text, ha="center", va="center", fontsize=fontsize, wrap=True)
+        return (x + w / 2, y, x + w / 2, y + h)
+    
+    def arrow(x1, y1, x2, y2):
+        ax.add_patch(FancyArrowPatch((x1, y1), (x2, y2), arrowstyle="-|>",
+                                     mutation_scale=12, color="#555555", linewidth=1.2))
+    
+    cx1, by1, cx2, ty1 = box(3.5, 3.5, 3.0, 0.8, "Landmarks\n(6 channels, 81 frames, 21 nodes)", "#cfe8ff")
+    cx1, by2, cx2, ty2 = box(3.5, 2.2, 3.0, 0.8,
+                              f"ST-GCN Backbone\n{config['num_blocks']}", "#cfe8ff", fontsize=8)
+    arrow(cx1, by1, cx1, ty2)
+    
+    cx1, by3, cx2, ty3 = box(3.5, 0.9, 3.0, 0.8,
+                              f"MoE Layers ×{config['num_moe_layers']}\n(top-{config['k']} of {config['num_experts']} experts)", "#e6d0f5", fontsize=8)
+    arrow(cx1, by2, cx1, ty3)
+    
+    box(3.5, 0.1, 3.0, 0.6, "Linear Classifier → 13 classes", "#ffe8a3")
+    
+    ax.set_xlim(0, 10)
+    ax.set_ylim(-0.1, 4.5)
+    plt.title("GestureSTGCNMoEModel - Single Stream Architecture", fontsize=12)
+    plt.tight_layout()
+    save_and_show("06_architecture_diagram")
+    
+    A = build_adjacency(21).to(device)
+    model_probe = GestureSTGCNMoEModel(
+        num_classes=NUM_CLASSES, A=A,
+        num_blocks=config['num_blocks'],
+        hidden_size=config['hidden_size'],
+        num_experts=config['num_experts'],
+        k=config['k'],
+        num_moe_layers=config['num_moe_layers'],
+        dropout=config['dropout'],
+        drop_path_rate=config['drop_path_rate']
+    ).to(device)
+    
+    blocks = {
+        "backbone": model_probe.backbone,
+        "moe_layers": model_probe.moe_layers,
+        "layer_norm": model_probe.layer_norm,
+        "classifier": model_probe.classifier,
+    }
+    names, counts_list = [], []
+    print(f"{'Block':<15}{'Parameters':>15}")
+    print("-" * 30)
+    for name, block in blocks.items():
+        total, _ = count_parameters(block)
+        print(f"{name:<15}{total:>15,}")
+        names.append(name)
+        counts_list.append(total)
+    total_params, trainable_params = count_parameters(model_probe)
+    print("-" * 30)
+    print(f"{'TOTAL':<15}{total_params:>15,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    
+    plt.figure(figsize=(7, 4))
+    plt.bar(names, counts_list, color=["#cfe8ff", "#e6d0f5", "#d9f2d9", "#ffe8a3"])
+    plt.ylabel("Number of parameters")
+    plt.title("Parameter count per model block")
+    for i, c in enumerate(counts_list):
+        plt.text(i, c + max(counts_list) * 0.01, f"{c:,}", ha="center", fontsize=8)
+    plt.tight_layout()
+    save_and_show("07_parameter_count")
+    
+    model_probe.eval()
+    b = 2
+    dummy_input = torch.randn(b, 6, 81, 21, device=device)
+    with torch.no_grad():
+        logits, info = model_probe(dummy_input)
+    print(f"Output logits shape: {tuple(logits.shape)}  (expected: ({b}, {NUM_CLASSES}))")
+    print(f"Aux loss (load balancing): {float(info['aux_loss']):.4f}")
+    
+    del model_probe
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+# =============================================================================
+# TRAINING CURVES AND EVALUATION PLOTS
+# =============================================================================
+def plot_training_curves(history):
+    """Plot training and validation loss/accuracy over epochs."""
+    if not MAKE_PLOTS or len(history["train_loss"]) == 0:
+        return
+    
+    epochs_range = range(1, len(history["train_loss"]) + 1)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+    
+    axes[0].plot(epochs_range, history["train_loss"], label="Train", marker="o", markersize=3)
+    axes[0].plot(epochs_range, history["val_loss"], label="Validation", marker="o", markersize=3)
+    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Focal loss")
+    axes[0].set_title("Main classification loss")
+    axes[0].legend()
+    
+    axes[1].plot(epochs_range, history["train_acc"], label="Train", marker="o", markersize=3)
+    axes[1].plot(epochs_range, history["val_acc"], label="Validation", marker="o", markersize=3)
+    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Accuracy (%)")
+    axes[1].set_title("Classification accuracy")
+    axes[1].legend()
+    
+    plt.tight_layout()
+    save_and_show("08_training_curves")
+
+
+def plot_val_evaluation(val_preds, val_targets):
+    """Plot confusion matrix and per-class precision/recall/F1."""
+    if not MAKE_PLOTS:
+        return
+    
+    val_preds_lbl = np.array(val_preds) + 1
+    val_targets_lbl = np.array(val_targets) + 1
+    class_labels = sorted(np.unique(val_targets_lbl))
+    print(f"Validation accuracy: {(val_preds_lbl == val_targets_lbl).mean() * 100:.2f}%")
+    
+    cm = confusion_matrix(val_targets_lbl, val_preds_lbl, labels=class_labels)
+    plt.figure(figsize=(8, 6.5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=class_labels, yticklabels=class_labels, cbar=True)
+    plt.xlabel("Predicted class")
+    plt.ylabel("True class")
+    plt.title("Confusion matrix - validation set")
+    plt.tight_layout()
+    save_and_show("09_confusion_matrix")
+    
+    precision, recall, f1, support = precision_recall_fscore_support(
+        val_targets_lbl, val_preds_lbl, labels=class_labels, zero_division=0
+    )
+    metrics_df = pd.DataFrame({
+        "class": class_labels, "precision": precision,
+        "recall": recall, "f1_score": f1, "support": support,
+    })
+    print(metrics_df.to_string(index=False))
+    print("\nFull classification report:")
+    print(classification_report(val_targets_lbl, val_preds_lbl, labels=class_labels, zero_division=0))
+    
+    x = np.arange(len(class_labels))
+    width = 0.25
+    plt.figure(figsize=(11, 4.5))
+    plt.bar(x - width, precision, width, label="Precision", color="#1f77b4")
+    plt.bar(x, recall, width, label="Recall", color="#ff7f0e")
+    plt.bar(x + width, f1, width, label="F1-score", color="#2ca02c")
+    plt.xticks(x, class_labels)
+    plt.xlabel("Gesture class"); plt.ylabel("Score"); plt.ylim(0, 1.05)
+    plt.title("Per-class precision / recall / F1-score - validation set")
+    plt.legend()
+    plt.tight_layout()
+    save_and_show("10_prf_per_class")
+    
+    macro_f1 = f1.mean()
+    weighted_f1 = np.average(f1, weights=support)
+    print(f"Macro-average F1: {macro_f1:.4f}")
+    print(f"Weighted-average F1: {weighted_f1:.4f}")
+
+# =============================================================================
+# DATASET AND EVALUATION
+# =============================================================================
+class LandmarkDataset(Dataset):
+    """Simple dataset that returns graph stream tensor and optional label."""
+    def __init__(self, graph_stream, labels=None):
+        self.graph_stream = torch.FloatTensor(graph_stream)
+        self.labels = torch.LongTensor(labels.astype(int) - 1) if labels is not None else None
+
+    def __len__(self):
+        return len(self.graph_stream)
+
+    def __getitem__(self, idx):
+        if self.labels is not None:
+            return self.graph_stream[idx], self.labels[idx]
+        return self.graph_stream[idx]
+
+
+def evaluate(model, loader, criterion, aux_loss_weight):
+    """Evaluate model on a data loader."""
+    model.eval()
+    correct, total, running_loss = 0, 0, 0.0
+    all_preds, all_targets = [], []
+    
+    with torch.no_grad():
+        for inputs, targets in loader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            
+            outputs, moe_info = model(inputs)
+            loss = criterion(outputs, targets) + aux_loss_weight * moe_info['aux_loss']
+            
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+            
+            all_preds.extend(predicted.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+    
+    return 100. * correct / total, running_loss / len(loader), np.array(all_preds), np.array(all_targets)
+
+# =============================================================================
+# TRAINING FUNCTION
+# =============================================================================
+def train_model(config, train_landmarks, train_labels, val_landmarks, val_labels):
+    """Complete training pipeline for one configuration."""
+    print(f"\n{'='*60}")
+    print(f"Training configuration: {config['name']}")
+    print(f"{'='*60}")
+    
+    torch.manual_seed(config.get('seed', 42))
+    np.random.seed(config.get('seed', 42))
+    
+    train_landmarks_aug, train_labels_aug = augment_data_balanced(
+        train_landmarks, train_labels, target_count=config.get('target_count', 450)
+    )
+    
+    train_graph = prepare_graph_stream(train_landmarks_aug)
+    val_graph = prepare_graph_stream(val_landmarks)
+    
+    print(f"Train graph stream shape: {train_graph.shape}")
+    print(f"Val graph stream shape: {val_graph.shape}")
+    
+    train_dataset = LandmarkDataset(train_graph, train_labels_aug)
+    val_dataset = LandmarkDataset(val_graph, val_labels)
+    
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=0)
+    
+    A = build_adjacency(21).to(device)
+    alpha = compute_focal_alpha(train_labels_aug.astype(int), NUM_CLASSES, device)
+    
+    model = GestureSTGCNMoEModel(
+        num_classes=NUM_CLASSES,
+        A=A,
+        num_blocks=config['num_blocks'],
+        hidden_size=config['hidden_size'],
+        num_experts=config['num_experts'],
+        k=config['k'],
+        num_moe_layers=config['num_moe_layers'],
+        dropout=config['dropout'],
+        drop_path_rate=config['drop_path_rate']
+    ).to(device)
+    
+    ema_model = GestureSTGCNMoEModel(
+        num_classes=NUM_CLASSES,
+        A=A,
+        num_blocks=config['num_blocks'],
+        hidden_size=config['hidden_size'],
+        num_experts=config['num_experts'],
+        k=config['k'],
+        num_moe_layers=config['num_moe_layers'],
+        dropout=config['dropout'],
+        drop_path_rate=config['drop_path_rate']
+    ).to(device)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params:,}")
+    
+    criterion = FocalLoss(alpha=alpha, gamma=config['focal_gamma'], label_smoothing=config['label_smoothing'])
+    optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=config['T_0'], T_mult=1, eta_min=1e-6)
+    ema = EMA(model, decay=config['ema_decay'])
+    
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+    
+    best_val_acc = 0.0
+    best_epoch = 0
+    patience_counter = 0
+    save_path = 'best_model_stgcn_moe.pth'
+    
+    for epoch in range(config['epochs']):
+        model.train()
+        correct, total, running_loss = 0, 0, 0.0
+        
+        for inputs, targets in train_loader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            
+            optimizer.zero_grad()
+            outputs, moe_info = model(inputs)
+            main_loss = criterion(outputs, targets)
+            total_loss = main_loss + config['aux_loss_weight'] * moe_info['aux_loss']
+            total_loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            ema.update(model)
+            
+            running_loss += main_loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+        
+        scheduler.step()
+        train_acc = 100. * correct / total
+        train_loss = running_loss / len(train_loader)
+        
+        ema_model.load_state_dict(ema.state_dict())
+        val_acc, val_loss, _, _ = evaluate(ema_model, val_loader, criterion, config['aux_loss_weight'])
+        
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+        
+        print(f"Epoch {epoch+1}/{config['epochs']}: "
+              f"Train Loss: {train_loss:.4f} Acc: {train_acc:.2f}% | "
+              f"Val Loss: {val_loss:.4f} Acc: {val_acc:.2f}%")
+        
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_epoch = epoch + 1
+            patience_counter = 0
+            torch.save(ema_model.state_dict(), save_path)
+            print(f"  → New best model saved (Val Acc: {val_acc:.2f}%)")
+        else:
+            patience_counter += 1
+            if patience_counter >= config['patience']:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
+    
+    plot_training_curves(history)
+    
+    if os.path.exists(save_path):
+        ema_model.load_state_dict(torch.load(save_path, map_location=device))
+        _, _, val_preds, val_targets = evaluate(ema_model, val_loader, criterion, config['aux_loss_weight'])
+        plot_val_evaluation(val_preds, val_targets)
+    
+    print(f"\nTraining complete. Best Val Acc: {best_val_acc:.2f}% at epoch {best_epoch}")
+    
+    del model
+    torch.cuda.empty_cache()
+    
+    return {
+        'best_val_acc': best_val_acc,
+        'best_epoch': best_epoch,
+        'save_path': save_path,
+        'total_params': total_params
+    }
+
+# =============================================================================
+# INFERENCE FUNCTION
+# =============================================================================
+def predict_test(config, model_path, test_landmarks):
+    """Generate predictions for test data using a trained model."""
+    print(f"\nLoading model from {model_path}...")
+    
+    test_graph = prepare_graph_stream(test_landmarks)
+    test_dataset = LandmarkDataset(test_graph)
+    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=0)
+    
+    A = build_adjacency(21).to(device)
+    model = GestureSTGCNMoEModel(
+        num_classes=NUM_CLASSES,
+        A=A,
+        num_blocks=config['num_blocks'],
+        hidden_size=config['hidden_size'],
+        num_experts=config['num_experts'],
+        k=config['k'],
+        num_moe_layers=config['num_moe_layers'],
+        dropout=config['dropout'],
+        drop_path_rate=config['drop_path_rate']
+    ).to(device)
+    
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    
+    predictions = []
+    with torch.no_grad():
+        for inputs in tqdm(test_loader, desc="Predicting"):
+            inputs = inputs.to(device)
+            outputs, _ = model(inputs)
+            _, predicted = outputs.max(1)
+            predictions.extend(predicted.cpu().numpy())
+    
+    predictions = np.array(predictions) + 1
+    return predictions
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+if __name__ == "__main__":
+    
+    config = {
+        'name': 'stgcn_moe_single_stream',
+        'batch_size': 32,
+        'epochs': 150,
+        'patience': 15,
+        'learning_rate': 1e-4,
+        'weight_decay': 8e-4,
+        'dropout': 0.35,
+        'drop_path_rate': 0.2,
+        'aux_loss_weight': 0.02,
+        'num_blocks': [64, 64, 128, 128, 256, 384],
+        'hidden_size': 384,
+        'num_experts': 10,
+        'k': 4,
+        'num_moe_layers': 2,
+        'focal_gamma': 2.2,
+        'label_smoothing': 0.08,
+        'ema_decay': 0.999,
+        'T_0': 25,
+        'target_count': 800,
+        'seed': 42,
+    }
+    
+    print("Loading training data...")
+    train_landmarks, train_labels = load_train_data()
+    print(f"Training landmarks shape: {train_landmarks.shape}")
+    
+    # Data exploration plots
+    plot_data_exploration(train_landmarks, train_labels)
+    plot_augmentation_effect(train_landmarks, train_labels, config['target_count'])
+    plot_model_complexity(config)
+    
+    train_landmarks = scale_normalize(train_landmarks)
+    
+    indices = np.arange(len(train_landmarks))
+    train_idx, val_idx = train_test_split(
+        indices, test_size=0.2, random_state=42, stratify=train_labels.astype(int)
+    )
+    
+    raw_train_landmarks = train_landmarks[train_idx]
+    raw_train_labels = train_labels[train_idx]
+    val_landmarks = train_landmarks[val_idx]
+    val_labels = train_labels[val_idx]
+    
+    print(f"Train samples: {len(train_idx)} | Validation samples: {len(val_idx)}")
+    
+    results = train_model(config, raw_train_landmarks, raw_train_labels, val_landmarks, val_labels)
+    
+    print(f"\n{'='*60}")
+    print(f"FINAL RESULTS")
+    print(f"{'='*60}")
+    print(f"Best Validation Accuracy: {results['best_val_acc']:.2f}%")
+    print(f"Best Epoch: {results['best_epoch']}")
+    print(f"Model saved to: {results['save_path']}")
+    print(f"Total Parameters: {results['total_params']:,}")
+    
+    print("\nLoading test data...")
+    test_landmarks = load_test_data()
+    test_landmarks = scale_normalize(test_landmarks)
+    print(f"Test landmarks shape: {test_landmarks.shape}")
+    
+    predictions = predict_test(config, results['save_path'], test_landmarks)
+    
+    submission = pd.DataFrame({'Id': range(len(predictions)), 'Gesture': predictions})
+    submission.to_csv('submission_stgcn_moe.csv', index=False)
+    print("\nSubmission saved to: submission_stgcn_moe.csv")
+    print(submission.head())
+    print(f"\nPrediction distribution:")
+    print(pd.Series(predictions).value_counts().sort_index())
+    
+    if MAKE_PLOTS:
+        pred_unique, pred_counts = np.unique(predictions, return_counts=True)
+        plt.figure(figsize=(9, 4))
+        plt.bar(pred_unique, pred_counts, color="#9467bd")
+        plt.xlabel("Predicted gesture class")
+        plt.ylabel("Number of test sequences")
+        plt.title("Predicted class distribution on the test set")
+        plt.xticks(pred_unique)
+        plt.tight_layout()
+        save_and_show("11_test_prediction_distribution")
