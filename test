@@ -532,6 +532,7 @@ class PrefetchingDataLoader:
         self.stop_event.set()
         if self.prefetch_thread.is_alive(): 
             self.prefetch_thread.join(timeout=5)
+            
 def worker_init_fn(worker_id):
     seed = (torch.initial_seed() + worker_id) % (2 ** 32)
     np.random.seed(seed)

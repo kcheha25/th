@@ -3,14 +3,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
+
 import fvcore.nn.weight_init as weight_init
 from timm.models.layers import DropPath, trunc_normal_
+
 from detectron2.modeling.backbone.backbone import Backbone
 from detectron2.modeling.backbone.build import BACKBONE_REGISTRY
 from detectron2.modeling.backbone.fpn import FPN, LastLevelMaxPool, LastLevelP6P7
 from detectron2.layers import ShapeSpec
 
 _to_2tuple = nn.modules.utils._ntuple(2)
+
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.0):
@@ -30,6 +33,7 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+
 def spectral_window_partition(x, window_size):
     B, N, D = x.shape
     pad_n = (window_size - N % window_size) % window_size
@@ -40,6 +44,7 @@ def spectral_window_partition(x, window_size):
     windows = x.contiguous().view(-1, window_size, D)
     return windows, N, pad_n
 
+
 def spectral_window_reverse(windows, window_size, N_original, pad_n):
     N_padded = N_original + pad_n
     B = windows.shape[0] // (N_padded // window_size)
@@ -49,13 +54,13 @@ def spectral_window_reverse(windows, window_size, N_original, pad_n):
         x = x[:, :N_original, :]
     return x
 
+
 class SpectralWindowAttention(nn.Module):
-    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0.0, proj_drop=0.0, use_flash_attn=True):
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         self.dim = dim
         self.window_size = window_size
         self.num_heads = num_heads
-        self.use_flash_attn = use_flash_attn
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim**-0.5
         self.relative_position_bias_table = nn.Parameter(torch.zeros((2 * window_size - 1), num_heads))
@@ -74,33 +79,30 @@ class SpectralWindowAttention(nn.Module):
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        if self.use_flash_attn and mask is None:
-            attn_output = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
-            x = attn_output.transpose(1, 2).reshape(B_, N, C)
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size, self.window_size, -1)
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
         else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-                self.window_size, self.window_size, -1)
-            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
-            attn = attn + relative_position_bias.unsqueeze(0)
-            if mask is not None:
-                nW = mask.shape[0]
-                attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-                attn = attn.view(-1, self.num_heads, N, N)
-                attn = self.softmax(attn)
-            else:
-                attn = self.softmax(attn)
-            attn = self.attn_drop(attn)
-            x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+            attn = self.softmax(attn)
+        attn = self.attn_drop(attn)
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
 
+
 class SpectralSwinTransformerBlock(nn.Module):
     def __init__(self, dim, num_heads, window_size=8, shift_size=0, mlp_ratio=4.0, qkv_bias=True,
                  qk_scale=None, drop=0.0, attn_drop=0.0, drop_path=0.0, act_layer=nn.GELU,
-                 norm_layer=nn.LayerNorm, use_flash_attn=True):
+                 norm_layer=nn.LayerNorm):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -111,8 +113,7 @@ class SpectralSwinTransformerBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.attn = SpectralWindowAttention(
             dim, window_size=self.window_size, num_heads=num_heads,
-            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop,
-            use_flash_attn=use_flash_attn)
+            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -137,6 +138,7 @@ class SpectralSwinTransformerBlock(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
+
 class SpectralPatchMerging(nn.Module):
     def __init__(self, dim, norm_layer=nn.LayerNorm):
         super().__init__()
@@ -156,10 +158,11 @@ class SpectralPatchMerging(nn.Module):
         x = self.reduction(x)
         return x
 
+
 class BasicSpectralLayer(nn.Module):
     def __init__(self, dim, depth, num_heads, window_size=8, mlp_ratio=4.0, qkv_bias=True,
                  qk_scale=None, drop=0.0, attn_drop=0.0, drop_path=0.0, norm_layer=nn.LayerNorm,
-                 downsample=None, use_checkpoint=False, use_flash_attn=True):
+                 downsample=None, use_checkpoint=False):
         super().__init__()
         self.window_size = window_size
         self.shift_size = window_size // 2
@@ -172,7 +175,7 @@ class BasicSpectralLayer(nn.Module):
                 mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop, attn_drop=attn_drop,
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                norm_layer=norm_layer, use_flash_attn=use_flash_attn)
+                norm_layer=norm_layer)
             for i in range(depth)])
         self.downsample = downsample(dim=dim, norm_layer=norm_layer) if downsample is not None else None
 
@@ -204,6 +207,7 @@ class BasicSpectralLayer(nn.Module):
         else:
             return x, x
 
+
 class SpectralPatchEmbed(nn.Module):
     def __init__(self, in_chans=270, spectral_patch_size=1, embed_dim=256, norm_layer=None):
         super().__init__()
@@ -224,10 +228,15 @@ class SpectralPatchEmbed(nn.Module):
             x = self.norm(x)
         return x, H, W
 
+
 class SpatialDownsample(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        self.dw_conv = nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=1, groups=channels, bias=False)
+        self.dw_conv = nn.Conv2d(
+            channels, channels,
+            kernel_size=3, stride=2, padding=1,
+            groups=channels, bias=False,
+        )
         self.bn = nn.BatchNorm2d(channels)
         self.act = nn.GELU()
 
@@ -236,23 +245,27 @@ class SpatialDownsample(nn.Module):
         C = x.shape[2]
         H2 = (H + 1) // 2
         W2 = (W + 1) // 2
+        x_mean = x.mean(dim=1)
+        x_spatial = x_mean.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+        x_spatial = self.dw_conv(x_spatial)
+        x_spatial = self.bn(x_spatial)
+        x_spatial = self.act(x_spatial)
         x = x.view(B, H, W, N_tokens, C)
-        x = x.permute(0, 3, 4, 1, 2).contiguous()
-        x = x.view(B * N_tokens, C, H, W)
-        x = self.dw_conv(x)
-        x = self.bn(x)
-        x = self.act(x)
+        x = x.permute(0, 3, 4, 1, 2).contiguous().view(B, N_tokens * C, H, W)
+        x = F.interpolate(x, size=(H2, W2), mode='bilinear', align_corners=False)
         x = x.view(B, N_tokens, C, H2, W2)
         x = x.permute(0, 3, 4, 1, 2).contiguous()
         x = x.view(B * H2 * W2, N_tokens, C)
+        x = x + x_spatial.permute(0, 2, 3, 1).contiguous().view(B * H2 * W2, 1, C)
         return x, H2, W2
+
 
 class SpectralSwinTransformer(Backbone):
     def __init__(self, in_chans=270, spectral_patch_size=1, embed_dim=256, depths=(2, 2, 6, 2),
                  num_heads=(4, 8, 16, 32), spectral_window_size=8, mlp_ratio=4.0, qkv_bias=True,
                  qk_scale=None, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.2,
                  norm_layer=nn.LayerNorm, patch_norm=True, frozen_stages=-1,
-                 use_checkpoint=False, out_features=None, use_flash_attn=True):
+                 use_checkpoint=False, out_features=None):
         super().__init__()
         self.num_layers = len(depths)
         self.embed_dim = embed_dim
@@ -263,21 +276,21 @@ class SpectralSwinTransformer(Backbone):
         self.spectral_window_size = spectral_window_size
         self.out_features = out_features
         self.stem = nn.Sequential(
-            nn.Conv2d(in_chans, in_chans, kernel_size=3, stride=2, padding=1, groups=in_chans, bias=False),
-            nn.BatchNorm2d(in_chans),
+            nn.Conv2d(in_chans, embed_dim, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(embed_dim),
             nn.GELU(),
         )
         self.patch_embed = SpectralPatchEmbed(
-            in_chans=in_chans,
+            in_chans=embed_dim,
             spectral_patch_size=spectral_patch_size,
-            embed_dim=in_chans,
+            embed_dim=embed_dim,
             norm_layer=norm_layer if self.patch_norm else None,
         )
         self.pos_drop = nn.Dropout(p=drop_rate)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         self._out_feature_strides = {}
         self._out_feature_channels = {}
-        num_features = [int(in_chans * 2**i) for i in range(self.num_layers)]
+        num_features = [int(embed_dim * 2**i) for i in range(self.num_layers)]
         self.num_features = num_features
         self.spatial_downsamples = nn.ModuleList()
         self.layers = nn.ModuleList()
@@ -298,7 +311,6 @@ class SpectralSwinTransformer(Backbone):
                 norm_layer=norm_layer,
                 downsample=SpectralPatchMerging if (i_layer < self.num_layers - 1) else None,
                 use_checkpoint=use_checkpoint,
-                use_flash_attn=use_flash_attn,
             )
             self.layers.append(layer)
             stage = f"stage{i_layer + 2}"
@@ -373,6 +385,7 @@ class SpectralSwinTransformer(Backbone):
             for name in self.out_features
         }
 
+
 class LastLevelP6(nn.Module):
     def __init__(self, in_channels, out_channels, in_features="p5"):
         super().__init__()
@@ -383,6 +396,7 @@ class LastLevelP6(nn.Module):
 
     def forward(self, x):
         return [self.p6(x)]
+
 
 @BACKBONE_REGISTRY.register()
 def build_spectral_swint_backbone(cfg, input_shape):
@@ -404,8 +418,8 @@ def build_spectral_swint_backbone(cfg, input_shape):
         patch_norm=True,
         frozen_stages=cfg.MODEL.BACKBONE.FREEZE_AT,
         out_features=out_features,
-        use_flash_attn=cfg.MODEL.SPECTRAL_SWINT.USE_FLASH_ATTN,
     )
+
 
 @BACKBONE_REGISTRY.register()
 def build_spectral_swint_fpn_backbone(cfg, input_shape: ShapeSpec):
@@ -421,6 +435,7 @@ def build_spectral_swint_fpn_backbone(cfg, input_shape: ShapeSpec):
         fuse_type=cfg.MODEL.FPN.FUSE_TYPE,
     )
     return backbone
+
 
 @BACKBONE_REGISTRY.register()
 def build_retinanet_spectral_swint_fpn_backbone(cfg, input_shape: ShapeSpec):
@@ -444,6 +459,7 @@ def build_retinanet_spectral_swint_fpn_backbone(cfg, input_shape: ShapeSpec):
         fuse_type=cfg.MODEL.FPN.FUSE_TYPE,
     )
     return backbone
+
 
 if __name__ == "__main__":
     import traceback
@@ -483,10 +499,10 @@ if __name__ == "__main__":
     print(f"       params total={total:,}  trainable={trainable:,}")
 
     expected_shapes = {
-        "stage2": (BATCH_SIZE, 270,  H // 4,  W // 4),
-        "stage3": (BATCH_SIZE, 540,  H // 8,  W // 8),
-        "stage4": (BATCH_SIZE, 1080, H // 16, W // 16),
-        "stage5": (BATCH_SIZE, 2160, H // 32, W // 32),
+        "stage2": (BATCH_SIZE, 256,  H // 4,  W // 4),
+        "stage3": (BATCH_SIZE, 512,  H // 8,  W // 8),
+        "stage4": (BATCH_SIZE, 1024, H // 16, W // 16),
+        "stage5": (BATCH_SIZE, 2048, H // 32, W // 32),
     }
     print("\neval forward")
     try:
@@ -579,7 +595,7 @@ if __name__ == "__main__":
         print(traceback.format_exc())
 
     print("\nmulti-size")
-    for bs, c, h, w in [(1, 270, 128, 128), (1, 270, 256, 256)]:
+    for bs, c, h, w in [(1, 270, 64, 64), (1, 270, 128, 128), (1, 270, 256, 256)]:
         tag = f"bs={bs} h={h} w={w}"
         try:
             model.eval()
