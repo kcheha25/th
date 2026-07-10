@@ -1,36 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Jul  9 19:46:49 2026
-
+Created on Tue Jul  7 07:59:48 2026
 @author: karim
 """
 
-# -*- coding: utf-8 -*-
-"""
-Hand Gesture Recognition System - Multi-Stream ST-GCN with Mixture of Experts
-==============================================================================
-A comprehensive deep learning system for recognizing 13 hand gesture classes from
-3D landmark sequences. The architecture combines spatial-temporal graph convolutions
-(ST-GCN) for processing hand skeleton data with Transformer networks for engineered
-features, all integrated through a Mixture of Experts (MoE) classification head.
-
-Key Features:
-- Multi-stream processing: raw landmarks, normalized, differences, and engineered features
-- Advanced data augmentation: rotation, time warping, frame dropout, translation, noise
-- Class-balanced augmentation to target_count samples per class
-- 5-fold cross-validation with ensemble inference
-- Test-Time Augmentation (TTA) for robust predictions
-"""
-
-"""
-BLOCK 1: IMPORTS AND CONFIGURATION
-----------------------------------
-This block imports all necessary libraries and sets up the global configuration.
-It includes scientific computing (numpy, scipy), deep learning (PyTorch), data
-processing (pandas), visualization (matplotlib, seaborn), and experiment tracking
-(wandb). The configuration flags control the operating mode (training vs inference),
-cross-validation settings, and visualization options.
-"""
 import os
 import copy
 import pickle
@@ -39,11 +12,7 @@ import pandas as pd
 from scipy.interpolate import interp1d
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    confusion_matrix,
-    classification_report,
-    precision_recall_fscore_support,
-)
+from sklearn.metrics import confusion_matrix, classification_report, precision_recall_fscore_support
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -53,24 +22,22 @@ from tqdm import tqdm
 import wandb
 import random
 
-import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
 import seaborn as sns
 
 sns.set_style("whitegrid")
 
-# Operating mode and experiment configuration
-INFERENCE_ONLY = True      # False for training, True for inference only
-BEST_RUN_ID = 2            # Used when not in k-fold mode
-USE_KFOLD = True           # Enable 5-fold cross-validation
-N_FOLDS = 5                # Number of cross-validation folds
-MAKE_PLOTS = True          # Enable all visualization plots
-PLOTS_DIR = 'plots'        # Directory for saving generated figures
-# Liste des identifiants de runs à utiliser pour l'inférence d'ensemble
-ENSEMBLE_RUN_IDS = [1, 2, 4, 5]   # <-- modifiez selon vos besoins
+INFERENCE_ONLY = True
+BEST_RUN_ID = 2
+USE_KFOLD = True
+N_FOLDS = 5
+MAKE_PLOTS = True
+PLOTS_DIR = 'plots'
 
-# Device configuration
+CONFIDENCE_MARGIN_THRESHOLD = 0.15
+TOP_K_CANDIDATES = 2
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 if device.type == 'cuda':
@@ -82,21 +49,12 @@ wandb.init(project="hand_gesture_multistream_stgcn_moe_fixed", config={"num_clas
 data_path = 'hand-gesture-recognition-challenge/'
 
 
-"""
-BLOCK 2: UTILITY FUNCTIONS FOR PLOTTING AND INTERPOLATION
-----------------------------------------------------------
-Helper functions for saving plots to disk and performing linear interpolation
-on landmark sequences. The save_and_show function conditionally saves figures
-when MAKE_PLOTS is enabled, while linear_interpolation handles missing frames
-by creating evenly-spaced temporal samples.
-"""
 def save_and_show(name):
-    """Save plot to disk and attempt to display it."""
     if MAKE_PLOTS:
         os.makedirs(PLOTS_DIR, exist_ok=True)
         path = os.path.join(PLOTS_DIR, f"{name}.png")
         plt.savefig(path, dpi=120, bbox_inches='tight')
-        print(f"Plot saved: {path}")
+        print(f"Plot sauvegarde: {path}")
     try:
         plt.show()
     except Exception:
@@ -105,11 +63,6 @@ def save_and_show(name):
 
 
 def linear_interpolation(landmarks, t_from, t_to):
-    """
-    Interpolate landmark sequences to a fixed number of frames.
-    Handles missing frames by linearly interpolating between available frames.
-    Returns zero-filled array if no landmarks are available.
-    """
     if len(landmarks) == 0:
         return np.zeros((len(t_to), landmarks.shape[1]))
     interpolated = np.zeros((len(t_to), landmarks.shape[1]))
@@ -119,20 +72,7 @@ def linear_interpolation(landmarks, t_from, t_to):
     return interpolated
 
 
-"""
-BLOCK 3: DATA LOADING FUNCTIONS
----------------------------------
-Functions to load training and test data from the competition dataset format.
-Each video sequence is stored as landmark files with 21 hand keypoints in 3D.
-The loading process handles missing frames through interpolation, standardizes
-all sequences to 81 frames, and filters out corrupted or invalid samples.
-"""
 def load_train_data():
-    """
-    Load training data with labels from annotation files.
-    Processes landmark files, interpolates to 81 frames, and returns
-    arrays of shape (N, 81, 21, 3) for landmarks and (N,) for labels.
-    """
     data_dir = os.path.join(data_path, 'data_train/')
     data_txt_file = os.path.join(data_path, 'data_train/train_annotations.txt')
     max_len = 80
@@ -183,11 +123,6 @@ def load_train_data():
 
 
 def load_test_data():
-    """
-    Load test data without labels.
-    Similar processing to training data but handles missing files by
-    filling with zeros and doesn't require label information.
-    """
     data_dir = os.path.join(data_path, 'data_test/')
     data_txt_file = os.path.join(data_path, 'data_test/test_annotations.txt')
     max_len = 80
@@ -233,26 +168,10 @@ def load_test_data():
     return test_landmarks
 
 
-"""
-BLOCK 4: FEATURE ENGINEERING FUNCTIONS
----------------------------------------
-This block implements the computation of hand-crafted features from raw 3D landmarks.
-These engineered features capture geometric properties of hand gestures that are
-complementary to the raw coordinates processed by the ST-GCN streams.
-
-The 31 features computed per frame include:
-- Triangle Areas (4): Areas formed by finger base triangles (thumb-index-middle, etc.)
-- Finger Deployment (5): Euclidean distance from fingertip to finger base
-- Inter-finger Angles (4): Angles between adjacent fingers relative to palm center
-- Remarkable Distances (10): Distances between predefined keypoint pairs
-- Hand Direction (5): 3D direction vector + azimuth/elevation angles
-- Normalized Wrist (3): Wrist coordinates relative to first frame (optional)
-"""
 AREAS = {0: [[0, 4, 5], [4, 5, 8]], 1: [[5, 8, 9], [8, 9, 12]],
          2: [[9, 12, 13], [12, 13, 16]], 3: [[13, 16, 17], [16, 17, 20]]}
 
 def areas_landmarks(vids):
-    """Compute triangle areas formed by specific finger joint triplets."""
     areas = np.zeros((vids.shape[0], vids.shape[1], 4))
     for i, v in AREAS.items():
         vec_1_1 = vids[:, :, v[0][1]] - vids[:, :, v[0][0]]
@@ -266,7 +185,6 @@ def areas_landmarks(vids):
 FINGERS = [[0, 1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20]]
 
 def fingers_deployment(vids):
-    """Compute finger deployment as distance from fingertip to finger base."""
     features = np.zeros((vids.shape[0], vids.shape[1], len(FINGERS)))
     for i, f in enumerate(FINGERS):
         features[:, :, i] = np.linalg.norm(vids[:, :, f[-1]] - vids[:, :, f[0]], axis=2)
@@ -275,18 +193,15 @@ def fingers_deployment(vids):
 HARDCODED = [[0, 12], [0, 16], [4, 12], [4, 16], [4, 20], [4, 8], [8, 12], [12, 16], [16, 20], [2, 17]]
 
 def remarkable_distances(vids):
-    """Compute distances between predefined pairs of hand landmarks."""
     features = np.zeros((vids.shape[0], vids.shape[1], len(HARDCODED)))
     for i, (p1, p2) in enumerate(HARDCODED):
         features[:, :, i] = np.linalg.norm(vids[:, :, p1] - vids[:, :, p2], axis=2)
     return features
 
 def diff(vids):
-    """Compute frame-to-frame differences (temporal derivatives)."""
     return vids[:, 1:] - vids[:, :-1]
 
 def angle(vids):
-    """Compute inter-finger angles relative to palm center."""
     center = np.sum(vids[:, :, [0, 17, 13, 9, 5]], axis=2) / 5
     center = np.repeat(center[:, :, np.newaxis, :], 5, axis=-2)
     vectors = vids[:, :, [4, 8, 12, 16, 20]] - center
@@ -297,14 +212,12 @@ def angle(vids):
     return np.arccos(dot_product)
 
 def normalize(vids):
-    """Normalize landmarks relative to the first frame's wrist position."""
     bases = vids[:, :1]
     normalized = vids.copy()
     normalized[:, 1:] -= bases
     return normalized
 
 def direction(landmarks):
-    """Compute hand direction vector and angular coordinates."""
     mean_land_9_13 = np.mean(landmarks[:, :, [9, 13]], axis=-2)
     hand_direction = mean_land_9_13 - landmarks[:, :, 0]
     phi = np.arctan2(hand_direction[:, :, 0], hand_direction[:, :, 2])
@@ -312,7 +225,6 @@ def direction(landmarks):
     return np.concatenate((hand_direction, np.expand_dims(phi, axis=-1), np.expand_dims(theta, axis=-1)), axis=-1)
 
 def rotate(arr, theta, axis):
-    """Apply 3D rotation around specified axis."""
     if axis == 0:
         rot_mat = np.array([[1, 0, 0], [0, np.cos(theta), -np.sin(theta)], [0, np.sin(theta), np.cos(theta)]])
     elif axis == 1:
@@ -322,18 +234,12 @@ def rotate(arr, theta, axis):
     return (rot_mat @ arr.T).T
 
 def scale_normalize(vids):
-    """Scale normalize by the distance between wrist and middle finger base."""
     ref = np.linalg.norm(vids[:, :, 9] - vids[:, :, 0], axis=-1, keepdims=True)
     ref = np.where(ref < 1e-6, 1e-6, ref)
     ref = ref[:, :, np.newaxis]
     return vids / ref
 
 def create_features(landmarks, with_normalized=True):
-    """
-    Create all feature representations from raw landmarks.
-    Returns either 4 or 3 feature sets depending on whether normalized
-    landmarks are included.
-    """
     differences = diff(landmarks)
     if with_normalized:
         normalized = normalize(landmarks)
@@ -351,254 +257,6 @@ def create_features(landmarks, with_normalized=True):
     return [landmarks, differences, features]
 
 
-"""
-BLOCK 5: ADVANCED DATA AUGMENTATION
--------------------------------------
-Implements sophisticated data augmentation techniques to improve model
-generalization and handle class imbalance. The augmentation pipeline includes:
-
-1. 3D Rotation (±30° around random axis) - Always applied
-2. Random scaling (0.9-1.1x) - Always applied
-3. Time warping (30% chance) - Non-linear temporal distortion
-4. Frame dropout (20% chance) - Simulates missing frames
-5. Global translation (20% chance) - Small position shifts
-6. Gaussian noise (σ=0.005) - Always applied
-
-The class balancing function ensures each gesture class has at least
-target_count samples by generating augmented copies of minority classes.
-"""
-def time_warp(landmarks, warp_factor):
-    """Apply non-linear temporal warping to simulate speed variations."""
-    n = landmarks.shape[0]
-    t_orig = np.arange(n)
-    t_warped = np.power(np.linspace(0, 1, n), warp_factor) * (n - 1)
-    flat = landmarks.reshape(n, -1)
-    f = interp1d(t_orig, flat, axis=0, kind='linear', fill_value='extrapolate')
-    return f(t_warped).reshape(landmarks.shape)
-
-
-def frame_dropout(landmarks, drop_ratio):
-    """Randomly drop frames and interpolate to simulate tracking failures."""
-    n = landmarks.shape[0]
-    n_drop = max(1, int(n * drop_ratio))
-    idx_all = np.arange(n)
-    drop_idx = np.random.choice(idx_all[1:-1], size=min(n_drop, n - 2), replace=False)
-    keep_idx = np.setdiff1d(idx_all, drop_idx)
-    kept = landmarks[keep_idx].reshape(len(keep_idx), -1)
-    f = interp1d(keep_idx, kept, axis=0, kind='linear', fill_value='extrapolate')
-    return f(idx_all).reshape(landmarks.shape)
-
-
-def global_translate(landmarks, max_shift):
-    """Apply small global translation to simulate hand position variations."""
-    shift = np.random.uniform(-max_shift, max_shift, size=(1, 1, 3))
-    return landmarks + shift
-
-
-def augment_gesture_advanced(seq):
-    """
-    Advanced augmentation pipeline combining multiple transformations.
-    Applies rotation and scaling always, with probabilistic application
-    of time warping, frame dropout, and translation.
-    """
-    out = seq.copy()
-    
-    ang = np.random.uniform(-np.pi/6, np.pi/6)
-    axis = np.random.choice([0, 1, 2])
-    scale = np.random.uniform(0.9, 1.1)
-    for f in range(out.shape[0]):
-        out[f] = rotate(out[f], ang, axis) * scale
-    
-    if np.random.random() < 0.3:
-        wf = np.random.uniform(0.8, 1.25)
-        out = time_warp(out, wf)
-    
-    if np.random.random() < 0.2:
-        out = frame_dropout(out, drop_ratio=np.random.uniform(0.03, 0.08))
-    
-    if np.random.random() < 0.2:
-        out = global_translate(out, max_shift=0.01)
-    
-    out = out + np.random.normal(0, 0.005, out.shape)
-    
-    return out
-
-
-def augment_data_balanced_advanced(landmarks, labels, target_count=450):
-    """
-    Balance dataset by augmenting minority classes to reach target_count.
-    Only augments classes with fewer samples than target_count, preserving
-    original data for well-represented classes.
-    """
-    unique_labels, counts = np.unique(labels, return_counts=True)
-    print(f"Classes before augmentation: {dict(zip(unique_labels, counts))}")
-    print(f"Target: {target_count} samples per class")
-    
-    X_added, y_added = [], []
-    
-    for lab in unique_labels:
-        lab_indices = np.where(labels == lab)[0]
-        current = len(lab_indices)
-        
-        if current < target_count:
-            n_to_add = target_count - current
-            print(f"Class {lab}: {current} -> {target_count} (+{n_to_add})")
-            
-            for _ in range(n_to_add):
-                idx = np.random.choice(lab_indices)
-                aug = augment_gesture_advanced(landmarks[idx])
-                X_added.append(aug)
-                y_added.append(lab)
-        else:
-            print(f"Class {lab}: {current} (no addition needed)")
-    
-    if X_added:
-        landmarks_aug = np.vstack((landmarks, np.array(X_added)))
-        labels_aug = np.concatenate((labels, np.array(y_added)))
-        unique_after, counts_after = np.unique(labels_aug, return_counts=True)
-        print(f"Classes after augmentation: {dict(zip(unique_after, counts_after))}")
-        return landmarks_aug, labels_aug
-    
-    return landmarks, labels
-
-
-"""
-BLOCK 6: VISUALIZATION FUNCTIONS FOR DATA EXPLORATION
-------------------------------------------------------
-Functions to generate exploratory visualizations similar to Jupyter notebook
-analysis. These plots help understand the dataset characteristics:
-- Class distribution before augmentation
-- Hand skeleton structure for different gestures
-- Wrist trajectory patterns over time
-- Before/after augmentation comparisons
-- Original vs augmented skeleton visualizations
-"""
-HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),          # thumb
-    (0, 5), (5, 6), (6, 7), (7, 8),          # index
-    (5, 9), (9, 10), (10, 11), (11, 12),     # middle
-    (9, 13), (13, 14), (14, 15), (15, 16),   # ring
-    (13, 17), (17, 18), (18, 19), (19, 20),  # pinky
-    (0, 17),                                  # palm base
-]
-
-def plot_hand_skeleton(ax, landmarks_frame, color="#1f77b4", title=None):
-    """Plot a single frame of hand skeleton with connections and joints."""
-    xs, ys = landmarks_frame[:, 0], landmarks_frame[:, 1]
-    for a, b in HAND_CONNECTIONS:
-        ax.plot([xs[a], xs[b]], [ys[a], ys[b]], color=color, linewidth=1.5, zorder=1)
-    ax.scatter(xs, ys, color=color, s=25, zorder=2)
-    ax.invert_yaxis()
-    ax.set_aspect("equal")
-    ax.set_xticks([]); ax.set_yticks([])
-    if title:
-        ax.set_title(title, fontsize=10)
-
-
-def plot_data_exploration(train_landmarks, train_labels):
-    """Generate comprehensive data exploration plots for the training set."""
-    if not MAKE_PLOTS:
-        return
-    unique, counts = np.unique(train_labels.astype(int), return_counts=True)
-
-    plt.figure(figsize=(9, 4))
-    bars = plt.bar(unique, counts, color="#1f77b4", edgecolor="white")
-    plt.xlabel("Gesture class")
-    plt.ylabel("Number of sequences")
-    plt.title("Class distribution - training set (before augmentation)")
-    plt.xticks(unique)
-    for b, c in zip(bars, counts):
-        plt.text(b.get_x() + b.get_width() / 2, c + 0.5, str(c), ha="center", va="bottom", fontsize=8)
-    plt.tight_layout()
-    save_and_show("01_class_distribution_before_aug")
-
-    fig, axes = plt.subplots(1, 5, figsize=(16, 4))
-    example_classes = unique[:5]
-    for ax, cls in zip(axes, example_classes):
-        idx = np.where(train_labels.astype(int) == cls)[0][0]
-        mid_frame = train_landmarks[idx, train_landmarks.shape[1] // 2]
-        plot_hand_skeleton(ax, mid_frame, title=f"Class {cls}")
-    plt.suptitle("Example hand skeleton (middle frame) for several gesture classes")
-    plt.tight_layout()
-    save_and_show("02_hand_skeletons")
-
-    sample_idx = 0
-    traj = train_landmarks[sample_idx, :, 0, :]
-    fig, ax = plt.subplots(figsize=(6, 5))
-    sc = ax.scatter(traj[:, 0], traj[:, 1], c=np.arange(len(traj)), cmap="viridis", s=15)
-    ax.plot(traj[:, 0], traj[:, 1], color="gray", alpha=0.3, linewidth=1)
-    ax.invert_yaxis()
-    ax.set_title(f"Wrist trajectory over 81 frames - sample #{sample_idx} "
-                 f"(class {int(train_labels[sample_idx])})")
-    ax.set_xlabel("x"); ax.set_ylabel("y")
-    plt.colorbar(sc, ax=ax, label="frame index")
-    plt.tight_layout()
-    save_and_show("03_wrist_trajectory")
-
-
-def plot_augmentation_effect(train_landmarks, train_labels, target_count):
-    """Visualize the effect of data augmentation on class distribution and samples."""
-    if not MAKE_PLOTS:
-        return
-    print("\n--- Advanced augmentation demonstration (for plots) ---")
-    
-    train_landmarks_aug, train_labels_aug = augment_data_balanced_advanced(
-        train_landmarks, train_labels, target_count=target_count
-    )
-    
-    print(f"Before augmentation: {train_landmarks.shape[0]} sequences")
-    print(f"After augmentation:  {train_landmarks_aug.shape[0]} sequences")
-    
-    unique_before, counts_before = np.unique(train_labels.astype(int), return_counts=True)
-    unique_after, counts_after = np.unique(train_labels_aug.astype(int), return_counts=True)
-    
-    all_classes = unique_after
-    cb = np.array([counts_before[list(unique_before).index(c)] if c in unique_before else 0
-                   for c in all_classes])
-    ca = counts_after
-    
-    x = np.arange(len(all_classes))
-    width = 0.35
-    
-    plt.figure(figsize=(10, 4))
-    plt.bar(x - width / 2, cb, width, label="Before augmentation", color="#1f77b4")
-    plt.bar(x + width / 2, ca, width, label="After augmentation", color="#ff7f0e")
-    plt.xticks(x, all_classes)
-    plt.xlabel("Gesture class")
-    plt.ylabel("Number of sequences")
-    plt.title(f"Class distribution before vs. after advanced augmentation (target_count={target_count})")
-    plt.legend()
-    plt.tight_layout()
-    save_and_show("04_class_distribution_before_vs_after")
-    
-    orig_idx = 1
-    orig_frame = train_landmarks[orig_idx, train_landmarks.shape[1] // 2]
-    
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    plot_hand_skeleton(axes[0], orig_frame, color="#1f77b4", title="Original")
-    
-    aug_seq1 = augment_gesture_advanced(train_landmarks[orig_idx])
-    aug_frame1 = aug_seq1[aug_seq1.shape[0] // 2]
-    plot_hand_skeleton(axes[1], aug_frame1, color="#ff7f0e", title="Augmented v1")
-    
-    aug_seq2 = augment_gesture_advanced(train_landmarks[orig_idx])
-    aug_frame2 = aug_seq2[aug_seq2.shape[0] // 2]
-    plot_hand_skeleton(axes[2], aug_frame2, color="#2ca02c", title="Augmented v2")
-    
-    plt.suptitle("Advanced augmentation - original vs. augmented versions")
-    plt.tight_layout()
-    save_and_show("05_original_vs_augmented_skeleton")
-
-
-"""
-BLOCK 7: GRAPH CONSTRUCTION AND DATA PREPARATION
--------------------------------------------------
-Defines the hand skeleton graph structure and prepares data for the ST-GCN streams.
-The hand is represented as a graph with 21 nodes (landmarks) connected by anatomical
-edges. The adjacency matrix is normalized using degree-based normalization.
-Velocity features are computed and concatenated with positions to create 6-channel
-input for each ST-GCN stream.
-"""
 EDGES = [(0, 1), (1, 2), (2, 3), (3, 4),
          (0, 5), (5, 6), (6, 7), (7, 8),
          (0, 9), (9, 10), (10, 11), (11, 12),
@@ -607,10 +265,6 @@ EDGES = [(0, 1), (1, 2), (2, 3), (3, 4),
          (5, 9), (9, 13), (13, 17)]
 
 def build_adjacency(num_nodes=21):
-    """
-    Build normalized adjacency matrix for the hand skeleton graph.
-    Uses symmetric normalization: A_norm = D^(-1/2) * A * D^(-1/2)
-    """
     A = np.eye(num_nodes)
     for i, j in EDGES:
         A[i, j] = 1
@@ -620,43 +274,19 @@ def build_adjacency(num_nodes=21):
     A_norm = D_inv_sqrt @ A @ D_inv_sqrt
     return torch.FloatTensor(A_norm)
 
-
 def compute_velocity(x):
-    """Compute frame-to-frame velocity for each landmark."""
     vel = np.zeros_like(x)
     vel[:, 1:] = x[:, 1:] - x[:, :-1]
     return vel
 
-
 def prepare_graph_stream(x):
-    """
-    Prepare input for ST-GCN by concatenating positions and velocities,
-    then reshaping to (N, C, T, V) format where C=6 (3 pos + 3 vel).
-    """
     vel = compute_velocity(x)
     combined = np.concatenate([x, vel], axis=-1)
     combined = combined.transpose(0, 3, 1, 2)
     return combined.astype('float32')
 
 
-"""
-BLOCK 8: LOSS FUNCTIONS AND TRAINING UTILITIES
------------------------------------------------
-Implements Focal Loss with class balancing and label smoothing for handling
-imbalanced classification. Also includes Exponential Moving Average (EMA)
-for stable model evaluation and DropPath (Stochastic Depth) for regularization.
-
-Focal Loss: FL(p_t) = -(1-p_t)^γ * log(p_t)
-- Reduces the contribution of easy examples
-- Alpha balancing weights minority classes more heavily
-- Label smoothing prevents overconfidence
-"""
 class FocalLoss(nn.Module):
-    """
-    Focal Loss with optional class balancing and label smoothing.
-    gamma=2.2 focuses learning on hard examples
-    label_smoothing=0.08 prevents overconfidence
-    """
     def __init__(self, alpha=None, gamma=2.2, label_smoothing=0.08):
         super().__init__()
         self.alpha = alpha
@@ -686,10 +316,6 @@ class FocalLoss(nn.Module):
 
 
 def compute_focal_alpha(labels_int, num_classes, device):
-    """
-    Compute class weights for Focal Loss based on inverse frequency.
-    Weights are raised to power 1.5 to moderately emphasize minority classes.
-    """
     counts = np.array([np.sum(labels_int == c) for c in range(1, num_classes + 1)], dtype=np.float32)
     counts = np.where(counts == 0, 1, counts)
     alpha = (counts.sum() / (num_classes * counts)) ** 1.5
@@ -698,11 +324,6 @@ def compute_focal_alpha(labels_int, num_classes, device):
 
 
 class EMA:
-    """
-    Exponential Moving Average of model weights.
-    Maintains a shadow copy that evolves as: θ_ema = decay * θ_ema + (1-decay) * θ
-    Used for more stable evaluation and typically improves final performance.
-    """
     def __init__(self, model, decay=0.999):
         self.decay = decay
         self.shadow = copy.deepcopy(model.state_dict())
@@ -719,11 +340,6 @@ class EMA:
 
 
 class DropPath(nn.Module):
-    """
-    Stochastic Depth (DropPath) regularization.
-    Randomly drops entire residual blocks during training with probability drop_prob.
-    Surviving paths are scaled by 1/(1-drop_prob) to maintain expected values.
-    """
     def __init__(self, drop_prob=0.0):
         super().__init__()
         self.drop_prob = drop_prob
@@ -738,24 +354,7 @@ class DropPath(nn.Module):
         return x.div(keep_prob) * mask
 
 
-"""
-BLOCK 9: SPATIAL-TEMPORAL GRAPH CONVOLUTIONAL NETWORK (ST-GCN)
----------------------------------------------------------------
-Core building blocks of the ST-GCN architecture for processing hand skeleton data.
-Each ST-GCN block consists of:
-1. Unit GCN (Graph Convolution): Spatial feature extraction along graph edges
-2. Unit TCN (Temporal Convolution): Temporal pattern extraction across frames
-3. Residual connection with optional downsampling
-4. DropPath regularization
-
-The GCN uses a learnable residual adjacency matrix (A_res) allowing the model
-to learn task-specific connections beyond the anatomical skeleton structure.
-"""
 class UnitGCN(nn.Module):
-    """
-    Graph Convolution Unit for spatial feature extraction.
-    Uses normalized adjacency matrix with learnable residual connections.
-    """
     def __init__(self, in_channels, out_channels, A, dropout=0.35):
         super().__init__()
         self.register_buffer('A', A)
@@ -784,10 +383,6 @@ class UnitGCN(nn.Module):
 
 
 class UnitTCN(nn.Module):
-    """
-    Temporal Convolution Unit for capturing motion patterns.
-    Uses 1D convolution along time dimension with kernel_size=9.
-    """
     def __init__(self, channels, kernel_size=9, stride=1, dropout=0.35):
         super().__init__()
         pad = (kernel_size - 1) // 2
@@ -810,11 +405,6 @@ class UnitTCN(nn.Module):
 
 
 class STGCNBlock(nn.Module):
-    """
-    Complete ST-GCN block combining spatial graph convolution and temporal convolution.
-    Includes residual connection, stride support for temporal downsampling,
-    and DropPath regularization.
-    """
     def __init__(self, in_channels, out_channels, A, stride=1, dropout=0.35, drop_path=0.2):
         super().__init__()
         self.gcn = UnitGCN(in_channels, out_channels, A, dropout=dropout)
@@ -838,12 +428,6 @@ class STGCNBlock(nn.Module):
 
 
 class STGCNStream(nn.Module):
-    """
-    Complete ST-GCN stream processing a single input representation.
-    Consists of multiple ST-GCN blocks with progressive channel expansion
-    and temporal downsampling at specific layers (strides=[1,1,2,1,2,1]).
-    Final output is obtained through global average pooling.
-    """
     def __init__(self, in_channels, A, num_blocks, drop_path_rate=0.2, dropout=0.35):
         super().__init__()
         num_nodes = A.shape[0]
@@ -875,26 +459,7 @@ class STGCNStream(nn.Module):
         return x
 
 
-"""
-BLOCK 10: TRANSFORMER ARCHITECTURE
------------------------------------
-Implements a Vision Transformer (ViT) style architecture for processing
-the 31 engineered features. The transformer treats each frame as a "patch"
-and uses self-attention to capture long-range temporal dependencies.
-
-Key components:
-- Patch embedding: Linear projection from 31 features to embed_dim
-- Learnable CLS token: Aggregates global sequence information
-- Position embeddings: Encodes temporal order
-- Multi-head self-attention: Captures relationships between frames
-- MLP with GELU activation: Non-linear transformation
-"""
 class TransformerBlock(nn.Module):
-    """
-    Standard Transformer block with pre-norm architecture.
-    Uses Multi-head Attention followed by MLP, both with residual connections
-    and DropPath regularization.
-    """
     def __init__(self, embed_dim, num_heads, mlp_ratio, dropout, drop_path):
         super().__init__()
         self.norm1 = nn.LayerNorm(embed_dim)
@@ -919,12 +484,6 @@ class TransformerBlock(nn.Module):
 
 
 class TransformerBranch(nn.Module):
-    """
-    Complete Transformer branch for processing engineered features.
-    Prepends a learnable CLS token and adds positional embeddings before
-    passing through multiple Transformer blocks. The final CLS token
-    output serves as the sequence representation.
-    """
     def __init__(self, patch_dim, seq_len, embed_dim=80, num_heads=5, num_layers=3,
                  mlp_ratio=4.0, dropout=0.1, drop_path_rate=0.1):
         super().__init__()
@@ -955,24 +514,7 @@ class TransformerBranch(nn.Module):
         return x[:, 0]
 
 
-"""
-BLOCK 11: MIXTURE OF EXPERTS (MoE) ARCHITECTURE
--------------------------------------------------
-Implements a sparse Mixture of Experts layer for adaptive classification.
-The MoE consists of:
-- Router network: Determines which experts to use for each input
-- Multiple Expert networks: Specialized MLPs for different input patterns
-- Sparse activation: Only top-k experts are activated per input (k=4 out of 10)
-- Load balancing loss: Ensures all experts are utilized during training
-
-The sparse MoE allows the model to develop specialized sub-networks for
-different types of gestures while maintaining computational efficiency.
-"""
 class Expert(nn.Module):
-    """
-    Individual expert network: 2-layer MLP with ReLU activation and dropout.
-    Each expert specializes in processing certain types of inputs.
-    """
     def __init__(self, input_dim, hidden_dim, output_dim, dropout_rate=0.35):
         super().__init__()
         self.net = nn.Sequential(
@@ -989,10 +531,6 @@ class Expert(nn.Module):
 
 
 class Router(nn.Module):
-    """
-    Router network that determines expert selection probabilities.
-    Uses softmax to produce a probability distribution over experts.
-    """
     def __init__(self, input_dim, num_experts):
         super().__init__()
         self.router = nn.Linear(input_dim, num_experts)
@@ -1003,11 +541,6 @@ class Router(nn.Module):
 
 
 class MixtureOfExpertsLayer(nn.Module):
-    """
-    Complete Mixture of Experts layer with sparse top-k routing.
-    During training, Gaussian noise is added to router logits for exploration.
-    The auxiliary load balancing loss encourages uniform expert utilization.
-    """
     def __init__(self, input_dim, hidden_dim, num_experts, k, dropout_rate=0.35):
         super().__init__()
         self.num_experts = num_experts
@@ -1039,30 +572,12 @@ class MixtureOfExpertsLayer(nn.Module):
         return output, {'aux_loss': aux_loss}
 
     def _calculate_aux_loss(self, router_probs):
-        """
-        Calculate load balancing loss to encourage uniform expert utilization.
-        Penalizes the router if some experts are used much more than others.
-        """
         expert_usage = router_probs.mean(dim=0)
         expert_weights = router_probs.sum(dim=0) / router_probs.sum()
         return (expert_usage * expert_weights).sum() * self.num_experts
 
 
-"""
-BLOCK 12: COMPLETE MODEL ARCHITECTURE
---------------------------------------
-Assembles all components into the final GestureMultiStreamMoEModel.
-The architecture consists of:
-1. Multi-Stream Backbone: 3 ST-GCN streams + 1 Transformer branch
-2. Combiner Network: Fuses features from all streams
-3. MoE Layers: 2 layers of sparse mixture of experts
-4. Final Classifier: Linear projection to 13 gesture classes
-
-The model processes 4 complementary representations of hand gestures
-and uses adaptive expert routing for final classification.
-"""
 def rotate_tensor_3d(tensor, ang, axis):
-    """Apply 3D rotation to tensor with shape (B, 6, T, V)."""
     B, C, T, V = tensor.shape
     assert C == 6
     if axis == 0:
@@ -1095,10 +610,6 @@ def rotate_tensor_3d(tensor, ang, axis):
 
 
 class HandGestureMultiStreamBackbone(nn.Module):
-    """
-    Multi-stream backbone combining 3 ST-GCN streams and 1 Transformer branch.
-    Each stream processes a different representation of the input gesture.
-    """
     def __init__(self, A, num_blocks, transformer_embed_dim=80, transformer_heads=5,
                  transformer_layers=3, transformer_mlp_ratio=4.0, dropout=0.35,
                  drop_path_rate=0.2, output_dim=384):
@@ -1141,11 +652,6 @@ class HandGestureMultiStreamBackbone(nn.Module):
 
 
 class GestureMultiStreamMoEModel(nn.Module):
-    """
-    Complete gesture recognition model with multi-stream backbone and MoE head.
-    Processes 4 input streams, fuses them, then applies sparse mixture of experts
-    for final classification into 13 gesture classes.
-    """
     def __init__(self, num_classes, A, num_blocks, transformer_embed_dim=80, transformer_heads=5,
                  transformer_layers=3, transformer_mlp_ratio=4.0, hidden_size=384, num_experts=10,
                  k=4, num_moe_layers=2, dropout=0.35, drop_path_rate=0.2):
@@ -1181,231 +687,7 @@ class GestureMultiStreamMoEModel(nn.Module):
         return output, {'aux_loss': total_aux_loss}
 
 
-"""
-BLOCK 13: MODEL VISUALIZATION AND EVALUATION PLOTS
----------------------------------------------------
-Functions for visualizing model architecture, parameter counts,
-training curves, and validation metrics. These plots help understand
-model behavior and diagnose training issues.
-"""
-def count_parameters(module):
-    """Count total and trainable parameters in a module."""
-    total = sum(p.numel() for p in module.parameters())
-    trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
-    return total, trainable
-
-
-def plot_model_complexity(cfg):
-    """Generate architecture diagram and parameter count visualization."""
-    if not MAKE_PLOTS:
-        return
-
-    fig, ax = plt.subplots(figsize=(13, 7.5))
-    ax.axis("off")
-
-    def box(x, y, w, h, text, color, fontsize=9):
-        rect = FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.02,rounding_size=0.08",
-                              linewidth=1.2, edgecolor="#333333", facecolor=color)
-        ax.add_patch(rect)
-        ax.text(x + w / 2, y + h / 2, text, ha="center", va="center", fontsize=fontsize, wrap=True)
-        return (x + w / 2, y, x + w / 2, y + h)
-
-    def arrow(x1, y1, x2, y2):
-        ax.add_patch(FancyArrowPatch((x1, y1), (x2, y2), arrowstyle="-|>",
-                                     mutation_scale=12, color="#555555", linewidth=1.2))
-
-    inputs = [
-        ("landmarks\n(6,81,21)", "#cfe8ff"),
-        ("normalized\n(6,81,21)", "#cfe8ff"),
-        ("differences\n(6,80,21)", "#ffe1c4"),
-        ("features\n(81,31)", "#d9f2d9"),
-    ]
-    in_x = [0.3, 3.3, 6.3, 9.3]
-    in_centers = []
-    for x, (label, color) in zip(in_x, inputs):
-        cx, by, cx2, ty = box(x, 6.4, 2.6, 0.9, label, color)
-        in_centers.append((cx, by))
-
-    proc_labels = ["ST-GCN stream", "ST-GCN stream", "ST-GCN stream", "Transformer branch"]
-    proc_colors = ["#cfe8ff", "#cfe8ff", "#ffe1c4", "#d9f2d9"]
-    proc_centers = []
-    for x, label, color, (icx, iby) in zip(in_x, proc_labels, proc_colors, in_centers):
-        cx, by, cx2, ty = box(x, 4.9, 2.6, 0.9, label, color, fontsize=8)
-        arrow(icx, iby, cx, ty)
-        proc_centers.append((cx, by))
-
-    ccx, cby, ccx2, cty = box(4.5, 3.4, 4.0, 0.9,
-                              "Combiner (concat -> MLP)\n-> hidden_size embedding", "#f5d0d0")
-    for cx, by in proc_centers:
-        arrow(cx, by, ccx, cty)
-
-    m1x, m1y, m1x2, m1y2 = box(4.5, 2.1, 4.0, 0.9,
-                               f"MoE layer 1\n(router + top-{cfg['k']} experts)", "#e6d0f5")
-    arrow(ccx, cby, m1x, m1y2)
-    m2x, m2y, m2x2, m2y2 = box(4.5, 1.1, 4.0, 0.9,
-                               f"MoE layer 2\n(router + top-{cfg['k']} experts)", "#e6d0f5")
-    arrow(m1x, m1y, m2x, m2y2)
-    box(4.5, 0.1, 4.0, 0.7, "Linear classifier -> 13 classes", "#ffe8a3")
-
-    ax.set_xlim(0, 13)
-    ax.set_ylim(-0.1, 7.6)
-    plt.title("GestureMultiStreamMoEModel - multi-stream ST-GCN/Transformer + MoE head", fontsize=12)
-    plt.tight_layout()
-    save_and_show("06_architecture_diagram")
-
-    A = build_adjacency(21).to(device)
-    model_probe = GestureMultiStreamMoEModel(
-        num_classes=NUM_CLASSES, A=A,
-        num_blocks=cfg['num_blocks'],
-        transformer_embed_dim=cfg['transformer_embed_dim'],
-        transformer_heads=cfg['transformer_heads'],
-        transformer_layers=cfg['transformer_layers'],
-        transformer_mlp_ratio=cfg['transformer_mlp_ratio'],
-        hidden_size=cfg['hidden_size'],
-        num_experts=cfg['num_experts'],
-        k=cfg['k'],
-        num_moe_layers=cfg['num_moe_layers'],
-        dropout=cfg['dropout'],
-        drop_path_rate=cfg['drop_path_rate']
-    ).to(device)
-
-    blocks = {
-        "backbone": model_probe.backbone,
-        "moe_layers": model_probe.moe_layers,
-        "layer_norm": model_probe.layer_norm,
-        "classifier": model_probe.classifier,
-    }
-    names, counts = [], []
-    print(f"{'Block':<15}{'Parameters':>15}")
-    print("-" * 30)
-    for name, block in blocks.items():
-        total, _ = count_parameters(block)
-        print(f"{name:<15}{total:>15,}")
-        names.append(name)
-        counts.append(total)
-    total_params, trainable_params = count_parameters(model_probe)
-    print("-" * 30)
-    print(f"{'TOTAL':<15}{total_params:>15,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-
-    plt.figure(figsize=(7, 4))
-    plt.bar(names, counts, color=["#cfe8ff", "#e6d0f5", "#d9f2d9", "#ffe8a3"])
-    plt.ylabel("Number of parameters")
-    plt.title("Parameter count per model block")
-    for i, c in enumerate(counts):
-        plt.text(i, c + max(counts) * 0.01, f"{c:,}", ha="center", fontsize=8)
-    plt.tight_layout()
-    save_and_show("07_parameter_count")
-
-    model_probe.eval()
-    b = 2
-    dummy_lm = torch.randn(b, 6, 81, 21, device=device)
-    dummy_norm = torch.randn(b, 6, 81, 21, device=device)
-    dummy_diff = torch.randn(b, 6, 80, 21, device=device)
-    dummy_feat = torch.randn(b, 81, 31, device=device)
-    with torch.no_grad():
-        logits, info = model_probe(dummy_lm, dummy_norm, dummy_diff, dummy_feat)
-    print(f"Output logits shape: {tuple(logits.shape)}  (expected: ({b}, {NUM_CLASSES}))")
-    print(f"Aux loss (load balancing): {float(info['aux_loss']):.4f}")
-
-    del model_probe
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-
-def plot_training_curves(history, run_id):
-    """Plot training and validation loss/accuracy curves."""
-    if not MAKE_PLOTS or len(history["train_loss"]) == 0:
-        return
-    epochs_range = range(1, len(history["train_loss"]) + 1)
-    fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
-
-    axes[0].plot(epochs_range, history["train_loss"], label="Train", marker="o", markersize=3)
-    axes[0].plot(epochs_range, history["val_loss"], label="Validation", marker="o", markersize=3)
-    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Focal loss")
-    axes[0].set_title("Main classification loss")
-    axes[0].legend()
-
-    axes[1].plot(epochs_range, history["train_aux_loss"], label="Train", marker="o", markersize=3)
-    axes[1].plot(epochs_range, history["val_aux_loss"], label="Validation", marker="o", markersize=3)
-    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Aux loss")
-    axes[1].set_title("MoE load-balancing auxiliary loss")
-    axes[1].legend()
-
-    axes[2].plot(epochs_range, history["train_acc"], label="Train", marker="o", markersize=3)
-    axes[2].plot(epochs_range, history["val_acc"], label="Validation", marker="o", markersize=3)
-    axes[2].set_xlabel("Epoch"); axes[2].set_ylabel("Accuracy (%)")
-    axes[2].set_title("Classification accuracy")
-    axes[2].legend()
-
-    plt.tight_layout()
-    save_and_show(f"08_training_curves_run{run_id}")
-
-
-def plot_val_evaluation(val_preds, val_targets, run_id):
-    """Generate confusion matrix and per-class metrics for validation set."""
-    if not MAKE_PLOTS:
-        return
-    val_preds = np.array(val_preds) + 1
-    val_targets = np.array(val_targets) + 1
-    class_labels = sorted(np.unique(val_targets))
-    print(f"[Run {run_id}] Validation accuracy: {(val_preds == val_targets).mean() * 100:.2f}%")
-
-    cm = confusion_matrix(val_targets, val_preds, labels=class_labels)
-    plt.figure(figsize=(8, 6.5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                xticklabels=class_labels, yticklabels=class_labels, cbar=True)
-    plt.xlabel("Predicted class")
-    plt.ylabel("True class")
-    plt.title(f"Confusion matrix - validation set (run {run_id})")
-    plt.tight_layout()
-    save_and_show(f"09_confusion_matrix_run{run_id}")
-
-    precision, recall, f1, support = precision_recall_fscore_support(
-        val_targets, val_preds, labels=class_labels, zero_division=0
-    )
-    metrics_df = pd.DataFrame({
-        "class": class_labels, "precision": precision,
-        "recall": recall, "f1_score": f1, "support": support,
-    })
-    print(metrics_df.to_string(index=False))
-    print("\nFull classification report:")
-    print(classification_report(val_targets, val_preds, labels=class_labels, zero_division=0))
-
-    x = np.arange(len(class_labels))
-    width = 0.25
-    plt.figure(figsize=(11, 4.5))
-    plt.bar(x - width, precision, width, label="Precision", color="#1f77b4")
-    plt.bar(x, recall, width, label="Recall", color="#ff7f0e")
-    plt.bar(x + width, f1, width, label="F1-score", color="#2ca02c")
-    plt.xticks(x, class_labels)
-    plt.xlabel("Gesture class"); plt.ylabel("Score"); plt.ylim(0, 1.05)
-    plt.title(f"Per-class precision / recall / F1-score - validation set (run {run_id})")
-    plt.legend()
-    plt.tight_layout()
-    save_and_show(f"10_prf_per_class_run{run_id}")
-
-    macro_f1 = f1.mean()
-    weighted_f1 = np.average(f1, weights=support)
-    print(f"Macro-average F1: {macro_f1:.4f}")
-    print(f"Weighted-average F1: {weighted_f1:.4f}")
-
-
-"""
-BLOCK 14: DATASET AND TRAINING/EVALUATION FUNCTIONS
-----------------------------------------------------
-PyTorch Dataset class for handling multi-stream inputs and functions for
-model evaluation, sequence transformations, and the main training loop.
-The training loop includes:
-- Advanced data augmentation with class balancing
-- Feature standardization using StandardScaler
-- Training with Focal Loss, AdamW optimizer, and cosine annealing
-- EMA weight averaging for stable evaluation
-- Early stopping based on validation accuracy
-- Comprehensive logging to wandb and console
-"""
 class HandGestureMultiStreamDataset(Dataset):
-    """PyTorch Dataset for multi-stream hand gesture data."""
     def __init__(self, landmark_in, norm_in, diff_in, feat_in, labels=None):
         self.landmark_in = torch.FloatTensor(landmark_in)
         self.norm_in = torch.FloatTensor(norm_in)
@@ -1429,29 +711,25 @@ class HandGestureMultiStreamDataset(Dataset):
 
 
 def evaluate(model, loader, criterion, aux_loss_weight):
-    """Evaluate model on a data loader, returning accuracy, losses, and predictions."""
     model.eval()
-    correct, total, running_loss, running_aux = 0, 0, 0.0, 0.0
+    correct, total, running_loss = 0, 0, 0.0
     all_preds, all_targets = [], []
     with torch.no_grad():
         for inputs, targets in loader:
             landmark_in, norm_in, diff_in, feat_in = [inp.to(device) for inp in inputs]
             targets = targets.to(device)
             outputs, moe_info = model(landmark_in, norm_in, diff_in, feat_in)
-            main_loss = criterion(outputs, targets)
-            running_loss += main_loss.item()
-            running_aux += moe_info['aux_loss'].item()
+            loss = criterion(outputs, targets) + aux_loss_weight * moe_info['aux_loss']
+            running_loss += loss.item()
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
             all_preds.extend(predicted.cpu().numpy())
             all_targets.extend(targets.cpu().numpy())
-    return (100. * correct / total, running_loss / len(loader),
-            running_aux / len(loader), np.array(all_preds), np.array(all_targets))
+    return 100. * correct / total, running_loss / len(loader), np.array(all_preds), np.array(all_targets)
 
 
 def rotate_sequence(seq, ang, axis):
-    """Apply 3D rotation to a numpy sequence for TTA."""
     out = seq.copy()
     if axis == 0:
         R = np.array([
@@ -1477,226 +755,362 @@ def rotate_sequence(seq, ang, axis):
 
 
 def scale_sequence(seq, scale):
-    """Apply scaling to a sequence for TTA."""
     return seq * scale
 
 
-def build_tta_inputs(landmarks_batch, scaler):
-    """Build model inputs from a batch of landmarks for TTA."""
-    lm, norm, diff_, feat = create_features(landmarks_batch, with_normalized=True)
-    feat = scaler.transform(feat.reshape(-1, 31)).reshape(feat.shape)
-    landmark_in = prepare_graph_stream(lm)
-    norm_in = prepare_graph_stream(norm)
-    diff_in = prepare_graph_stream(diff_)
-    landmark_in = torch.FloatTensor(landmark_in).to(device)
-    norm_in = torch.FloatTensor(norm_in).to(device)
-    diff_in = torch.FloatTensor(diff_in).to(device)
-    feat = torch.FloatTensor(feat).to(device)
-    return landmark_in, norm_in, diff_in, feat
+TTA_CONFIGS_INFERENCE = [
+    {"angle": 0.0, "axis": 2, "scale": 1.00},
+    {"angle": np.pi/18, "axis": 2, "scale": 1.00},
+    {"angle": -np.pi/18, "axis": 2, "scale": 1.00},
+    {"angle": np.pi/36, "axis": 1, "scale": 1.05},
+    {"angle": -np.pi/36, "axis": 1, "scale": 0.95},
+    {"angle": np.pi/24, "axis": 0, "scale": 1.00},
+    {"angle": -np.pi/24, "axis": 0, "scale": 1.00},
+]
+
+_model_cache = {}
+_scaler_cache = {}
 
 
-def train_single_config(run_id, cfg, train_landmarks_raw, train_labels_raw, val_landmarks_raw, val_labels):
-    """
-    Train a single model configuration with the complete pipeline:
-    augmentation -> feature extraction -> training -> evaluation -> plotting.
-    """
-    print(f"\n========== RUN {run_id}: {cfg['name']} ==========")
-    print(cfg)
-
-    torch.manual_seed(cfg.get('seed', 42) + run_id)
-    np.random.seed(cfg.get('seed', 42) + run_id)
-
-    target_count = cfg.get('target_count', 450)
-
-    train_landmarks_aug, train_labels_aug = augment_data_balanced_advanced(
-        train_landmarks_raw, train_labels_raw, target_count=target_count
-    )
-
-    train_landmarks_f, train_normalized_f, train_differences_f, train_features_f = create_features(
-        train_landmarks_aug, with_normalized=True
-    )
-    val_landmarks_f, val_normalized_f, val_differences_f, val_features_f = create_features(
-        val_landmarks_raw, with_normalized=True
-    )
-
-    scaler = StandardScaler()
-    train_features_reshaped = train_features_f.reshape(-1, 31)
-    scaler.fit(train_features_reshaped)
-
-    scaler_path = f'scaler_run{run_id}.pkl'
-    with open(scaler_path, 'wb') as f:
-        pickle.dump(scaler, f)
-    print(f"Scaler saved: {scaler_path}")
-
-    train_features_f = scaler.transform(train_features_reshaped).reshape(train_features_f.shape)
-    val_features_f = scaler.transform(val_features_f.reshape(-1, 31)).reshape(val_features_f.shape)
-
-    train_landmark_in = prepare_graph_stream(train_landmarks_f)
-    train_norm_in = prepare_graph_stream(train_normalized_f)
-    train_diff_in = prepare_graph_stream(train_differences_f)
-    val_landmark_in = prepare_graph_stream(val_landmarks_f)
-    val_norm_in = prepare_graph_stream(val_normalized_f)
-    val_diff_in = prepare_graph_stream(val_differences_f)
-
-    train_dataset = HandGestureMultiStreamDataset(
-        train_landmark_in, train_norm_in, train_diff_in, train_features_f, train_labels_aug
-    )
-    val_dataset = HandGestureMultiStreamDataset(
-        val_landmark_in, val_norm_in, val_diff_in, val_features_f, val_labels
-    )
-
-    train_loader = DataLoader(train_dataset, batch_size=cfg['batch_size'], shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=cfg['batch_size'], shuffle=False, num_workers=0)
-
+def load_model_for_run(run_id):
+    if run_id in _model_cache:
+        return _model_cache[run_id]
+    model_path = f"best_model_run{run_id}.pth"
+    cfg = CONFIGS[0]
     A = build_adjacency(21).to(device)
-    alpha = compute_focal_alpha(train_labels_aug.astype(int), NUM_CLASSES, device)
-
     model = GestureMultiStreamMoEModel(
         num_classes=NUM_CLASSES, A=A,
-        num_blocks=cfg['num_blocks'],
-        transformer_embed_dim=cfg['transformer_embed_dim'],
-        transformer_heads=cfg['transformer_heads'],
-        transformer_layers=cfg['transformer_layers'],
-        transformer_mlp_ratio=cfg['transformer_mlp_ratio'],
-        hidden_size=cfg['hidden_size'],
-        num_experts=cfg['num_experts'],
-        k=cfg['k'],
-        num_moe_layers=cfg['num_moe_layers'],
-        dropout=cfg['dropout'],
-        drop_path_rate=cfg['drop_path_rate']
+        num_blocks=[int(x) for x in cfg['num_blocks']],
+        transformer_embed_dim=int(cfg['transformer_embed_dim']),
+        transformer_heads=int(cfg['transformer_heads']),
+        transformer_layers=int(cfg['transformer_layers']),
+        transformer_mlp_ratio=float(cfg['transformer_mlp_ratio']),
+        hidden_size=int(cfg['hidden_size']),
+        num_experts=int(cfg['num_experts']),
+        k=int(cfg['k']),
+        num_moe_layers=int(cfg['num_moe_layers']),
+        dropout=float(cfg['dropout']),
+        drop_path_rate=float(cfg['drop_path_rate'])
     ).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    _model_cache[run_id] = model
+    return model
 
-    ema_model = GestureMultiStreamMoEModel(
-        num_classes=NUM_CLASSES, A=A,
-        num_blocks=cfg['num_blocks'],
-        transformer_embed_dim=cfg['transformer_embed_dim'],
-        transformer_heads=cfg['transformer_heads'],
-        transformer_layers=cfg['transformer_layers'],
-        transformer_mlp_ratio=cfg['transformer_mlp_ratio'],
-        hidden_size=cfg['hidden_size'],
-        num_experts=cfg['num_experts'],
-        k=cfg['k'],
-        num_moe_layers=cfg['num_moe_layers'],
-        dropout=cfg['dropout'],
-        drop_path_rate=cfg['drop_path_rate']
-    ).to(device)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Run {run_id} total parameters: {total_params:,}")
+def load_scaler_for_run(run_id):
+    if run_id in _scaler_cache:
+        return _scaler_cache[run_id]
+    scaler_path = f"scaler_best_run{run_id}.pkl"
+    with open(scaler_path, 'rb') as f:
+        scaler = pickle.load(f)
+    _scaler_cache[run_id] = scaler
+    return scaler
 
-    criterion = FocalLoss(alpha=alpha, gamma=cfg['focal_gamma'], label_smoothing=cfg['label_smoothing'])
-    optimizer = optim.AdamW(model.parameters(), lr=cfg['learning_rate'], weight_decay=cfg['weight_decay'])
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=cfg['T_0'], T_mult=1, eta_min=1e-6)
-    ema = EMA(model, decay=cfg['ema_decay'])
 
-    history = {
-        "train_loss": [], "train_aux_loss": [], "train_acc": [],
-        "val_loss": [], "val_aux_loss": [], "val_acc": [],
-    }
+def compute_class_best_runs_automatic():
+    print("\n" + "="*60)
+    print("CALCUL AUTOMATIQUE DES MEILLEURS RUNS PAR CLASSE")
+    print("="*60)
+    
+    train_landmarks, train_labels = load_train_data()
+    train_landmarks = scale_normalize(train_landmarks)
+    
+    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+    folds = list(skf.split(train_landmarks, train_labels.astype(int)))
+    
+    fold_f1_scores = np.zeros((N_FOLDS, NUM_CLASSES))
+    fold_precision = np.zeros((N_FOLDS, NUM_CLASSES))
+    fold_recall = np.zeros((N_FOLDS, NUM_CLASSES))
+    
+    for fold_idx in range(N_FOLDS):
+        run_id = fold_idx + 1
+        model_path = f"best_model_run{run_id}.pth"
+        if not os.path.exists(model_path):
+            print(f"  ⚠️  Run {run_id} non trouvé, skip...")
+            continue
+        
+        print(f"\n  Évaluation Run {run_id} sur son set de validation...")
+        model = load_model_for_run(run_id)
+        scaler = load_scaler_for_run(run_id)
+        
+        _, val_idx = folds[fold_idx]
+        val_landmarks = train_landmarks[val_idx]
+        val_labels = train_labels[val_idx].astype(int)
+        
+        all_preds = []
+        all_targets = []
+        
+        for i in tqdm(range(0, len(val_landmarks), 32), desc=f"    Run {run_id}", leave=False):
+            batch = val_landmarks[i:i+32]
+            batch_labels = val_labels[i:i+32]
+            
+            probs_list = []
+            for angle in [0, np.pi/18, -np.pi/18]:
+                aug = batch.copy()
+                if angle != 0:
+                    for j in range(len(aug)):
+                        aug[j] = rotate_sequence(aug[j], angle, 2)
+                
+                lm, norm, diff_, feat = create_features(aug, with_normalized=True)
+                feat = scaler.transform(feat.reshape(-1, 31)).reshape(feat.shape)
+                
+                landmark_in = torch.FloatTensor(prepare_graph_stream(lm)).to(device)
+                norm_in = torch.FloatTensor(prepare_graph_stream(norm)).to(device)
+                diff_in = torch.FloatTensor(prepare_graph_stream(diff_)).to(device)
+                feat_in = torch.FloatTensor(feat).to(device)
+                
+                with torch.no_grad():
+                    outputs, _ = model(landmark_in, norm_in, diff_in, feat_in)
+                    probs_list.append(F.softmax(outputs, dim=1).cpu().numpy())
+            
+            avg_probs = np.mean(probs_list, axis=0)
+            preds = np.argmax(avg_probs, axis=1)
+            
+            all_preds.extend(preds)
+            all_targets.extend(batch_labels - 1)
+        
+        all_preds = np.array(all_preds)
+        all_targets = np.array(all_targets)
+        
+        for cls in range(NUM_CLASSES):
+            tp = np.sum((all_preds == cls) & (all_targets == cls))
+            fp = np.sum((all_preds == cls) & (all_targets != cls))
+            fn = np.sum((all_preds != cls) & (all_targets == cls))
+            
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+            
+            fold_f1_scores[fold_idx, cls] = f1
+            fold_precision[fold_idx, cls] = precision
+            fold_recall[fold_idx, cls] = recall
+        
+        acc = (all_preds == all_targets).mean() * 100
+        print(f"    Accuracy globale: {acc:.2f}%")
+    
+    class_best_runs_weighted = {}
+    
+    print("\n" + "="*60)
+    print("MEILLEURS RUNS PAR CLASSE (AVEC POIDS)")
+    print("="*60)
+    
+    for cls in range(NUM_CLASSES):
+        f1_scores = fold_f1_scores[:, cls]
+        sorted_folds = np.argsort(f1_scores)[::-1]
+        
+        runs_with_weights = []
+        total_f1 = f1_scores.sum()
+        
+        for fold_idx in sorted_folds:
+            run_id = fold_idx + 1
+            f1 = f1_scores[fold_idx]
+            
+            if f1 > 0:
+                weight = f1 / total_f1 if total_f1 > 0 else 1.0
+                runs_with_weights.append((run_id, weight))
+        
+        class_best_runs_weighted[cls + 1] = runs_with_weights
+        
+        print(f"\n  Classe {cls+1:2d}:")
+        for run_id, weight in runs_with_weights:
+            f1 = fold_f1_scores[run_id-1, cls]
+            prec = fold_precision[run_id-1, cls]
+            rec = fold_recall[run_id-1, cls]
+            print(f"    Run {run_id}: F1={f1:.4f}, Prec={prec:.4f}, Rec={rec:.4f}, Poids={weight:.4f}")
+    
+    class_best_runs_simple = {cls: [r[0] for r in runs] 
+                              for cls, runs in class_best_runs_weighted.items()}
+    
+    print("\n" + "="*60)
+    print("DICTIONNAIRE CLASS_BEST_RUNS (simple) :")
+    print("="*60)
+    print("CLASS_BEST_RUNS = {")
+    for cls in range(1, NUM_CLASSES+1):
+        runs = class_best_runs_simple[cls]
+        print(f"    {cls}: {runs},")
+    print("}")
+    
+    return class_best_runs_weighted, class_best_runs_simple
 
-    best_val_acc = 0.0
-    best_train_acc = 0.0
-    best_epoch = 0
-    patience_counter = 0
-    save_path = f'best_model_run{run_id}.pth'
 
-    for epoch in range(cfg['epochs']):
-        model.train()
-        correct, total, running_loss, running_aux = 0, 0, 0.0, 0.0
+def get_ambiguous_samples(probs_matrix, margin_threshold=CONFIDENCE_MARGIN_THRESHOLD, top_k=TOP_K_CANDIDATES):
+    sorted_probs = np.sort(probs_matrix, axis=1)[:, ::-1]
+    top1 = sorted_probs[:, 0]
+    top2 = sorted_probs[:, 1]
+    margin = top1 - top2
+    is_ambiguous = margin < margin_threshold
 
-        for inputs, targets in train_loader:
-            landmark_in, norm_in, diff_in, feat_in = [inp.to(device) for inp in inputs]
-            targets = targets.to(device)
-
-            optimizer.zero_grad()
-            outputs, moe_info = model(landmark_in, norm_in, diff_in, feat_in)
-            main_loss = criterion(outputs, targets)
-            total_loss = main_loss + cfg['aux_loss_weight'] * moe_info['aux_loss']
-            total_loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            ema.update(model)
-
-            running_loss += main_loss.item()
-            running_aux += moe_info['aux_loss'].item()
-            _, predicted = outputs.max(1)
-            total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
-
-        scheduler.step()
-        train_acc = 100. * correct / total
-        train_loss = running_loss / len(train_loader)
-        train_aux = running_aux / len(train_loader)
-
-        ema_model.load_state_dict(ema.state_dict())
-        val_acc, val_loss, val_aux, _, _ = evaluate(ema_model, val_loader, criterion, cfg['aux_loss_weight'])
-
-        history["train_loss"].append(train_loss)
-        history["train_aux_loss"].append(train_aux)
-        history["train_acc"].append(train_acc)
-        history["val_loss"].append(val_loss)
-        history["val_aux_loss"].append(val_aux)
-        history["val_acc"].append(val_acc)
-
-        wandb.log({
-            'run_id': run_id, 'epoch': epoch + 1,
-            'train_loss': train_loss, 'train_aux_loss': train_aux, 'train_accuracy': train_acc,
-            'val_loss': val_loss, 'val_aux_loss': val_aux, 'val_accuracy': val_acc,
+    ambiguous_info = []
+    for idx in np.where(is_ambiguous)[0]:
+        top_k_classes = np.argsort(probs_matrix[idx])[::-1][:top_k] + 1
+        ambiguous_info.append({
+            'sample_idx': int(idx),
+            'candidates': top_k_classes.tolist(),
+            'margin': float(margin[idx])
         })
-
-        print(f'Run {run_id} Epoch {epoch+1}/{cfg["epochs"]}: '
-              f'Train Loss {train_loss:.4f} Acc {train_acc:.2f}% | '
-              f'EMA Val Loss {val_loss:.4f} Acc {val_acc:.2f}%')
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_train_acc = train_acc
-            best_epoch = epoch + 1
-            patience_counter = 0
-            torch.save(ema_model.state_dict(), save_path)
-            with open(f'scaler_best_run{run_id}.pkl', 'wb') as f:
-                pickle.dump(scaler, f)
-        else:
-            patience_counter += 1
-            if patience_counter >= cfg['patience']:
-                print(f'Run {run_id} early stopping at epoch {epoch+1}')
-                break
-
-    plot_training_curves(history, run_id)
-
-    if os.path.exists(save_path):
-        ema_model.load_state_dict(torch.load(save_path, map_location=device))
-        _, _, _, val_preds, val_targets = evaluate(ema_model, val_loader, criterion, cfg['aux_loss_weight'])
-        plot_val_evaluation(val_preds, val_targets, run_id)
-
-    del model
-    torch.cuda.empty_cache()
-
-    return {
-        'run_id': run_id,
-        'name': cfg['name'],
-        'best_epoch': best_epoch,
-        'best_train_acc': best_train_acc,
-        'best_val_acc': best_val_acc,
-        'save_path': save_path,
-        'scaler_path': f'scaler_best_run{run_id}.pkl',
-        'total_params': total_params,
-        **cfg
-    }
+    return ambiguous_info
 
 
-"""
-BLOCK 15: CONFIGURATION AND MAIN EXECUTION
--------------------------------------------
-Defines the base configuration and orchestrates the entire pipeline:
-- Training mode: Runs 5-fold cross-validation or single train/val split
-- Inference mode: Loads 5 trained models and performs ensemble prediction
-  with Test-Time Augmentation (TTA) for robust final predictions
+def predict_single_sample_with_weighted_runs(landmarks_sample, run_ids_with_weights, use_tta=True):
+    batch = landmarks_sample[np.newaxis, ...]
+    
+    all_probs = []
+    all_weights = []
+    
+    for run_id, weight in run_ids_with_weights:
+        model = load_model_for_run(run_id)
+        scaler = load_scaler_for_run(run_id)
+        
+        configs = TTA_CONFIGS_INFERENCE if use_tta else [{"angle": 0.0, "axis": 2, "scale": 1.0}]
+        probs_tta = []
+        
+        for cfg_tta in configs:
+            aug = batch.copy()
+            aug[0] = rotate_sequence(aug[0], cfg_tta["angle"], cfg_tta["axis"])
+            aug[0] = scale_sequence(aug[0], cfg_tta["scale"])
+            
+            lm, norm, diff_, feat = create_features(aug, with_normalized=True)
+            feat = scaler.transform(feat.reshape(-1, 31)).reshape(feat.shape)
+            
+            landmark_in = torch.FloatTensor(prepare_graph_stream(lm)).to(device)
+            norm_in = torch.FloatTensor(prepare_graph_stream(norm)).to(device)
+            diff_in = torch.FloatTensor(prepare_graph_stream(diff_)).to(device)
+            feat_in = torch.FloatTensor(feat).to(device)
+            
+            with torch.no_grad():
+                outputs, _ = model(landmark_in, norm_in, diff_in, feat_in)
+                probs_tta.append(F.softmax(outputs, dim=1).cpu().numpy())
+        
+        avg_tta = np.mean(probs_tta, axis=0)
+        all_probs.append(avg_tta[0] * weight)
+        all_weights.append(weight)
+    
+    ensemble_probs = np.sum(all_probs, axis=0) / np.sum(all_weights)
+    return ensemble_probs
 
-The TTA applies 7 different transformations (rotations ±10°, ±5°, scaling)
-and averages predictions across all models and transformations.
-"""
+
+def run_first_pass_ensemble_with_probs(test_landmarks):
+    print("\n" + "="*60)
+    print("PREMIÈRE PASSE : ENSEMBLE GLOBAL")
+    print("="*60)
+    
+    available_runs = []
+    for run_id in range(1, 6):
+        if os.path.exists(f"best_model_run{run_id}.pth"):
+            available_runs.append(run_id)
+    
+    print(f"Runs disponibles : {available_runs}")
+    
+    models = [load_model_for_run(r) for r in available_runs]
+    scalers = [load_scaler_for_run(r) for r in available_runs]
+    
+    batch_size = 32
+    all_preds = []
+    all_probs = []
+    
+    for start in tqdm(range(0, len(test_landmarks), batch_size), desc="First pass"):
+        batch_landmarks = test_landmarks[start:start + batch_size]
+        model_probs = []
+        
+        for model, scaler in zip(models, scalers):
+            probs_tta = []
+            for cfg_tta in TTA_CONFIGS_INFERENCE:
+                aug = batch_landmarks.copy()
+                for i in range(len(aug)):
+                    aug[i] = rotate_sequence(aug[i], cfg_tta["angle"], cfg_tta["axis"])
+                    aug[i] = scale_sequence(aug[i], cfg_tta["scale"])
+                
+                lm, norm, diff_, feat = create_features(aug, with_normalized=True)
+                feat = scaler.transform(feat.reshape(-1, 31)).reshape(feat.shape)
+                
+                landmark_in = torch.FloatTensor(prepare_graph_stream(lm)).to(device)
+                norm_in = torch.FloatTensor(prepare_graph_stream(norm)).to(device)
+                diff_in = torch.FloatTensor(prepare_graph_stream(diff_)).to(device)
+                feat_in = torch.FloatTensor(feat).to(device)
+                
+                with torch.no_grad():
+                    outputs, _ = model(landmark_in, norm_in, diff_in, feat_in)
+                    probs_tta.append(F.softmax(outputs, dim=1))
+            
+            model_probs.append(torch.stack(probs_tta).mean(0))
+        
+        ensemble_probs = torch.stack(model_probs).mean(0)
+        pred = ensemble_probs.argmax(1)
+        all_preds.extend(pred.cpu().numpy())
+        all_probs.append(ensemble_probs.cpu().numpy())
+    
+    all_probs = np.concatenate(all_probs, axis=0)
+    return np.array(all_preds) + 1, all_probs
+
+
+def run_second_pass_weighted_disambiguation(test_landmarks, first_pass_predictions, 
+                                             first_pass_probs, class_best_runs_weighted):
+    print("\n" + "="*60)
+    print("SECONDE PASSE : DÉSAMBIGUÏSATION PONDÉRÉE")
+    print("="*60)
+    
+    ambiguous_info = get_ambiguous_samples(first_pass_probs)
+    print(f"Échantillons ambigus : {len(ambiguous_info)} / {len(test_landmarks)} "
+          f"({100 * len(ambiguous_info) / len(test_landmarks):.2f}%)")
+    
+    corrected_predictions = first_pass_predictions.copy()
+    n_changed = 0
+    change_log = []
+    
+    for info in tqdm(ambiguous_info, desc="Disambiguation"):
+        idx = info['sample_idx']
+        candidates = info['candidates']
+        original_pred = int(first_pass_predictions[idx])
+        
+        expert_runs_with_weights = []
+        seen_runs = set()
+        
+        for cls in candidates:
+            if cls in class_best_runs_weighted:
+                for run_id, weight in class_best_runs_weighted[cls]:
+                    if run_id not in seen_runs:
+                        expert_runs_with_weights.append((run_id, weight))
+                        seen_runs.add(run_id)
+        
+        if not expert_runs_with_weights:
+            continue
+        
+        probs = predict_single_sample_with_weighted_runs(
+            test_landmarks[idx], expert_runs_with_weights, use_tta=True
+        )
+        
+        candidate_mask = np.zeros(NUM_CLASSES, dtype=bool)
+        for cls in candidates:
+            candidate_mask[cls - 1] = True
+        
+        restricted_probs = np.where(candidate_mask, probs, -1)
+        new_pred = int(np.argmax(restricted_probs)) + 1
+        
+        if new_pred != original_pred:
+            n_changed += 1
+            change_log.append({
+                'sample_idx': idx,
+                'original_pred': original_pred,
+                'corrected_pred': new_pred,
+                'candidates': candidates,
+                'margin_pass1': info['margin'],
+                'experts_consulted': [r for r, _ in expert_runs_with_weights],
+                'confidence_new': float(probs[new_pred - 1])
+            })
+            corrected_predictions[idx] = new_pred
+    
+    print(f"\nÉchantillons corrigés : {n_changed} / {len(ambiguous_info)}")
+    
+    if change_log:
+        change_df = pd.DataFrame(change_log)
+        print("\nDétail des corrections :")
+        print(change_df.to_string(index=False))
+        change_df.to_csv('second_pass_weighted_disambiguation.csv', index=False)
+    
+    return corrected_predictions
+
+
 BASE = {
     'batch_size': 32,
     'epochs': 150,
@@ -1724,1896 +1138,64 @@ BASE = {
 }
 
 CONFIGS = [
-    {**BASE, 'name': 'fixed_v2_advanced_aug', 'learning_rate': 1e-4, 'target_count': 800},
+    {**BASE, 'name': 'fixed_v2', 'learning_rate': 1e-4, 'target_count': 800},
 ]
+
 
 if __name__ == "__main__":
     if not INFERENCE_ONLY:
-        # TRAINING MODE
         print("Loading training data...")
         train_landmarks, train_labels = load_train_data()
         print(f"train_landmarks shape: {train_landmarks.shape}")
-
-        plot_data_exploration(train_landmarks, train_labels)
-        plot_augmentation_effect(train_landmarks, train_labels, CONFIGS[0]['target_count'])
-        plot_model_complexity(CONFIGS[0])
-
-        train_landmarks = scale_normalize(train_landmarks)
-
-        if USE_KFOLD:
-            print(f"\nUsing {N_FOLDS}-fold cross-validation")
-            skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
-            all_val_scores = []
-
-            for fold, (train_idx, val_idx) in enumerate(skf.split(train_landmarks, train_labels.astype(int))):
-                print(f"\n{'='*60}")
-                print(f"FOLD {fold+1}/{N_FOLDS}")
-                print(f"{'='*60}")
-
-                train_fold_landmarks = train_landmarks[train_idx]
-                train_fold_labels = train_labels[train_idx]
-                val_fold_landmarks = train_landmarks[val_idx]
-                val_fold_labels = train_labels[val_idx]
-
-                cfg = CONFIGS[0].copy()
-                cfg['name'] = f"{cfg['name']}_fold{fold+1}"
-
-                res = train_single_config(
-                    fold+1, cfg, train_fold_landmarks, train_fold_labels,
-                    val_fold_landmarks, val_fold_labels
-                )
-                all_val_scores.append(res['best_val_acc'])
-
-            print(f"\n{'='*60}")
-            print(f"CROSS-VALIDATION RESULTS ({N_FOLDS}-FOLD)")
-            print(f"{'='*60}")
-            print(f"Scores per fold: {[f'{s:.2f}%' for s in all_val_scores]}")
-            print(f"Mean: {np.mean(all_val_scores):.2f}% +/- {np.std(all_val_scores):.2f}%")
-
-        else:
-            indices = np.arange(len(train_landmarks))
-            train_idx, val_idx = train_test_split(
-                indices, test_size=0.1, random_state=42, stratify=train_labels.astype(int)
-            )
-
-            raw_train_landmarks = train_landmarks[train_idx]
-            raw_train_labels = train_labels[train_idx]
-            val_landmarks_raw = train_landmarks[val_idx]
-            val_labels = train_labels[val_idx]
-
-            print(f"Train raw samples: {len(train_idx)} | Validation samples: {len(val_idx)}")
-
-            results = []
-            for i, cfg in enumerate(CONFIGS, start=1):
-                res = train_single_config(
-                    i, cfg, raw_train_landmarks, raw_train_labels, val_landmarks_raw, val_labels
-                )
-                results.append(res)
-
-            df = pd.DataFrame(results)
-            df_sorted = df.sort_values('best_val_acc', ascending=False).reset_index(drop=True)
-            print(f"\n=== RESULTS ===")
-            print(df_sorted[['run_id', 'name', 'best_val_acc', 'best_train_acc', 'best_epoch', 'total_params']].to_string(index=False))
-
-            best_row = df_sorted.iloc[0]
-            best_run_id = int(best_row['run_id'])
-            print(f"\nBEST MODEL: {best_row['name']} (run {best_run_id})")
-            print(f"Val acc: {float(best_row['best_val_acc']):.2f}%")
-            print(f"Weights: best_model_run{best_run_id}.pth")
-            print(f"Scaler: {best_row['scaler_path']}")
-
     else:
-        # INFERENCE MODE - Ensemble de plusieurs modèles (configurable) + TTA
         print("\n" + "="*60)
-        print(f"INFERENCE MODE WITH {len(ENSEMBLE_RUN_IDS)}-MODEL ENSEMBLE + TTA (runs {ENSEMBLE_RUN_IDS})")
+        print("MODE INFÉRENCE - DÉSAMBIGUÏSATION PONDÉRÉE AUTOMATIQUE")
         print("="*60)
-    
-        models = []
-        scalers = []
-    
-        for run_id in ENSEMBLE_RUN_IDS:
-            model_path = f"best_model_run{run_id}.pth"
-            scaler_path = f"scaler_best_run{run_id}.pkl"
-    
-            if not os.path.exists(model_path) or not os.path.exists(scaler_path):
-                print(f"Warning: Model or scaler for fold {run_id} missing, skipping...")
-                continue
-    
-            print(f"Loading model and scaler for fold {run_id}...")
-    
-            with open(scaler_path, 'rb') as f:
-                scaler = pickle.load(f)
-                scalers.append(scaler)
-    
-            cfg = CONFIGS[0].copy()
-            A = build_adjacency(21).to(device)
-    
-            model = GestureMultiStreamMoEModel(
-                num_classes=NUM_CLASSES, A=A,
-                num_blocks=[int(x) for x in cfg['num_blocks']],
-                transformer_embed_dim=int(cfg['transformer_embed_dim']),
-                transformer_heads=int(cfg['transformer_heads']),
-                transformer_layers=int(cfg['transformer_layers']),
-                transformer_mlp_ratio=float(cfg['transformer_mlp_ratio']),
-                hidden_size=int(cfg['hidden_size']),
-                num_experts=int(cfg['num_experts']),
-                k=int(cfg['k']),
-                num_moe_layers=int(cfg['num_moe_layers']),
-                dropout=float(cfg['dropout']),
-                drop_path_rate=float(cfg['drop_path_rate'])
-            ).to(device)
-    
-            model.load_state_dict(torch.load(model_path, map_location=device))
-            model.eval()
-            models.append(model)
-    
-        if not models:
-            raise RuntimeError("No models loaded. Check ENSEMBLE_RUN_IDS and model files.")
-    
-        print(f"Successfully loaded {len(models)} models (runs {[run_id for run_id in ENSEMBLE_RUN_IDS if os.path.exists(f'best_model_run{run_id}.pth')]})")
-    
-        print("Loading test data...")
+        
+        class_best_runs_weighted, class_best_runs_simple = compute_class_best_runs_automatic()
+        
+        print("\n" + "="*60)
+        print("CHARGEMENT DES DONNÉES DE TEST")
+        print("="*60)
         test_landmarks = load_test_data()
         test_landmarks = scale_normalize(test_landmarks)
-    
-        test_landmarks_f, test_normalized_f, test_differences_f, test_features_f = create_features(
-            test_landmarks, with_normalized=True
+        print(f"Échantillons de test : {len(test_landmarks)}")
+        
+        first_pass_predictions, first_pass_probs = run_first_pass_ensemble_with_probs(test_landmarks)
+        
+        submission_v1 = pd.DataFrame({
+            'Id': range(len(first_pass_predictions)),
+            'Gesture': first_pass_predictions
+        })
+        submission_v1.to_csv('submission_first_pass.csv', index=False)
+        print("\n✓ Première passe sauvegardée : submission_first_pass.csv")
+        print("Distribution première passe :")
+        print(pd.Series(first_pass_predictions).value_counts().sort_index())
+        
+        corrected_predictions = run_second_pass_weighted_disambiguation(
+            test_landmarks, first_pass_predictions, first_pass_probs, 
+            class_best_runs_weighted
         )
-    
-        print("Generating predictions with ensemble + TTA...")
-        predictions_ensemble = []
-    
-        tta_configs = [
-            {"angle": 0.0, "axis": 2, "scale": 1.00},
-            {"angle": np.pi/18, "axis": 2, "scale": 1.00},
-            {"angle": -np.pi/18, "axis": 2, "scale": 1.00},
-            {"angle": np.pi/36, "axis": 1, "scale": 1.05},
-            {"angle": -np.pi/36, "axis": 1, "scale": 0.95},
-            {"angle": np.pi/24, "axis": 0, "scale": 1.00},
-            {"angle": -np.pi/24, "axis": 0, "scale": 1.00},
-        ]
-    
-        batch_size = 32
-        all_probs = []
-    
-        for start in tqdm(range(0, len(test_landmarks), batch_size), desc="TTA + Ensemble Prediction"):
-            batch_landmarks = test_landmarks[start:start+batch_size]
-    
-            model_probs = []
-            for model_idx, model in enumerate(models):
-                scaler = scalers[model_idx]
-                probs_all = []
-    
-                for cfg_tta in tta_configs:
-                    aug = batch_landmarks.copy()
-    
-                    for i in range(len(aug)):
-                        aug[i] = rotate_sequence(aug[i], cfg_tta["angle"], cfg_tta["axis"])
-                        aug[i] = scale_sequence(aug[i], cfg_tta["scale"])
-    
-                    lm, norm, diff_, feat = create_features(aug, with_normalized=True)
-                    feat = scaler.transform(feat.reshape(-1, 31)).reshape(feat.shape)
-    
-                    landmark_in = torch.FloatTensor(prepare_graph_stream(lm)).to(device)
-                    norm_in = torch.FloatTensor(prepare_graph_stream(norm)).to(device)
-                    diff_in = torch.FloatTensor(prepare_graph_stream(diff_)).to(device)
-                    feat_in = torch.FloatTensor(feat).to(device)
-    
-                    with torch.no_grad():
-                        outputs, _ = model(landmark_in, norm_in, diff_in, feat_in)
-                        probs = F.softmax(outputs, dim=1)
-                        probs_all.append(probs)
-    
-                probs_all = torch.stack(probs_all)
-                avg_probs = probs_all.mean(0)
-                model_probs.append(avg_probs)
-    
-            if model_probs:
-                ensemble_probs = torch.stack(model_probs).mean(0)
-                pred = ensemble_probs.argmax(1)
-                all_probs.extend(pred.cpu().numpy())
-    
-        predictions = np.array(all_probs) + 1
-        submission = pd.DataFrame({'Id': range(len(predictions)), 'Gesture': predictions})
-        submission_file = f'submission_ensemble_runs{"_".join(map(str, ENSEMBLE_RUN_IDS))}.csv'
-        submission.to_csv(submission_file, index=False)
-        print(f"Submission saved: {submission_file}")
-        print(submission.head())
-        print(f"\nPrediction distribution:")
-        print(pd.Series(predictions).value_counts().sort_index())
-    
-        if MAKE_PLOTS:
-            pred_unique, pred_counts = np.unique(predictions, return_counts=True)
-            plt.figure(figsize=(9, 4))
-            plt.bar(pred_unique, pred_counts, color="#9467bd")
-            plt.xlabel("Predicted gesture class")
-            plt.ylabel("Number of test sequences")
-            plt.title(f"Predicted class distribution (ensemble runs {ENSEMBLE_RUN_IDS})")
-            plt.xticks(pred_unique)
-            plt.tight_layout()
-            save_and_show("11_test_prediction_distribution")
+        
+        submission_final = pd.DataFrame({
+            'Id': range(len(corrected_predictions)),
+            'Gesture': corrected_predictions
+        })
+        submission_final.to_csv('submission_final_weighted.csv', index=False)
+        
+        print("\n" + "="*60)
+        print("RÉSULTATS FINAUX")
+        print("="*60)
+        print("✓ Submission finale : submission_final_weighted.csv")
+        print("\nDistribution finale :")
+        print(pd.Series(corrected_predictions).value_counts().sort_index())
+        
+        diff_count = (first_pass_predictions != corrected_predictions).sum()
+        print(f"\nTotal échantillons modifiés : {diff_count} / {len(test_landmarks)} "
+              f"({100*diff_count/len(test_landmarks):.2f}%)")
+        
+        with open('class_best_runs_weighted.pkl', 'wb') as f:
+            pickle.dump(class_best_runs_weighted, f)
+        print("✓ Dictionnaire des experts sauvegardé : class_best_runs_weighted.pkl")
     
     wandb.finish()
-# # -*- coding: utf-8 -*-
-# """
-# Created on Tue Jul  7 07:59:48 2026
-
-# @author: karim
-
-# Version modifiee:
-# - L'augmentation de donnees "avancee" (time-warp, frame-dropout, translation,
-#   bruit, petites rotations) a ete remplacee par EXACTEMENT la meme augmentation
-#   que le notebook Colab (rotations aleatoires +/- 30 deg autour d'un axe
-#   aleatoire), tout en gardant la notion de `target_count` (equilibrage des
-#   classes jusqu'a un nombre cible d'echantillons).
-# - Ajout de tous les logs et plots du Colab: distribution des classes,
-#   squelette de la main, trajectoire du poignet, distribution avant/apres
-#   augmentation, squelette original vs augmente, schema d'architecture,
-#   nombre de parametres par bloc, courbes loss/accuracy, matrice de confusion,
-#   precision/rappel/F1, distribution des predictions.
-# """
-
-# import os
-# import copy
-# import pickle
-# import numpy as np
-# import pandas as pd
-# from scipy.interpolate import interp1d
-# from sklearn.model_selection import train_test_split, StratifiedKFold
-# from sklearn.preprocessing import StandardScaler
-# from sklearn.metrics import (
-#     confusion_matrix,
-#     classification_report,
-#     precision_recall_fscore_support,
-# )
-# import torch
-# import torch.nn as nn
-# import torch.optim as optim
-# from torch.utils.data import Dataset, DataLoader
-# import torch.nn.functional as F
-# from tqdm import tqdm
-# import wandb
-# import random
-
-# import matplotlib
-# import matplotlib.pyplot as plt
-# from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
-# import seaborn as sns
-
-# sns.set_style("whitegrid")
-
-# INFERENCE_ONLY = True
-# BEST_RUN_ID = 2
-# USE_KFOLD = True
-# N_FOLDS = 5
-# MAKE_PLOTS = True          # active tous les plots facon Colab
-# PLOTS_DIR = 'plots'        # les figures sont sauvegardees ici
-
-# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# print(f"Using device: {device}")
-# if device.type == 'cuda':
-#     print(f"GPU: {torch.cuda.get_device_name(0)}")
-
-# NUM_CLASSES = 13
-# os.environ.setdefault("WANDB_MODE", "offline")
-# wandb.init(project="hand_gesture_multistream_stgcn_moe_fixed", config={"num_classes": NUM_CLASSES})
-# data_path = 'hand-gesture-recognition-challenge/'
-
-
-# # ---------------------------------------------------------------------------
-# # Helper plot: sauvegarde + affichage (facon Colab, mais utilisable en script)
-# # ---------------------------------------------------------------------------
-# def save_and_show(name):
-#     if MAKE_PLOTS:
-#         os.makedirs(PLOTS_DIR, exist_ok=True)
-#         path = os.path.join(PLOTS_DIR, f"{name}.png")
-#         plt.savefig(path, dpi=120, bbox_inches='tight')
-#         print(f"Plot sauvegarde: {path}")
-#     try:
-#         plt.show()
-#     except Exception:
-#         pass
-#     plt.close()
-
-
-# def linear_interpolation(landmarks, t_from, t_to):
-#     if len(landmarks) == 0:
-#         return np.zeros((len(t_to), landmarks.shape[1]))
-#     interpolated = np.zeros((len(t_to), landmarks.shape[1]))
-#     for i in range(landmarks.shape[1]):
-#         f = interp1d(t_from, landmarks[:, i], kind='linear', bounds_error=False, fill_value='extrapolate')
-#         interpolated[:, i] = f(t_to)
-#     return interpolated
-
-
-# def load_train_data():
-#     data_dir = os.path.join(data_path, 'data_train/')
-#     data_txt_file = os.path.join(data_path, 'data_train/train_annotations.txt')
-#     max_len = 80
-#     all_landmarks = []
-#     labels = []
-#     to_discard = []
-#     with open(data_txt_file, 'r') as f:
-#         files = f.readlines()
-#     for i, file in tqdm(enumerate(files), desc="Loading training data"):
-#         try:
-#             parts = file.strip().split(', ')
-#             if len(parts) >= 4:
-#                 video_path, landmarks_path, label, nframes = parts
-#             else:
-#                 continue
-#             labels.append(label)
-#             landmark_file = os.path.join(data_dir, landmarks_path)
-#             if not os.path.exists(landmark_file):
-#                 to_discard.append(i)
-#                 continue
-#             with open(landmark_file) as f:
-#                 lines = f.readlines()
-#             landmarks = []
-#             is_available = []
-#             for line in lines:
-#                 lands = list(filter(lambda x: len(x), line.strip('\n').strip(' ').split(';')))
-#                 if len(lands):
-#                     is_available.append(True)
-#                     landmarks.append([float(x) for x in lands])
-#                 else:
-#                     landmarks.append(np.zeros(63))
-#                     is_available.append(False)
-#             if sum(is_available) > 1:
-#                 landmarks = np.array(landmarks).astype('float32')
-#                 is_available = np.array(is_available)
-#                 t_from = np.arange(len(landmarks))[is_available]
-#                 landmarks = linear_interpolation(landmarks[is_available], t_from=t_from,
-#                                                   t_to=np.linspace(min(t_from), max(t_from), max_len + 1))
-#                 all_landmarks.append(landmarks)
-#             else:
-#                 to_discard.append(i)
-#         except Exception as e:
-#             print(f"Error processing file {i}: {e}")
-#             to_discard.append(i)
-#     train_landmarks = np.array(all_landmarks).reshape(-1, 81, 21, 3)
-#     y_true = np.array([labels[i] for i in range(len(labels)) if i not in to_discard])
-#     return train_landmarks, y_true
-
-
-# def load_test_data():
-#     data_dir = os.path.join(data_path, 'data_test/')
-#     data_txt_file = os.path.join(data_path, 'data_test/test_annotations.txt')
-#     max_len = 80
-#     all_landmarks = []
-#     with open(data_txt_file, 'r') as f:
-#         files = f.readlines()
-#     for i, file in tqdm(enumerate(files), desc="Loading test data"):
-#         try:
-#             parts = file.strip().split(', ')
-#             if len(parts) >= 3:
-#                 video_path, landmarks_path, nframes = parts
-#             else:
-#                 continue
-#             landmark_file = os.path.join(data_dir, landmarks_path)
-#             if not os.path.exists(landmark_file):
-#                 all_landmarks.append(np.zeros((81, 63)))
-#                 continue
-#             with open(landmark_file) as f:
-#                 lines = f.readlines()
-#             landmarks = []
-#             is_available = []
-#             for line in lines:
-#                 lands = list(filter(lambda x: len(x), line.strip('\n').strip(' ').split(';')))
-#                 if len(lands):
-#                     is_available.append(True)
-#                     landmarks.append([float(x) for x in lands])
-#                 else:
-#                     landmarks.append(np.zeros(63))
-#                     is_available.append(False)
-#             if sum(is_available) > 1:
-#                 landmarks = np.array(landmarks).astype('float32')
-#                 is_available = np.array(is_available)
-#                 t_from = np.arange(len(landmarks))[is_available]
-#                 landmarks = linear_interpolation(landmarks[is_available], t_from=t_from,
-#                                                   t_to=np.linspace(min(t_from), max(t_from), max_len + 1))
-#                 all_landmarks.append(landmarks)
-#             else:
-#                 all_landmarks.append(np.zeros((81, 63)))
-#         except Exception as e:
-#             print(f"Error processing test file {i}: {e}")
-#             all_landmarks.append(np.zeros((81, 63)))
-#     test_landmarks = np.array(all_landmarks).reshape(-1, 81, 21, 3)
-#     return test_landmarks
-
-
-# AREAS = {0: [[0, 4, 5], [4, 5, 8]], 1: [[5, 8, 9], [8, 9, 12]],
-#          2: [[9, 12, 13], [12, 13, 16]], 3: [[13, 16, 17], [16, 17, 20]]}
-
-
-# def areas_landmarks(vids):
-#     areas = np.zeros((vids.shape[0], vids.shape[1], 4))
-#     for i, v in AREAS.items():
-#         vec_1_1 = vids[:, :, v[0][1]] - vids[:, :, v[0][0]]
-#         vec_1_2 = vids[:, :, v[0][2]] - vids[:, :, v[0][0]]
-#         vec_2_1 = vids[:, :, v[1][1]] - vids[:, :, v[1][0]]
-#         vec_2_2 = vids[:, :, v[1][2]] - vids[:, :, v[1][0]]
-#         areas[:, :, i] = (np.linalg.norm(np.cross(vec_1_1, vec_1_2, axis=2), axis=2) / 2 +
-#                           np.linalg.norm(np.cross(vec_2_1, vec_2_2, axis=2), axis=2) / 2)
-#     return areas
-
-
-# FINGERS = [[0, 1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20]]
-
-
-# def fingers_deployment(vids):
-#     features = np.zeros((vids.shape[0], vids.shape[1], len(FINGERS)))
-#     for i, f in enumerate(FINGERS):
-#         features[:, :, i] = np.linalg.norm(vids[:, :, f[-1]] - vids[:, :, f[0]], axis=2)
-#     return features
-
-
-# HARDCODED = [[0, 12], [0, 16], [4, 12], [4, 16], [4, 20], [4, 8], [8, 12], [12, 16], [16, 20], [2, 17]]
-
-
-# def remarkable_distances(vids):
-#     features = np.zeros((vids.shape[0], vids.shape[1], len(HARDCODED)))
-#     for i, (p1, p2) in enumerate(HARDCODED):
-#         features[:, :, i] = np.linalg.norm(vids[:, :, p1] - vids[:, :, p2], axis=2)
-#     return features
-
-
-# def diff(vids):
-#     return vids[:, 1:] - vids[:, :-1]
-
-
-# def angle(vids):
-#     center = np.sum(vids[:, :, [0, 17, 13, 9, 5]], axis=2) / 5
-#     center = np.repeat(center[:, :, np.newaxis, :], 5, axis=-2)
-#     vectors = vids[:, :, [4, 8, 12, 16, 20]] - center
-#     dot_product = np.sum(vectors[:, :, :-1] * vectors[:, :, 1:], axis=-1)
-#     norm_product = (np.linalg.norm(vectors[:, :, :-1], axis=-1) * np.linalg.norm(vectors[:, :, 1:], axis=-1))
-#     norm_product = np.where(norm_product == 0, 1e-8, norm_product)
-#     dot_product = np.clip(dot_product / norm_product, -1, 1)
-#     return np.arccos(dot_product)
-
-
-# def normalize(vids):
-#     bases = vids[:, :1]
-#     normalized = vids.copy()
-#     normalized[:, 1:] -= bases
-#     return normalized
-
-
-# def direction(landmarks):
-#     mean_land_9_13 = np.mean(landmarks[:, :, [9, 13]], axis=-2)
-#     hand_direction = mean_land_9_13 - landmarks[:, :, 0]
-#     phi = np.arctan2(hand_direction[:, :, 0], hand_direction[:, :, 2])
-#     theta = np.arccos(np.clip(hand_direction[:, :, 1] / np.linalg.norm(hand_direction, axis=-1), -1, 1))
-#     return np.concatenate((hand_direction, np.expand_dims(phi, axis=-1), np.expand_dims(theta, axis=-1)), axis=-1)
-
-
-# def rotate(arr, theta, axis):
-#     if axis == 0:
-#         rot_mat = np.array([[1, 0, 0], [0, np.cos(theta), -np.sin(theta)], [0, np.sin(theta), np.cos(theta)]])
-#     elif axis == 1:
-#         rot_mat = np.array([[np.cos(theta), 0, np.sin(theta)], [0, 1, 0], [-np.sin(theta), 0, np.cos(theta)]])
-#     else:
-#         rot_mat = np.array([[np.cos(theta), -np.sin(theta), 0], [np.sin(theta), np.cos(theta), 0], [0, 0, 1]])
-#     return (rot_mat @ arr.T).T
-
-
-# def scale_normalize(vids):
-#     ref = np.linalg.norm(vids[:, :, 9] - vids[:, :, 0], axis=-1, keepdims=True)
-#     ref = np.where(ref < 1e-6, 1e-6, ref)
-#     ref = ref[:, :, np.newaxis]
-#     return vids / ref
-
-
-# def create_features(landmarks, with_normalized=True):
-#     differences = diff(landmarks)
-#     if with_normalized:
-#         normalized = normalize(landmarks)
-#         features = np.zeros((landmarks.shape[0], landmarks.shape[1], 31))
-#     else:
-#         features = np.zeros((landmarks.shape[0], landmarks.shape[1], 28))
-#     features[:, :, :4] = areas_landmarks(landmarks)
-#     features[:, :, 4:9] = fingers_deployment(landmarks)
-#     features[:, :, 9:13] = angle(landmarks)
-#     features[:, :, 13:23] = remarkable_distances(landmarks)
-#     features[:, :, 23:28] = direction(landmarks)
-#     if with_normalized:
-#         features[:, :, 28:31] = normalized[:, :, 0]
-#         return [landmarks, normalized, differences, features]
-#     return [landmarks, differences, features]
-
-
-# # ---------------------------------------------------------------------------
-# # AUGMENTATION DE DONNEES AVANCEE (time-warp, frame-dropout, translation, bruit)
-# # ---------------------------------------------------------------------------
-# def time_warp(landmarks, warp_factor):
-#     """Applique un warping temporel (accélération/décélération)"""
-#     n = landmarks.shape[0]
-#     t_orig = np.arange(n)
-#     t_warped = np.power(np.linspace(0, 1, n), warp_factor) * (n - 1)
-#     flat = landmarks.reshape(n, -1)
-#     f = interp1d(t_orig, flat, axis=0, kind='linear', fill_value='extrapolate')
-#     return f(t_warped).reshape(landmarks.shape)
-
-
-# def frame_dropout(landmarks, drop_ratio):
-#     """Supprime aléatoirement des frames et interpole"""
-#     n = landmarks.shape[0]
-#     n_drop = max(1, int(n * drop_ratio))
-#     idx_all = np.arange(n)
-#     drop_idx = np.random.choice(idx_all[1:-1], size=min(n_drop, n - 2), replace=False)
-#     keep_idx = np.setdiff1d(idx_all, drop_idx)
-#     kept = landmarks[keep_idx].reshape(len(keep_idx), -1)
-#     f = interp1d(keep_idx, kept, axis=0, kind='linear', fill_value='extrapolate')
-#     return f(idx_all).reshape(landmarks.shape)
-
-
-# def global_translate(landmarks, max_shift):
-#     """Translation globale de la main"""
-#     shift = np.random.uniform(-max_shift, max_shift, size=(1, 1, 3))
-#     return landmarks + shift
-
-
-# def augment_gesture_advanced(seq):
-#     """
-#     Version avancée de l'augmentation avec:
-#     - Rotation +/- 30° autour d'un axe aléatoire
-#     - Mise à l'échelle 0.9-1.1
-#     - Time warping (30% de chance)
-#     - Frame dropout (20% de chance)
-#     - Translation globale (20% de chance)
-#     - Bruit gaussien
-#     """
-#     out = seq.copy()
-    
-#     # Rotation et mise à l'échelle (toujours appliquées)
-#     ang = np.random.uniform(-np.pi/6, np.pi/6)
-#     axis = np.random.choice([0, 1, 2])
-#     scale = np.random.uniform(0.9, 1.1)
-#     for f in range(out.shape[0]):
-#         out[f] = rotate(out[f], ang, axis) * scale
-    
-#     # Time warping (30% de chance)
-#     if np.random.random() < 0.3:
-#         wf = np.random.uniform(0.8, 1.25)
-#         out = time_warp(out, wf)
-    
-#     # Frame dropout (20% de chance)
-#     if np.random.random() < 0.2:
-#         out = frame_dropout(out, drop_ratio=np.random.uniform(0.03, 0.08))
-    
-#     # Translation globale (20% de chance)
-#     if np.random.random() < 0.2:
-#         out = global_translate(out, max_shift=0.01)
-    
-#     # Bruit gaussien
-#     out = out + np.random.normal(0, 0.005, out.shape)
-    
-#     return out
-
-
-# def augment_data_balanced_advanced(landmarks, labels, target_count=450):
-#     """
-#     Version avancée avec augmentation multiple et équilibrage des classes
-#     jusqu'à target_count échantillons par classe.
-#     """
-#     unique_labels, counts = np.unique(labels, return_counts=True)
-#     print(f"Classes avant augmentation: {dict(zip(unique_labels, counts))}")
-#     print(f"Target: {target_count} échantillons par classe")
-    
-#     X_added, y_added = [], []
-    
-#     for lab in unique_labels:
-#         lab_indices = np.where(labels == lab)[0]
-#         current = len(lab_indices)
-        
-#         if current < target_count:
-#             n_to_add = target_count - current
-#             print(f"Classe {lab}: {current} -> {target_count} (+{n_to_add})")
-            
-#             for _ in range(n_to_add):
-#                 idx = np.random.choice(lab_indices)
-#                 aug = augment_gesture_advanced(landmarks[idx])
-#                 X_added.append(aug)
-#                 y_added.append(lab)
-#         else:
-#             print(f"Classe {lab}: {current} (aucun ajout)")
-    
-#     if X_added:
-#         landmarks_aug = np.vstack((landmarks, np.array(X_added)))
-#         labels_aug = np.concatenate((labels, np.array(y_added)))
-#         unique_after, counts_after = np.unique(labels_aug, return_counts=True)
-#         print(f"Classes après augmentation: {dict(zip(unique_after, counts_after))}")
-#         return landmarks_aug, labels_aug
-    
-#     return landmarks, labels
-
-
-# # ---------------------------------------------------------------------------
-# # Plots d'exploration / augmentation (facon Colab)
-# # ---------------------------------------------------------------------------
-# HAND_CONNECTIONS = [
-#     (0, 1), (1, 2), (2, 3), (3, 4),          # thumb
-#     (0, 5), (5, 6), (6, 7), (7, 8),          # index
-#     (5, 9), (9, 10), (10, 11), (11, 12),     # middle
-#     (9, 13), (13, 14), (14, 15), (15, 16),   # ring
-#     (13, 17), (17, 18), (18, 19), (19, 20),  # pinky
-#     (0, 17),                                  # palm base
-# ]
-
-
-# def plot_hand_skeleton(ax, landmarks_frame, color="#1f77b4", title=None):
-#     """landmarks_frame: array de forme (21, 3)"""
-#     xs, ys = landmarks_frame[:, 0], landmarks_frame[:, 1]
-#     for a, b in HAND_CONNECTIONS:
-#         ax.plot([xs[a], xs[b]], [ys[a], ys[b]], color=color, linewidth=1.5, zorder=1)
-#     ax.scatter(xs, ys, color=color, s=25, zorder=2)
-#     ax.invert_yaxis()
-#     ax.set_aspect("equal")
-#     ax.set_xticks([]); ax.set_yticks([])
-#     if title:
-#         ax.set_title(title, fontsize=10)
-
-
-# def plot_data_exploration(train_landmarks, train_labels):
-#     """Distribution des classes + squelettes + trajectoire du poignet (comme Colab)."""
-#     if not MAKE_PLOTS:
-#         return
-#     unique, counts = np.unique(train_labels.astype(int), return_counts=True)
-
-#     # Distribution des classes (avant augmentation)
-#     plt.figure(figsize=(9, 4))
-#     bars = plt.bar(unique, counts, color="#1f77b4", edgecolor="white")
-#     plt.xlabel("Gesture class")
-#     plt.ylabel("Number of sequences")
-#     plt.title("Class distribution - training set (before augmentation)")
-#     plt.xticks(unique)
-#     for b, c in zip(bars, counts):
-#         plt.text(b.get_x() + b.get_width() / 2, c + 0.5, str(c), ha="center", va="bottom", fontsize=8)
-#     plt.tight_layout()
-#     save_and_show("01_class_distribution_before_aug")
-
-#     # Squelettes (frame du milieu) pour quelques classes
-#     fig, axes = plt.subplots(1, 5, figsize=(16, 4))
-#     example_classes = unique[:5]
-#     for ax, cls in zip(axes, example_classes):
-#         idx = np.where(train_labels.astype(int) == cls)[0][0]
-#         mid_frame = train_landmarks[idx, train_landmarks.shape[1] // 2]
-#         plot_hand_skeleton(ax, mid_frame, title=f"Class {cls}")
-#     plt.suptitle("Example hand skeleton (middle frame) for several gesture classes")
-#     plt.tight_layout()
-#     save_and_show("02_hand_skeletons")
-
-#     # Trajectoire du poignet (landmark 0)
-#     sample_idx = 0
-#     traj = train_landmarks[sample_idx, :, 0, :]
-#     fig, ax = plt.subplots(figsize=(6, 5))
-#     sc = ax.scatter(traj[:, 0], traj[:, 1], c=np.arange(len(traj)), cmap="viridis", s=15)
-#     ax.plot(traj[:, 0], traj[:, 1], color="gray", alpha=0.3, linewidth=1)
-#     ax.invert_yaxis()
-#     ax.set_title(f"Wrist trajectory over 81 frames - sample #{sample_idx} "
-#                  f"(class {int(train_labels[sample_idx])})")
-#     ax.set_xlabel("x"); ax.set_ylabel("y")
-#     plt.colorbar(sc, ax=ax, label="frame index")
-#     plt.tight_layout()
-#     save_and_show("03_wrist_trajectory")
-
-
-# def plot_augmentation_effect(train_landmarks, train_labels, target_count):
-#     """Distribution avant/apres + squelette original vs augmente (version avancée)."""
-#     if not MAKE_PLOTS:
-#         return
-#     print("\n--- Démonstration de l'augmentation avancée (pour les plots) ---")
-    
-#     # Utiliser l'augmentation avancée
-#     train_landmarks_aug, train_labels_aug = augment_data_balanced_advanced(
-#         train_landmarks, train_labels, target_count=target_count
-#     )
-    
-#     print(f"Before augmentation: {train_landmarks.shape[0]} sequences")
-#     print(f"After augmentation:  {train_landmarks_aug.shape[0]} sequences")
-    
-#     # Distribution avant vs après
-#     unique_before, counts_before = np.unique(train_labels.astype(int), return_counts=True)
-#     unique_after, counts_after = np.unique(train_labels_aug.astype(int), return_counts=True)
-    
-#     all_classes = unique_after
-#     cb = np.array([counts_before[list(unique_before).index(c)] if c in unique_before else 0
-#                    for c in all_classes])
-#     ca = counts_after
-    
-#     x = np.arange(len(all_classes))
-#     width = 0.35
-    
-#     plt.figure(figsize=(10, 4))
-#     plt.bar(x - width / 2, cb, width, label="Before augmentation", color="#1f77b4")
-#     plt.bar(x + width / 2, ca, width, label="After augmentation", color="#ff7f0e")
-#     plt.xticks(x, all_classes)
-#     plt.xlabel("Gesture class")
-#     plt.ylabel("Number of sequences")
-#     plt.title(f"Class distribution before vs. after advanced augmentation (target_count={target_count})")
-#     plt.legend()
-#     plt.tight_layout()
-#     save_and_show("04_class_distribution_before_vs_after")
-    
-#     # Comparaison original vs augmenté (plusieurs versions pour montrer la variété)
-#     orig_idx = 1
-#     orig_frame = train_landmarks[orig_idx, train_landmarks.shape[1] // 2]
-    
-#     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    
-#     # Original
-#     plot_hand_skeleton(axes[0], orig_frame, color="#1f77b4", title="Original")
-    
-#     # 2 versions augmentées différentes
-#     aug_seq1 = augment_gesture_advanced(train_landmarks[orig_idx])
-#     aug_frame1 = aug_seq1[aug_seq1.shape[0] // 2]
-#     plot_hand_skeleton(axes[1], aug_frame1, color="#ff7f0e", title="Augmented v1")
-    
-#     aug_seq2 = augment_gesture_advanced(train_landmarks[orig_idx])
-#     aug_frame2 = aug_seq2[aug_seq2.shape[0] // 2]
-#     plot_hand_skeleton(axes[2], aug_frame2, color="#2ca02c", title="Augmented v2")
-    
-#     plt.suptitle("Advanced augmentation - original vs. augmented versions")
-#     plt.tight_layout()
-#     save_and_show("05_original_vs_augmented_skeleton")
-
-
-# EDGES = [(0, 1), (1, 2), (2, 3), (3, 4),
-#          (0, 5), (5, 6), (6, 7), (7, 8),
-#          (0, 9), (9, 10), (10, 11), (11, 12),
-#          (0, 13), (13, 14), (14, 15), (15, 16),
-#          (0, 17), (17, 18), (18, 19), (19, 20),
-#          (5, 9), (9, 13), (13, 17)]
-
-
-# def build_adjacency(num_nodes=21):
-#     A = np.eye(num_nodes)
-#     for i, j in EDGES:
-#         A[i, j] = 1
-#         A[j, i] = 1
-#     Deg = np.sum(A, axis=1)
-#     D_inv_sqrt = np.diag(1.0 / np.sqrt(Deg))
-#     A_norm = D_inv_sqrt @ A @ D_inv_sqrt
-#     return torch.FloatTensor(A_norm)
-
-
-# def compute_velocity(x):
-#     vel = np.zeros_like(x)
-#     vel[:, 1:] = x[:, 1:] - x[:, :-1]
-#     return vel
-
-
-# def prepare_graph_stream(x):
-#     vel = compute_velocity(x)
-#     combined = np.concatenate([x, vel], axis=-1)
-#     combined = combined.transpose(0, 3, 1, 2)
-#     return combined.astype('float32')
-
-
-# class FocalLoss(nn.Module):
-#     def __init__(self, alpha=None, gamma=2.2, label_smoothing=0.08):
-#         super().__init__()
-#         self.alpha = alpha
-#         self.gamma = gamma
-#         self.label_smoothing = label_smoothing
-
-#     def forward(self, inputs, targets):
-#         num_classes = inputs.size(-1)
-#         log_probs = F.log_softmax(inputs, dim=-1)
-#         probs = log_probs.exp()
-#         if self.label_smoothing > 0:
-#             with torch.no_grad():
-#                 true_dist = torch.zeros_like(log_probs)
-#                 true_dist.fill_(self.label_smoothing / (num_classes - 1))
-#                 true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
-#             ce = -(true_dist * log_probs).sum(dim=-1)
-#             pt = (true_dist * probs).sum(dim=-1)
-#         else:
-#             ce = F.nll_loss(log_probs, targets, reduction='none')
-#             pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-#         focal_term = (1 - pt).clamp(min=1e-6) ** self.gamma
-#         loss = focal_term * ce
-#         if self.alpha is not None:
-#             at = self.alpha.gather(0, targets)
-#             loss = at * loss
-#         return loss.mean()
-
-
-# def compute_focal_alpha(labels_int, num_classes, device):
-#     counts = np.array([np.sum(labels_int == c) for c in range(1, num_classes + 1)], dtype=np.float32)
-#     counts = np.where(counts == 0, 1, counts)
-#     alpha = (counts.sum() / (num_classes * counts)) ** 1.5
-#     alpha = alpha / alpha.mean()
-#     return torch.FloatTensor(alpha).to(device)
-
-
-# class EMA:
-#     def __init__(self, model, decay=0.999):
-#         self.decay = decay
-#         self.shadow = copy.deepcopy(model.state_dict())
-
-#     def update(self, model):
-#         for k, v in model.state_dict().items():
-#             if v.dtype.is_floating_point:
-#                 self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1 - self.decay)
-#             else:
-#                 self.shadow[k] = v.clone()
-
-#     def state_dict(self):
-#         return self.shadow
-
-
-# class DropPath(nn.Module):
-#     def __init__(self, drop_prob=0.0):
-#         super().__init__()
-#         self.drop_prob = drop_prob
-
-#     def forward(self, x):
-#         if not self.training or self.drop_prob == 0.0:
-#             return x
-#         keep_prob = 1 - self.drop_prob
-#         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-#         mask = keep_prob + torch.rand(shape, device=x.device, dtype=x.dtype)
-#         mask.floor_()
-#         return x.div(keep_prob) * mask
-
-
-# class UnitGCN(nn.Module):
-#     def __init__(self, in_channels, out_channels, A, dropout=0.35):
-#         super().__init__()
-#         self.register_buffer('A', A)
-#         self.A_res = nn.Parameter(torch.zeros_like(A))
-#         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-#         self.bn = nn.BatchNorm2d(out_channels)
-#         self.relu = nn.ReLU(inplace=True)
-#         self.dropout = nn.Dropout(dropout)
-#         if in_channels != out_channels:
-#             self.down = nn.Sequential(
-#                 nn.Conv2d(in_channels, out_channels, kernel_size=1),
-#                 nn.BatchNorm2d(out_channels)
-#             )
-#         else:
-#             self.down = None
-
-#     def forward(self, x):
-#         A = self.A + self.A_res
-#         x_res = x if self.down is None else self.down(x)
-#         x = self.conv(x)
-#         x = torch.einsum('nctv,vw->nctw', x, A)
-#         x = self.bn(x)
-#         x = self.relu(x + x_res)
-#         x = self.dropout(x)
-#         return x
-
-
-# class UnitTCN(nn.Module):
-#     def __init__(self, channels, kernel_size=9, stride=1, dropout=0.35):
-#         super().__init__()
-#         pad = (kernel_size - 1) // 2
-#         self.conv = nn.Conv2d(
-#             channels, channels,
-#             kernel_size=(kernel_size, 1),
-#             padding=(pad, 0),
-#             stride=(stride, 1)
-#         )
-#         self.bn = nn.BatchNorm2d(channels)
-#         self.relu = nn.ReLU(inplace=True)
-#         self.dropout = nn.Dropout(dropout)
-
-#     def forward(self, x):
-#         x = self.conv(x)
-#         x = self.bn(x)
-#         x = self.relu(x)
-#         x = self.dropout(x)
-#         return x
-
-
-# class STGCNBlock(nn.Module):
-#     def __init__(self, in_channels, out_channels, A, stride=1, dropout=0.35, drop_path=0.2):
-#         super().__init__()
-#         self.gcn = UnitGCN(in_channels, out_channels, A, dropout=dropout)
-#         self.tcn = UnitTCN(out_channels, stride=stride, dropout=dropout)
-#         if in_channels != out_channels or stride != 1:
-#             self.residual = nn.Sequential(
-#                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(stride, 1)),
-#                 nn.BatchNorm2d(out_channels)
-#             )
-#         else:
-#             self.residual = nn.Identity()
-#         self.drop_path = DropPath(drop_path)
-#         self.relu = nn.ReLU(inplace=True)
-
-#     def forward(self, x):
-#         res = self.residual(x)
-#         x = self.gcn(x)
-#         x = self.tcn(x)
-#         x = self.relu(self.drop_path(x) + res)
-#         return x
-
-
-# class STGCNStream(nn.Module):
-#     def __init__(self, in_channels, A, num_blocks, drop_path_rate=0.2, dropout=0.35):
-#         super().__init__()
-#         num_nodes = A.shape[0]
-#         self.data_bn = nn.BatchNorm1d(in_channels * num_nodes)
-#         channels = [in_channels] + num_blocks
-#         strides = [1, 1, 2, 1, 2, 1][:len(num_blocks)]
-#         dpr = np.linspace(0, drop_path_rate, len(num_blocks))
-#         blocks = []
-#         for i in range(len(num_blocks)):
-#             blocks.append(
-#                 STGCNBlock(
-#                     channels[i], channels[i + 1], A,
-#                     stride=strides[i],
-#                     dropout=dropout,
-#                     drop_path=float(dpr[i])
-#                 )
-#             )
-#         self.blocks = nn.ModuleList(blocks)
-#         self.out_channels = num_blocks[-1]
-
-#     def forward(self, x):
-#         N, C, T, V = x.shape
-#         x = x.permute(0, 3, 1, 2).contiguous().view(N, V * C, T)
-#         x = self.data_bn(x)
-#         x = x.view(N, V, C, T).permute(0, 2, 3, 1).contiguous()
-#         for block in self.blocks:
-#             x = block(x)
-#         x = x.mean(dim=[2, 3])
-#         return x
-
-
-# class TransformerBlock(nn.Module):
-#     def __init__(self, embed_dim, num_heads, mlp_ratio, dropout, drop_path):
-#         super().__init__()
-#         self.norm1 = nn.LayerNorm(embed_dim)
-#         self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
-#         self.drop_path1 = DropPath(drop_path)
-#         self.norm2 = nn.LayerNorm(embed_dim)
-#         self.mlp = nn.Sequential(
-#             nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
-#             nn.GELU(),
-#             nn.Dropout(dropout),
-#             nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
-#             nn.Dropout(dropout)
-#         )
-#         self.drop_path2 = DropPath(drop_path)
-
-#     def forward(self, x):
-#         normed = self.norm1(x)
-#         attn_out, _ = self.attn(normed, normed, normed)
-#         x = x + self.drop_path1(attn_out)
-#         x = x + self.drop_path2(self.mlp(self.norm2(x)))
-#         return x
-
-
-# class TransformerBranch(nn.Module):
-#     def __init__(self, patch_dim, seq_len, embed_dim=80, num_heads=5, num_layers=3,
-#                  mlp_ratio=4.0, dropout=0.1, drop_path_rate=0.1):
-#         super().__init__()
-#         self.patch_embed = nn.Linear(patch_dim, embed_dim)
-#         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-#         self.pos_embed = nn.Parameter(torch.zeros(1, seq_len + 1, embed_dim))
-#         nn.init.trunc_normal_(self.pos_embed, std=0.02)
-#         nn.init.trunc_normal_(self.cls_token, std=0.02)
-#         dpr = np.linspace(0, drop_path_rate, num_layers)
-#         self.blocks = nn.ModuleList([
-#             TransformerBlock(
-#                 embed_dim, num_heads, mlp_ratio, dropout, float(dpr[i])
-#             ) for i in range(num_layers)
-#         ])
-#         self.norm = nn.LayerNorm(embed_dim)
-#         self.dropout = nn.Dropout(dropout)
-
-#     def forward(self, x):
-#         batch = x.size(0)
-#         x = self.patch_embed(x)
-#         cls_tokens = self.cls_token.expand(batch, -1, -1)
-#         x = torch.cat([cls_tokens, x], dim=1)
-#         x = x + self.pos_embed
-#         x = self.dropout(x)
-#         for block in self.blocks:
-#             x = block(x)
-#         x = self.norm(x)
-#         return x[:, 0]
-
-
-# class Expert(nn.Module):
-#     def __init__(self, input_dim, hidden_dim, output_dim, dropout_rate=0.35):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(input_dim, hidden_dim),
-#             nn.ReLU(inplace=True),
-#             nn.Dropout(dropout_rate),
-#             nn.Linear(hidden_dim, output_dim),
-#             nn.ReLU(inplace=True),
-#             nn.Dropout(dropout_rate)
-#         )
-
-#     def forward(self, x):
-#         return self.net(x)
-
-
-# class Router(nn.Module):
-#     def __init__(self, input_dim, num_experts):
-#         super().__init__()
-#         self.router = nn.Linear(input_dim, num_experts)
-#         self.softmax = nn.Softmax(dim=-1)
-
-#     def forward(self, x):
-#         return self.softmax(self.router(x))
-
-
-# class MixtureOfExpertsLayer(nn.Module):
-#     def __init__(self, input_dim, hidden_dim, num_experts, k, dropout_rate=0.35):
-#         super().__init__()
-#         self.num_experts = num_experts
-#         self.k = k
-#         self.experts = nn.ModuleList([
-#             Expert(input_dim, hidden_dim, input_dim, dropout_rate)
-#             for _ in range(num_experts)
-#         ])
-#         self.router = Router(input_dim, num_experts)
-#         self.noise_std = 0.05
-
-#     def forward(self, x):
-#         batch_size, seq_len, input_dim = x.shape
-#         x_flat = x.view(-1, input_dim)
-#         router_probs = self.router(x_flat)
-#         if self.training:
-#             noise = torch.randn_like(router_probs) * self.noise_std
-#             router_probs = torch.softmax(router_probs + noise, dim=-1)
-#         top_k_probs, top_k_indices = torch.topk(router_probs, self.k, dim=-1)
-#         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
-#         all_expert_outputs = torch.stack([expert(x_flat) for expert in self.experts], dim=1)
-#         gathered = torch.gather(
-#             all_expert_outputs, 1,
-#             top_k_indices.unsqueeze(-1).expand(-1, -1, input_dim)
-#         )
-#         output = (gathered * top_k_probs.unsqueeze(-1)).sum(dim=1)
-#         output = output.view(batch_size, seq_len, input_dim)
-#         aux_loss = self._calculate_aux_loss(router_probs)
-#         return output, {'aux_loss': aux_loss}
-
-#     def _calculate_aux_loss(self, router_probs):
-#         expert_usage = router_probs.mean(dim=0)
-#         expert_weights = router_probs.sum(dim=0) / router_probs.sum()
-#         return (expert_usage * expert_weights).sum() * self.num_experts
-
-
-# def rotate_tensor_3d(tensor, ang, axis):
-#     B, C, T, V = tensor.shape
-#     assert C == 6
-#     if axis == 0:
-#         R = torch.tensor([
-#             [1, 0, 0],
-#             [0, np.cos(ang), -np.sin(ang)],
-#             [0, np.sin(ang), np.cos(ang)]
-#         ], dtype=tensor.dtype, device=tensor.device)
-#     elif axis == 1:
-#         R = torch.tensor([
-#             [np.cos(ang), 0, np.sin(ang)],
-#             [0, 1, 0],
-#             [-np.sin(ang), 0, np.cos(ang)]
-#         ], dtype=tensor.dtype, device=tensor.device)
-#     else:
-#         R = torch.tensor([
-#             [np.cos(ang), -np.sin(ang), 0],
-#             [np.sin(ang), np.cos(ang), 0],
-#             [0, 0, 1]
-#         ], dtype=tensor.dtype, device=tensor.device)
-#     xyz = tensor[:, :3].permute(0, 2, 3, 1).reshape(-1, 3)
-#     xyz = xyz @ R.T
-#     xyz = xyz.view(B, T, V, 3)
-#     vel = tensor[:, 3:].permute(0, 2, 3, 1).reshape(-1, 3)
-#     vel = vel @ R.T
-#     vel = vel.view(B, T, V, 3)
-#     out = torch.cat([xyz, vel], dim=-1)
-#     out = out.permute(0, 3, 1, 2).contiguous()
-#     return out
-
-
-# class HandGestureMultiStreamBackbone(nn.Module):
-#     def __init__(self, A, num_blocks, transformer_embed_dim=80, transformer_heads=5,
-#                  transformer_layers=3, transformer_mlp_ratio=4.0, dropout=0.35,
-#                  drop_path_rate=0.2, output_dim=384):
-#         super().__init__()
-#         self.landmark_branch = STGCNStream(
-#             in_channels=6, A=A, num_blocks=num_blocks,
-#             drop_path_rate=drop_path_rate, dropout=dropout
-#         )
-#         self.norm_branch = STGCNStream(
-#             in_channels=6, A=A, num_blocks=num_blocks,
-#             drop_path_rate=drop_path_rate, dropout=dropout
-#         )
-#         self.diff_branch = STGCNStream(
-#             in_channels=6, A=A, num_blocks=num_blocks,
-#             drop_path_rate=drop_path_rate, dropout=dropout
-#         )
-#         self.feature_branch = TransformerBranch(
-#             patch_dim=31, seq_len=81, embed_dim=transformer_embed_dim,
-#             num_heads=transformer_heads, num_layers=transformer_layers,
-#             mlp_ratio=transformer_mlp_ratio, dropout=dropout,
-#             drop_path_rate=drop_path_rate
-#         )
-#         fusion_dim = num_blocks[-1] * 3 + transformer_embed_dim
-#         self.combiner = nn.Sequential(
-#             nn.Linear(fusion_dim, 512),
-#             nn.ReLU(inplace=True),
-#             nn.Dropout(dropout),
-#             nn.Linear(512, output_dim),
-#             nn.ReLU(inplace=True),
-#             nn.Dropout(dropout)
-#         )
-
-#     def forward(self, landmark_in, norm_in, diff_in, feat_in):
-#         l = self.landmark_branch(landmark_in)
-#         n = self.norm_branch(norm_in)
-#         d = self.diff_branch(diff_in)
-#         f = self.feature_branch(feat_in)
-#         combined = torch.cat([l, n, d, f], dim=1)
-#         return self.combiner(combined)
-
-
-# class GestureMultiStreamMoEModel(nn.Module):
-#     def __init__(self, num_classes, A, num_blocks, transformer_embed_dim=80, transformer_heads=5,
-#                  transformer_layers=3, transformer_mlp_ratio=4.0, hidden_size=384, num_experts=10,
-#                  k=4, num_moe_layers=2, dropout=0.35, drop_path_rate=0.2):
-#         super().__init__()
-#         self.backbone = HandGestureMultiStreamBackbone(
-#             A=A, num_blocks=num_blocks,
-#             transformer_embed_dim=transformer_embed_dim,
-#             transformer_heads=transformer_heads,
-#             transformer_layers=transformer_layers,
-#             transformer_mlp_ratio=transformer_mlp_ratio,
-#             dropout=dropout,
-#             drop_path_rate=drop_path_rate,
-#             output_dim=hidden_size
-#         )
-#         self.moe_layers = nn.ModuleList([
-#             MixtureOfExpertsLayer(hidden_size, hidden_size * 2, num_experts, k, dropout)
-#             for _ in range(num_moe_layers)
-#         ])
-#         self.layer_norm = nn.LayerNorm(hidden_size)
-#         self.dropout = nn.Dropout(dropout)
-#         self.classifier = nn.Linear(hidden_size, num_classes)
-
-#     def forward(self, landmark_in, norm_in, diff_in, feat_in):
-#         features = self.backbone(landmark_in, norm_in, diff_in, feat_in).unsqueeze(1)
-#         total_aux_loss = 0
-#         for moe_layer in self.moe_layers:
-#             features, info = moe_layer(features)
-#             features = self.layer_norm(features)
-#             features = self.dropout(features)
-#             total_aux_loss += info['aux_loss']
-#         features = features.squeeze(1)
-#         output = self.classifier(features)
-#         return output, {'aux_loss': total_aux_loss}
-
-
-# # ---------------------------------------------------------------------------
-# # Plots de complexite du modele (facon Colab): schema + nb de parametres
-# # ---------------------------------------------------------------------------
-# def count_parameters(module):
-#     total = sum(p.numel() for p in module.parameters())
-#     trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
-#     return total, trainable
-
-
-# def plot_model_complexity(cfg):
-#     """Schema d'architecture + nombre de parametres par bloc + forward de test."""
-#     if not MAKE_PLOTS:
-#         return
-
-#     # --- Schema de l'architecture (multi-stream STGCN + Transformer + MoE) ---
-#     fig, ax = plt.subplots(figsize=(13, 7.5))
-#     ax.axis("off")
-
-#     def box(x, y, w, h, text, color, fontsize=9):
-#         rect = FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.02,rounding_size=0.08",
-#                               linewidth=1.2, edgecolor="#333333", facecolor=color)
-#         ax.add_patch(rect)
-#         ax.text(x + w / 2, y + h / 2, text, ha="center", va="center", fontsize=fontsize, wrap=True)
-#         return (x + w / 2, y, x + w / 2, y + h)
-
-#     def arrow(x1, y1, x2, y2):
-#         ax.add_patch(FancyArrowPatch((x1, y1), (x2, y2), arrowstyle="-|>",
-#                                      mutation_scale=12, color="#555555", linewidth=1.2))
-
-#     inputs = [
-#         ("landmarks\n(6,81,21)", "#cfe8ff"),
-#         ("normalized\n(6,81,21)", "#cfe8ff"),
-#         ("differences\n(6,80,21)", "#ffe1c4"),
-#         ("features\n(81,31)", "#d9f2d9"),
-#     ]
-#     in_x = [0.3, 3.3, 6.3, 9.3]
-#     in_centers = []
-#     for x, (label, color) in zip(in_x, inputs):
-#         cx, by, cx2, ty = box(x, 6.4, 2.6, 0.9, label, color)
-#         in_centers.append((cx, by))
-
-#     proc_labels = ["ST-GCN stream", "ST-GCN stream", "ST-GCN stream", "Transformer branch"]
-#     proc_colors = ["#cfe8ff", "#cfe8ff", "#ffe1c4", "#d9f2d9"]
-#     proc_centers = []
-#     for x, label, color, (icx, iby) in zip(in_x, proc_labels, proc_colors, in_centers):
-#         cx, by, cx2, ty = box(x, 4.9, 2.6, 0.9, label, color, fontsize=8)
-#         arrow(icx, iby, cx, ty)
-#         proc_centers.append((cx, by))
-
-#     ccx, cby, ccx2, cty = box(4.5, 3.4, 4.0, 0.9,
-#                               "Combiner (concat -> MLP)\n-> hidden_size embedding", "#f5d0d0")
-#     for cx, by in proc_centers:
-#         arrow(cx, by, ccx, cty)
-
-#     m1x, m1y, m1x2, m1y2 = box(4.5, 2.1, 4.0, 0.9,
-#                                f"MoE layer 1\n(router + top-{cfg['k']} experts)", "#e6d0f5")
-#     arrow(ccx, cby, m1x, m1y2)
-#     m2x, m2y, m2x2, m2y2 = box(4.5, 1.1, 4.0, 0.9,
-#                                f"MoE layer 2\n(router + top-{cfg['k']} experts)", "#e6d0f5")
-
-#     box(4.5, 0.1, 4.0, 0.7, "Linear classifier -> 13 classes", "#ffe8a3")
-
-#     ax.set_xlim(0, 13)
-#     ax.set_ylim(-0.1, 7.6)
-#     plt.title("GestureMultiStreamMoEModel - multi-stream ST-GCN/Transformer + MoE head",
-#               fontsize=12)
-#     plt.tight_layout()
-#     save_and_show("06_architecture_diagram")
-
-#     # --- Nombre de parametres par bloc ---
-#     A = build_adjacency(21).to(device)
-#     model_probe = GestureMultiStreamMoEModel(
-#         num_classes=NUM_CLASSES, A=A,
-#         num_blocks=cfg['num_blocks'],
-#         transformer_embed_dim=cfg['transformer_embed_dim'],
-#         transformer_heads=cfg['transformer_heads'],
-#         transformer_layers=cfg['transformer_layers'],
-#         transformer_mlp_ratio=cfg['transformer_mlp_ratio'],
-#         hidden_size=cfg['hidden_size'],
-#         num_experts=cfg['num_experts'],
-#         k=cfg['k'],
-#         num_moe_layers=cfg['num_moe_layers'],
-#         dropout=cfg['dropout'],
-#         drop_path_rate=cfg['drop_path_rate']
-#     ).to(device)
-
-#     blocks = {
-#         "backbone": model_probe.backbone,
-#         "moe_layers": model_probe.moe_layers,
-#         "layer_norm": model_probe.layer_norm,
-#         "classifier": model_probe.classifier,
-#     }
-#     names, counts = [], []
-#     print(f"{'Block':<15}{'Parameters':>15}")
-#     print("-" * 30)
-#     for name, block in blocks.items():
-#         total, _ = count_parameters(block)
-#         print(f"{name:<15}{total:>15,}")
-#         names.append(name)
-#         counts.append(total)
-#     total_params, trainable_params = count_parameters(model_probe)
-#     print("-" * 30)
-#     print(f"{'TOTAL':<15}{total_params:>15,}")
-#     print(f"Trainable parameters: {trainable_params:,}")
-
-#     plt.figure(figsize=(7, 4))
-#     plt.bar(names, counts, color=["#cfe8ff", "#e6d0f5", "#d9f2d9", "#ffe8a3"])
-#     plt.ylabel("Number of parameters")
-#     plt.title("Parameter count per model block")
-#     for i, c in enumerate(counts):
-#         plt.text(i, c + max(counts) * 0.01, f"{c:,}", ha="center", fontsize=8)
-#     plt.tight_layout()
-#     save_and_show("07_parameter_count")
-
-#     # --- Forward de test (sanity check des shapes) ---
-#     model_probe.eval()
-#     b = 2
-#     dummy_lm = torch.randn(b, 6, 81, 21, device=device)
-#     dummy_norm = torch.randn(b, 6, 81, 21, device=device)
-#     dummy_diff = torch.randn(b, 6, 80, 21, device=device)
-#     dummy_feat = torch.randn(b, 81, 31, device=device)
-#     with torch.no_grad():
-#         logits, info = model_probe(dummy_lm, dummy_norm, dummy_diff, dummy_feat)
-#     print(f"Output logits shape: {tuple(logits.shape)}  (expected: ({b}, {NUM_CLASSES}))")
-#     print(f"Aux loss (load balancing): {float(info['aux_loss']):.4f}")
-
-#     del model_probe
-#     if device.type == "cuda":
-#         torch.cuda.empty_cache()
-
-
-# def plot_training_curves(history, run_id):
-#     if not MAKE_PLOTS or len(history["train_loss"]) == 0:
-#         return
-#     epochs_range = range(1, len(history["train_loss"]) + 1)
-#     fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
-
-#     axes[0].plot(epochs_range, history["train_loss"], label="Train", marker="o", markersize=3)
-#     axes[0].plot(epochs_range, history["val_loss"], label="Validation", marker="o", markersize=3)
-#     axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Focal loss")
-#     axes[0].set_title("Main classification loss")
-#     axes[0].legend()
-
-#     axes[1].plot(epochs_range, history["train_aux_loss"], label="Train", marker="o", markersize=3)
-#     axes[1].plot(epochs_range, history["val_aux_loss"], label="Validation", marker="o", markersize=3)
-#     axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Aux loss")
-#     axes[1].set_title("MoE load-balancing auxiliary loss")
-#     axes[1].legend()
-
-#     axes[2].plot(epochs_range, history["train_acc"], label="Train", marker="o", markersize=3)
-#     axes[2].plot(epochs_range, history["val_acc"], label="Validation", marker="o", markersize=3)
-#     axes[2].set_xlabel("Epoch"); axes[2].set_ylabel("Accuracy (%)")
-#     axes[2].set_title("Classification accuracy")
-#     axes[2].legend()
-
-#     plt.tight_layout()
-#     save_and_show(f"08_training_curves_run{run_id}")
-
-
-# def plot_val_evaluation(val_preds, val_targets, run_id):
-#     """Matrice de confusion + precision/rappel/F1 (facon Colab)."""
-#     if not MAKE_PLOTS:
-#         return
-#     val_preds = np.array(val_preds) + 1
-#     val_targets = np.array(val_targets) + 1
-#     class_labels = sorted(np.unique(val_targets))
-#     print(f"[Run {run_id}] Validation accuracy: {(val_preds == val_targets).mean() * 100:.2f}%")
-
-#     # Matrice de confusion
-#     cm = confusion_matrix(val_targets, val_preds, labels=class_labels)
-#     plt.figure(figsize=(8, 6.5))
-#     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-#                 xticklabels=class_labels, yticklabels=class_labels, cbar=True)
-#     plt.xlabel("Predicted class")
-#     plt.ylabel("True class")
-#     plt.title(f"Confusion matrix - validation set (run {run_id})")
-#     plt.tight_layout()
-#     save_and_show(f"09_confusion_matrix_run{run_id}")
-
-#     # Precision / rappel / F1
-#     precision, recall, f1, support = precision_recall_fscore_support(
-#         val_targets, val_preds, labels=class_labels, zero_division=0
-#     )
-#     metrics_df = pd.DataFrame({
-#         "class": class_labels, "precision": precision,
-#         "recall": recall, "f1_score": f1, "support": support,
-#     })
-#     print(metrics_df.to_string(index=False))
-#     print("\nFull classification report:")
-#     print(classification_report(val_targets, val_preds, labels=class_labels, zero_division=0))
-
-#     x = np.arange(len(class_labels))
-#     width = 0.25
-#     plt.figure(figsize=(11, 4.5))
-#     plt.bar(x - width, precision, width, label="Precision", color="#1f77b4")
-#     plt.bar(x, recall, width, label="Recall", color="#ff7f0e")
-#     plt.bar(x + width, f1, width, label="F1-score", color="#2ca02c")
-#     plt.xticks(x, class_labels)
-#     plt.xlabel("Gesture class"); plt.ylabel("Score"); plt.ylim(0, 1.05)
-#     plt.title(f"Per-class precision / recall / F1-score - validation set (run {run_id})")
-#     plt.legend()
-#     plt.tight_layout()
-#     save_and_show(f"10_prf_per_class_run{run_id}")
-
-#     macro_f1 = f1.mean()
-#     weighted_f1 = np.average(f1, weights=support)
-#     print(f"Macro-average F1: {macro_f1:.4f}")
-#     print(f"Weighted-average F1: {weighted_f1:.4f}")
-
-
-# class HandGestureMultiStreamDataset(Dataset):
-#     def __init__(self, landmark_in, norm_in, diff_in, feat_in, labels=None):
-#         self.landmark_in = torch.FloatTensor(landmark_in)
-#         self.norm_in = torch.FloatTensor(norm_in)
-#         self.diff_in = torch.FloatTensor(diff_in)
-#         self.feat_in = torch.FloatTensor(feat_in)
-#         self.labels = torch.LongTensor(labels.astype(int) - 1) if labels is not None else None
-
-#     def __len__(self):
-#         return len(self.landmark_in)
-
-#     def __getitem__(self, idx):
-#         if self.labels is not None:
-#             return (
-#                 self.landmark_in[idx], self.norm_in[idx],
-#                 self.diff_in[idx], self.feat_in[idx]
-#             ), self.labels[idx]
-#         return (
-#             self.landmark_in[idx], self.norm_in[idx],
-#             self.diff_in[idx], self.feat_in[idx]
-#         )
-
-
-# def evaluate(model, loader, criterion, aux_loss_weight):
-#     model.eval()
-#     correct, total, running_loss, running_aux = 0, 0, 0.0, 0.0
-#     all_preds, all_targets = [], []
-#     with torch.no_grad():
-#         for inputs, targets in loader:
-#             landmark_in, norm_in, diff_in, feat_in = [inp.to(device) for inp in inputs]
-#             targets = targets.to(device)
-#             outputs, moe_info = model(landmark_in, norm_in, diff_in, feat_in)
-#             main_loss = criterion(outputs, targets)
-#             running_loss += main_loss.item()
-#             running_aux += moe_info['aux_loss'].item()
-#             _, predicted = outputs.max(1)
-#             total += targets.size(0)
-#             correct += predicted.eq(targets).sum().item()
-#             all_preds.extend(predicted.cpu().numpy())
-#             all_targets.extend(targets.cpu().numpy())
-#     return (100. * correct / total, running_loss / len(loader),
-#             running_aux / len(loader), np.array(all_preds), np.array(all_targets))
-
-
-# def rotate_sequence(seq, ang, axis):
-#     out = seq.copy()
-#     if axis == 0:
-#         R = np.array([
-#             [1, 0, 0],
-#             [0, np.cos(ang), -np.sin(ang)],
-#             [0, np.sin(ang), np.cos(ang)]
-#         ], dtype=np.float32)
-#     elif axis == 1:
-#         R = np.array([
-#             [np.cos(ang), 0, np.sin(ang)],
-#             [0, 1, 0],
-#             [-np.sin(ang), 0, np.cos(ang)]
-#         ], dtype=np.float32)
-#     else:
-#         R = np.array([
-#             [np.cos(ang), -np.sin(ang), 0],
-#             [np.sin(ang), np.cos(ang), 0],
-#             [0, 0, 1]
-#         ], dtype=np.float32)
-#     out = out.reshape(-1, 3)
-#     out = out @ R.T
-#     return out.reshape(seq.shape)
-
-
-# def scale_sequence(seq, scale):
-#     return seq * scale
-
-
-# def build_tta_inputs(landmarks_batch, scaler):
-#     lm, norm, diff_, feat = create_features(landmarks_batch, with_normalized=True)
-#     feat = scaler.transform(feat.reshape(-1, 31)).reshape(feat.shape)
-#     landmark_in = prepare_graph_stream(lm)
-#     norm_in = prepare_graph_stream(norm)
-#     diff_in = prepare_graph_stream(diff_)
-#     landmark_in = torch.FloatTensor(landmark_in).to(device)
-#     norm_in = torch.FloatTensor(norm_in).to(device)
-#     diff_in = torch.FloatTensor(diff_in).to(device)
-#     feat = torch.FloatTensor(feat).to(device)
-#     return landmark_in, norm_in, diff_in, feat
-
-
-# def train_single_config(run_id, cfg, train_landmarks_raw, train_labels_raw, val_landmarks_raw, val_labels):
-#     print(f"\n========== RUN {run_id}: {cfg['name']} ==========")
-#     print(cfg)
-
-#     torch.manual_seed(cfg.get('seed', 42) + run_id)
-#     np.random.seed(cfg.get('seed', 42) + run_id)
-
-#     target_count = cfg.get('target_count', 450)
-
-#     # Utilisation de l'augmentation avancée
-#     train_landmarks_aug, train_labels_aug = augment_data_balanced_advanced(
-#         train_landmarks_raw, train_labels_raw, target_count=target_count
-#     )
-
-#     train_landmarks_f, train_normalized_f, train_differences_f, train_features_f = create_features(
-#         train_landmarks_aug, with_normalized=True
-#     )
-#     val_landmarks_f, val_normalized_f, val_differences_f, val_features_f = create_features(
-#         val_landmarks_raw, with_normalized=True
-#     )
-
-#     scaler = StandardScaler()
-#     train_features_reshaped = train_features_f.reshape(-1, 31)
-#     scaler.fit(train_features_reshaped)
-
-#     scaler_path = f'scaler_run{run_id}.pkl'
-#     with open(scaler_path, 'wb') as f:
-#         pickle.dump(scaler, f)
-#     print(f"Scaler sauvegarde: {scaler_path}")
-
-#     train_features_f = scaler.transform(train_features_reshaped).reshape(train_features_f.shape)
-#     val_features_f = scaler.transform(val_features_f.reshape(-1, 31)).reshape(val_features_f.shape)
-
-#     train_landmark_in = prepare_graph_stream(train_landmarks_f)
-#     train_norm_in = prepare_graph_stream(train_normalized_f)
-#     train_diff_in = prepare_graph_stream(train_differences_f)
-#     val_landmark_in = prepare_graph_stream(val_landmarks_f)
-#     val_norm_in = prepare_graph_stream(val_normalized_f)
-#     val_diff_in = prepare_graph_stream(val_differences_f)
-
-#     train_dataset = HandGestureMultiStreamDataset(
-#         train_landmark_in, train_norm_in, train_diff_in, train_features_f, train_labels_aug
-#     )
-#     val_dataset = HandGestureMultiStreamDataset(
-#         val_landmark_in, val_norm_in, val_diff_in, val_features_f, val_labels
-#     )
-
-#     train_loader = DataLoader(train_dataset, batch_size=cfg['batch_size'], shuffle=True, num_workers=0)
-#     val_loader = DataLoader(val_dataset, batch_size=cfg['batch_size'], shuffle=False, num_workers=0)
-
-#     A = build_adjacency(21).to(device)
-#     alpha = compute_focal_alpha(train_labels_aug.astype(int), NUM_CLASSES, device)
-
-#     model = GestureMultiStreamMoEModel(
-#         num_classes=NUM_CLASSES, A=A,
-#         num_blocks=cfg['num_blocks'],
-#         transformer_embed_dim=cfg['transformer_embed_dim'],
-#         transformer_heads=cfg['transformer_heads'],
-#         transformer_layers=cfg['transformer_layers'],
-#         transformer_mlp_ratio=cfg['transformer_mlp_ratio'],
-#         hidden_size=cfg['hidden_size'],
-#         num_experts=cfg['num_experts'],
-#         k=cfg['k'],
-#         num_moe_layers=cfg['num_moe_layers'],
-#         dropout=cfg['dropout'],
-#         drop_path_rate=cfg['drop_path_rate']
-#     ).to(device)
-
-#     ema_model = GestureMultiStreamMoEModel(
-#         num_classes=NUM_CLASSES, A=A,
-#         num_blocks=cfg['num_blocks'],
-#         transformer_embed_dim=cfg['transformer_embed_dim'],
-#         transformer_heads=cfg['transformer_heads'],
-#         transformer_layers=cfg['transformer_layers'],
-#         transformer_mlp_ratio=cfg['transformer_mlp_ratio'],
-#         hidden_size=cfg['hidden_size'],
-#         num_experts=cfg['num_experts'],
-#         k=cfg['k'],
-#         num_moe_layers=cfg['num_moe_layers'],
-#         dropout=cfg['dropout'],
-#         drop_path_rate=cfg['drop_path_rate']
-#     ).to(device)
-
-#     total_params = sum(p.numel() for p in model.parameters())
-#     print(f"Run {run_id} total parameters: {total_params:,}")
-
-#     criterion = FocalLoss(alpha=alpha, gamma=cfg['focal_gamma'], label_smoothing=cfg['label_smoothing'])
-#     optimizer = optim.AdamW(model.parameters(), lr=cfg['learning_rate'], weight_decay=cfg['weight_decay'])
-#     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=cfg['T_0'], T_mult=1, eta_min=1e-6)
-#     ema = EMA(model, decay=cfg['ema_decay'])
-
-#     history = {
-#         "train_loss": [], "train_aux_loss": [], "train_acc": [],
-#         "val_loss": [], "val_aux_loss": [], "val_acc": [],
-#     }
-
-#     best_val_acc = 0.0
-#     best_train_acc = 0.0
-#     best_epoch = 0
-#     patience_counter = 0
-#     save_path = f'best_model_run{run_id}.pth'
-
-#     for epoch in range(cfg['epochs']):
-#         model.train()
-#         correct, total, running_loss, running_aux = 0, 0, 0.0, 0.0
-
-#         for inputs, targets in train_loader:
-#             landmark_in, norm_in, diff_in, feat_in = [inp.to(device) for inp in inputs]
-#             targets = targets.to(device)
-
-#             optimizer.zero_grad()
-#             outputs, moe_info = model(landmark_in, norm_in, diff_in, feat_in)
-#             main_loss = criterion(outputs, targets)
-#             total_loss = main_loss + cfg['aux_loss_weight'] * moe_info['aux_loss']
-#             total_loss.backward()
-
-#             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-#             optimizer.step()
-#             ema.update(model)
-
-#             running_loss += main_loss.item()
-#             running_aux += moe_info['aux_loss'].item()
-#             _, predicted = outputs.max(1)
-#             total += targets.size(0)
-#             correct += predicted.eq(targets).sum().item()
-
-#         scheduler.step()
-#         train_acc = 100. * correct / total
-#         train_loss = running_loss / len(train_loader)
-#         train_aux = running_aux / len(train_loader)
-
-#         ema_model.load_state_dict(ema.state_dict())
-#         val_acc, val_loss, val_aux, _, _ = evaluate(ema_model, val_loader, criterion, cfg['aux_loss_weight'])
-
-#         history["train_loss"].append(train_loss)
-#         history["train_aux_loss"].append(train_aux)
-#         history["train_acc"].append(train_acc)
-#         history["val_loss"].append(val_loss)
-#         history["val_aux_loss"].append(val_aux)
-#         history["val_acc"].append(val_acc)
-
-#         wandb.log({
-#             'run_id': run_id, 'epoch': epoch + 1,
-#             'train_loss': train_loss, 'train_aux_loss': train_aux, 'train_accuracy': train_acc,
-#             'val_loss': val_loss, 'val_aux_loss': val_aux, 'val_accuracy': val_acc,
-#         })
-
-#         print(f'Run {run_id} Epoch {epoch+1}/{cfg["epochs"]}: '
-#               f'Train Loss {train_loss:.4f} Acc {train_acc:.2f}% | '
-#               f'EMA Val Loss {val_loss:.4f} Acc {val_acc:.2f}%')
-
-#         if val_acc > best_val_acc:
-#             best_val_acc = val_acc
-#             best_train_acc = train_acc
-#             best_epoch = epoch + 1
-#             patience_counter = 0
-#             torch.save(ema_model.state_dict(), save_path)
-#             with open(f'scaler_best_run{run_id}.pkl', 'wb') as f:
-#                 pickle.dump(scaler, f)
-#         else:
-#             patience_counter += 1
-#             if patience_counter >= cfg['patience']:
-#                 print(f'Run {run_id} early stopping at epoch {epoch+1}')
-#                 break
-
-#     # Courbes loss/accuracy (comme Colab)
-#     plot_training_curves(history, run_id)
-
-#     # Evaluation finale sur la validation avec le meilleur modele
-#     if os.path.exists(save_path):
-#         ema_model.load_state_dict(torch.load(save_path, map_location=device))
-#         _, _, _, val_preds, val_targets = evaluate(ema_model, val_loader, criterion, cfg['aux_loss_weight'])
-#         plot_val_evaluation(val_preds, val_targets, run_id)
-
-#     del model
-#     torch.cuda.empty_cache()
-
-#     return {
-#         'run_id': run_id,
-#         'name': cfg['name'],
-#         'best_epoch': best_epoch,
-#         'best_train_acc': best_train_acc,
-#         'best_val_acc': best_val_acc,
-#         'save_path': save_path,
-#         'scaler_path': f'scaler_best_run{run_id}.pkl',
-#         'total_params': total_params,
-#         **cfg
-#     }
-
-
-# BASE = {
-#     'batch_size': 32,
-#     'epochs': 150,
-#     'patience': 15,
-#     'learning_rate': 7e-5,
-#     'weight_decay': 8e-4,
-#     'dropout': 0.35,
-#     'drop_path_rate': 0.2,
-#     'aux_loss_weight': 0.02,
-#     'num_blocks': [64, 64, 128, 128, 256, 384],
-#     'transformer_embed_dim': 80,
-#     'transformer_heads': 4,
-#     'transformer_layers': 3,
-#     'transformer_mlp_ratio': 4.0,
-#     'hidden_size': 384,
-#     'num_experts': 10,
-#     'k': 4,
-#     'num_moe_layers': 2,
-#     'focal_gamma': 2.2,
-#     'label_smoothing': 0.08,
-#     'ema_decay': 0.999,
-#     'T_0': 25,
-#     'target_count': 650,
-#     'seed': 42,
-# }
-
-# CONFIGS = [
-#     {**BASE, 'name': 'fixed_v2_advanced_aug', 'learning_rate': 1e-4, 'target_count': 800},
-# ]
-
-# if __name__ == "__main__":
-#     if not INFERENCE_ONLY:
-#         print("Loading training data...")
-#         train_landmarks, train_labels = load_train_data()
-#         print(f"train_landmarks shape: {train_landmarks.shape}")
-
-#         # --- Plots d'exploration (facon Colab), sur les landmarks bruts ---
-#         plot_data_exploration(train_landmarks, train_labels)
-
-#         # --- Plots d'augmentation (avant/apres + squelette), version avancée ---
-#         plot_augmentation_effect(train_landmarks, train_labels, CONFIGS[0]['target_count'])
-
-#         # --- Plots de complexite du modele (schema + nb de parametres) ---
-#         plot_model_complexity(CONFIGS[0])
-
-#         train_landmarks = scale_normalize(train_landmarks)
-
-#         if USE_KFOLD:
-#             print(f"\nUtilisation de la validation croisee {N_FOLDS}-fold")
-#             skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
-
-#             all_val_scores = []
-
-#             for fold, (train_idx, val_idx) in enumerate(skf.split(train_landmarks, train_labels.astype(int))):
-#                 print(f"\n{'='*60}")
-#                 print(f"FOLD {fold+1}/{N_FOLDS}")
-#                 print(f"{'='*60}")
-
-#                 train_fold_landmarks = train_landmarks[train_idx]
-#                 train_fold_labels = train_labels[train_idx]
-#                 val_fold_landmarks = train_landmarks[val_idx]
-#                 val_fold_labels = train_labels[val_idx]
-
-#                 cfg = CONFIGS[0].copy()
-#                 cfg['name'] = f"{cfg['name']}_fold{fold+1}"
-
-#                 res = train_single_config(
-#                     fold+1, cfg, train_fold_landmarks, train_fold_labels,
-#                     val_fold_landmarks, val_fold_labels
-#                 )
-#                 all_val_scores.append(res['best_val_acc'])
-
-#             print(f"\n{'='*60}")
-#             print(f"RESULTATS VALIDATION CROISEE {N_FOLDS}-FOLD")
-#             print(f"{'='*60}")
-#             print(f"Scores par fold: {[f'{s:.2f}%' for s in all_val_scores]}")
-#             print(f"Moyenne: {np.mean(all_val_scores):.2f}% +/- {np.std(all_val_scores):.2f}%")
-
-#         else:
-#             indices = np.arange(len(train_landmarks))
-#             train_idx, val_idx = train_test_split(
-#                 indices, test_size=0.1, random_state=42, stratify=train_labels.astype(int)
-#             )
-
-#             raw_train_landmarks = train_landmarks[train_idx]
-#             raw_train_labels = train_labels[train_idx]
-#             val_landmarks_raw = train_landmarks[val_idx]
-#             val_labels = train_labels[val_idx]
-
-#             print(f"Train raw samples: {len(train_idx)} | Validation samples: {len(val_idx)}")
-
-#             results = []
-#             for i, cfg in enumerate(CONFIGS, start=1):
-#                 res = train_single_config(
-#                     i, cfg, raw_train_landmarks, raw_train_labels, val_landmarks_raw, val_labels
-#                 )
-#                 results.append(res)
-
-#             df = pd.DataFrame(results)
-#             df_sorted = df.sort_values('best_val_acc', ascending=False).reset_index(drop=True)
-#             print(f"\n=== RESULTATS ===")
-#             print(df_sorted[['run_id', 'name', 'best_val_acc', 'best_train_acc', 'best_epoch', 'total_params']].to_string(index=False))
-
-#             best_row = df_sorted.iloc[0]
-#             best_run_id = int(best_row['run_id'])
-#             print(f"\nMEILLEUR MODELE: {best_row['name']} (run {best_run_id})")
-#             print(f"Val acc: {float(best_row['best_val_acc']):.2f}%")
-#             print(f"Poids: best_model_run{best_run_id}.pth")
-#             print(f"Scaler: {best_row['scaler_path']}")
-
-#     else:
-#         # Dans la section INFERENCE_ONLY
-#         print("\n" + "="*60)
-#         print("MODE INFERENCE AVEC ENSEMBLE DES 5 MODELES")
-#         print("="*60)
-
-#         models = []
-#         scalers = []
-
-#         for run_id in range(1, 6):  # Folds 1 a 5
-#             model_path = f"best_model_run{run_id}.pth"
-#             scaler_path = f"scaler_best_run{run_id}.pkl"
-
-#             if not os.path.exists(model_path) or not os.path.exists(scaler_path):
-#                 print(f"Attention: Modele ou scaler du fold {run_id} manquant, skipping...")
-#                 continue
-
-#             print(f"Chargement du modele et scaler du fold {run_id}...")
-
-#             with open(scaler_path, 'rb') as f:
-#                 scaler = pickle.load(f)
-#                 scalers.append(scaler)
-
-#             cfg = CONFIGS[0].copy()
-#             A = build_adjacency(21).to(device)
-
-#             model = GestureMultiStreamMoEModel(
-#                 num_classes=NUM_CLASSES, A=A,
-#                 num_blocks=[int(x) for x in cfg['num_blocks']],
-#                 transformer_embed_dim=int(cfg['transformer_embed_dim']),
-#                 transformer_heads=int(cfg['transformer_heads']),
-#                 transformer_layers=int(cfg['transformer_layers']),
-#                 transformer_mlp_ratio=float(cfg['transformer_mlp_ratio']),
-#                 hidden_size=int(cfg['hidden_size']),
-#                 num_experts=int(cfg['num_experts']),
-#                 k=int(cfg['k']),
-#                 num_moe_layers=int(cfg['num_moe_layers']),
-#                 dropout=float(cfg['dropout']),
-#                 drop_path_rate=float(cfg['drop_path_rate'])
-#             ).to(device)
-
-#             model.load_state_dict(torch.load(model_path, map_location=device))
-#             model.eval()
-#             models.append(model)
-
-#         print(f"Charge {len(models)} modeles avec succes")
-
-#         print("Loading test data...")
-#         test_landmarks = load_test_data()
-#         test_landmarks = scale_normalize(test_landmarks)
-
-#         test_landmarks_f, test_normalized_f, test_differences_f, test_features_f = create_features(
-#             test_landmarks, with_normalized=True
-#         )
-
-#         print("Generating predictions with ensemble + TTA...")
-#         predictions_ensemble = []
-
-#         tta_configs = [
-#             {"angle": 0.0, "axis": 2, "scale": 1.00},
-#             {"angle": np.pi/18, "axis": 2, "scale": 1.00},
-#             {"angle": -np.pi/18, "axis": 2, "scale": 1.00},
-#             {"angle": np.pi/36, "axis": 1, "scale": 1.05},
-#             {"angle": -np.pi/36, "axis": 1, "scale": 0.95},
-#             {"angle": np.pi/24, "axis": 0, "scale": 1.00},
-#             {"angle": -np.pi/24, "axis": 0, "scale": 1.00},
-#         ]
-
-#         batch_size = 32
-#         all_probs = []
-
-#         for start in tqdm(range(0, len(test_landmarks), batch_size), desc="TTA + Ensemble Prediction"):
-#             batch_landmarks = test_landmarks[start:start+batch_size]
-
-#             model_probs = []
-#             for model_idx, model in enumerate(models):
-#                 scaler = scalers[model_idx]
-#                 probs_all = []
-
-#                 for cfg_tta in tta_configs:
-#                     aug = batch_landmarks.copy()
-
-#                     for i in range(len(aug)):
-#                         aug[i] = rotate_sequence(aug[i], cfg_tta["angle"], cfg_tta["axis"])
-#                         aug[i] = scale_sequence(aug[i], cfg_tta["scale"])
-
-#                     lm, norm, diff_, feat = create_features(aug, with_normalized=True)
-#                     feat = scaler.transform(feat.reshape(-1, 31)).reshape(feat.shape)
-
-#                     landmark_in = torch.FloatTensor(prepare_graph_stream(lm)).to(device)
-#                     norm_in = torch.FloatTensor(prepare_graph_stream(norm)).to(device)
-#                     diff_in = torch.FloatTensor(prepare_graph_stream(diff_)).to(device)
-#                     feat_in = torch.FloatTensor(feat).to(device)
-
-#                     with torch.no_grad():
-#                         outputs, _ = model(landmark_in, norm_in, diff_in, feat_in)
-#                         probs = F.softmax(outputs, dim=1)
-#                         probs_all.append(probs)
-
-#                 probs_all = torch.stack(probs_all)
-#                 avg_probs = probs_all.mean(0)
-#                 model_probs.append(avg_probs)
-
-#             if model_probs:
-#                 ensemble_probs = torch.stack(model_probs).mean(0)
-#                 pred = ensemble_probs.argmax(1)
-#                 all_probs.extend(pred.cpu().numpy())
-
-#         predictions = np.array(all_probs) + 1
-#         submission = pd.DataFrame({'Id': range(len(predictions)), 'Gesture': predictions})
-#         submission.to_csv('submission_ensemble_final.csv', index=False)
-#         print("Submission saved: submission_ensemble_final.csv")
-#         print(submission.head())
-#         print(f"\nDistribution des predictions:")
-#         print(pd.Series(predictions).value_counts().sort_index())
-
-#         # --- Plot de la distribution des predictions (facon Colab) ---
-#         if MAKE_PLOTS:
-#             pred_unique, pred_counts = np.unique(predictions, return_counts=True)
-#             plt.figure(figsize=(9, 4))
-#             plt.bar(pred_unique, pred_counts, color="#9467bd")
-#             plt.xlabel("Predicted gesture class")
-#             plt.ylabel("Number of test sequences")
-#             plt.title("Predicted class distribution on the (unlabelled) test set")
-#             plt.xticks(pred_unique)
-#             plt.tight_layout()
-#             save_and_show("11_test_prediction_distribution")
-
-#     wandb.finish()
