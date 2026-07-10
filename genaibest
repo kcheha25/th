@@ -35,6 +35,22 @@ N_FOLDS = 5
 MAKE_PLOTS = True
 PLOTS_DIR = 'plots'
 
+CLASS_BEST_RUNS_WEIGHTED = {
+    1: [(1, 0.6), (3, 0.4)],
+    2: [(1, 0.5), (4, 0.5)],
+    3: [(2, 0.7), (5, 0.3)],
+    4: [(2, 0.5), (3, 0.5)],
+    5: [(1, 0.4), (5, 0.6)],
+    6: [(2, 0.6), (4, 0.4)],
+    7: [(3, 0.5), (5, 0.5)],
+    8: [(1, 0.5), (2, 0.5)],
+    9: [(3, 0.6), (4, 0.4)],
+    10: [(2, 0.6), (5, 0.4)],
+    11: [(1, 0.5), (3, 0.5)],
+    12: [(4, 0.5), (5, 0.5)],
+    13: [(1, 0.5), (2, 0.5)],
+}
+
 CONFIDENCE_MARGIN_THRESHOLD = 0.15
 TOP_K_CANDIDATES = 2
 
@@ -257,6 +273,173 @@ def create_features(landmarks, with_normalized=True):
     return [landmarks, differences, features]
 
 
+def time_warp(landmarks, warp_factor):
+    n = landmarks.shape[0]
+    t_orig = np.arange(n)
+    t_warped = np.power(np.linspace(0, 1, n), warp_factor) * (n - 1)
+    flat = landmarks.reshape(n, -1)
+    f = interp1d(t_orig, flat, axis=0, kind='linear', fill_value='extrapolate')
+    return f(t_warped).reshape(landmarks.shape)
+
+
+def frame_dropout(landmarks, drop_ratio):
+    n = landmarks.shape[0]
+    n_drop = max(1, int(n * drop_ratio))
+    idx_all = np.arange(n)
+    drop_idx = np.random.choice(idx_all[1:-1], size=min(n_drop, n - 2), replace=False)
+    keep_idx = np.setdiff1d(idx_all, drop_idx)
+    kept = landmarks[keep_idx].reshape(len(keep_idx), -1)
+    f = interp1d(keep_idx, kept, axis=0, kind='linear', fill_value='extrapolate')
+    return f(idx_all).reshape(landmarks.shape)
+
+
+def global_translate(landmarks, max_shift):
+    shift = np.random.uniform(-max_shift, max_shift, size=(1, 1, 3))
+    return landmarks + shift
+
+
+def augment_gesture_advanced(seq):
+    out = seq.copy()
+    ang = np.random.uniform(-np.pi/6, np.pi/6)
+    axis = np.random.choice([0, 1, 2])
+    scale = np.random.uniform(0.9, 1.1)
+    for f in range(out.shape[0]):
+        out[f] = rotate(out[f], ang, axis) * scale
+    if np.random.random() < 0.3:
+        wf = np.random.uniform(0.8, 1.25)
+        out = time_warp(out, wf)
+    if np.random.random() < 0.2:
+        out = frame_dropout(out, drop_ratio=np.random.uniform(0.03, 0.08))
+    if np.random.random() < 0.2:
+        out = global_translate(out, max_shift=0.01)
+    out = out + np.random.normal(0, 0.005, out.shape)
+    return out
+
+
+def augment_data_balanced_advanced(landmarks, labels, target_count=450):
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    print(f"Classes avant augmentation: {dict(zip(unique_labels, counts))}")
+    print(f"Target: {target_count} echantillons par classe")
+    X_added, y_added = [], []
+    for lab in unique_labels:
+        lab_indices = np.where(labels == lab)[0]
+        current = len(lab_indices)
+        if current < target_count:
+            n_to_add = target_count - current
+            print(f"Classe {lab}: {current} -> {target_count} (+{n_to_add})")
+            for _ in range(n_to_add):
+                idx = np.random.choice(lab_indices)
+                aug = augment_gesture_advanced(landmarks[idx])
+                X_added.append(aug)
+                y_added.append(lab)
+        else:
+            print(f"Classe {lab}: {current} (aucun ajout)")
+    if X_added:
+        landmarks_aug = np.vstack((landmarks, np.array(X_added)))
+        labels_aug = np.concatenate((labels, np.array(y_added)))
+        unique_after, counts_after = np.unique(labels_aug, return_counts=True)
+        print(f"Classes apres augmentation: {dict(zip(unique_after, counts_after))}")
+        return landmarks_aug, labels_aug
+    return landmarks, labels
+
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17),
+]
+
+
+def plot_hand_skeleton(ax, landmarks_frame, color="#1f77b4", title=None):
+    xs, ys = landmarks_frame[:, 0], landmarks_frame[:, 1]
+    for a, b in HAND_CONNECTIONS:
+        ax.plot([xs[a], xs[b]], [ys[a], ys[b]], color=color, linewidth=1.5, zorder=1)
+    ax.scatter(xs, ys, color=color, s=25, zorder=2)
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.set_xticks([]); ax.set_yticks([])
+    if title:
+        ax.set_title(title, fontsize=10)
+
+
+def plot_data_exploration(train_landmarks, train_labels):
+    if not MAKE_PLOTS:
+        return
+    unique, counts = np.unique(train_labels.astype(int), return_counts=True)
+    plt.figure(figsize=(9, 4))
+    bars = plt.bar(unique, counts, color="#1f77b4", edgecolor="white")
+    plt.xlabel("Gesture class")
+    plt.ylabel("Number of sequences")
+    plt.title("Class distribution - training set (before augmentation)")
+    plt.xticks(unique)
+    for b, c in zip(bars, counts):
+        plt.text(b.get_x() + b.get_width() / 2, c + 0.5, str(c), ha="center", va="bottom", fontsize=8)
+    plt.tight_layout()
+    save_and_show("01_class_distribution_before_aug")
+
+    fig, axes = plt.subplots(1, 5, figsize=(16, 4))
+    example_classes = unique[:5]
+    for ax, cls in zip(axes, example_classes):
+        idx = np.where(train_labels.astype(int) == cls)[0][0]
+        mid_frame = train_landmarks[idx, train_landmarks.shape[1] // 2]
+        plot_hand_skeleton(ax, mid_frame, title=f"Class {cls}")
+    plt.suptitle("Example hand skeleton (middle frame) for several gesture classes")
+    plt.tight_layout()
+    save_and_show("02_hand_skeletons")
+
+    sample_idx = 0
+    traj = train_landmarks[sample_idx, :, 0, :]
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sc = ax.scatter(traj[:, 0], traj[:, 1], c=np.arange(len(traj)), cmap="viridis", s=15)
+    ax.plot(traj[:, 0], traj[:, 1], color="gray", alpha=0.3, linewidth=1)
+    ax.invert_yaxis()
+    ax.set_title(f"Wrist trajectory over 81 frames - sample #{sample_idx} (class {int(train_labels[sample_idx])})")
+    ax.set_xlabel("x"); ax.set_ylabel("y")
+    plt.colorbar(sc, ax=ax, label="frame index")
+    plt.tight_layout()
+    save_and_show("03_wrist_trajectory")
+
+
+def plot_augmentation_effect(train_landmarks, train_labels, target_count):
+    if not MAKE_PLOTS:
+        return
+    print("\n--- Demonstration de l'augmentation (pour les plots) ---")
+    train_landmarks_aug, train_labels_aug = augment_data_balanced_advanced(train_landmarks, train_labels, target_count=target_count)
+    print(f"Before augmentation: {train_landmarks.shape[0]} sequences")
+    print(f"After augmentation:  {train_landmarks_aug.shape[0]} sequences")
+    unique_before, counts_before = np.unique(train_labels.astype(int), return_counts=True)
+    unique_after, counts_after = np.unique(train_labels_aug.astype(int), return_counts=True)
+    all_classes = unique_after
+    cb = np.array([counts_before[list(unique_before).index(c)] if c in unique_before else 0 for c in all_classes])
+    ca = counts_after
+    x = np.arange(len(all_classes))
+    width = 0.35
+    plt.figure(figsize=(10, 4))
+    plt.bar(x - width / 2, cb, width, label="Before augmentation", color="#1f77b4")
+    plt.bar(x + width / 2, ca, width, label="After augmentation", color="#ff7f0e")
+    plt.xticks(x, all_classes)
+    plt.xlabel("Gesture class")
+    plt.ylabel("Number of sequences")
+    plt.title(f"Class distribution before vs. after augmentation (target_count={target_count})")
+    plt.legend()
+    plt.tight_layout()
+    save_and_show("04_class_distribution_before_vs_after")
+
+    orig_idx = 1
+    orig_frame = train_landmarks[orig_idx, train_landmarks.shape[1] // 2]
+    aug_seq = augment_gesture_advanced(train_landmarks[orig_idx])
+    aug_frame = aug_seq[aug_seq.shape[0] // 2]
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+    plot_hand_skeleton(axes[0], orig_frame, color="#1f77b4", title="Original")
+    plot_hand_skeleton(axes[1], aug_frame, color="#ff7f0e", title="Augmented")
+    plt.suptitle("Augmentation - before vs. after")
+    plt.tight_layout()
+    save_and_show("05_original_vs_augmented_skeleton")
+
+
 EDGES = [(0, 1), (1, 2), (2, 3), (3, 4),
          (0, 5), (5, 6), (6, 7), (7, 8),
          (0, 9), (9, 10), (10, 11), (11, 12),
@@ -364,10 +547,7 @@ class UnitGCN(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.dropout = nn.Dropout(dropout)
         if in_channels != out_channels:
-            self.down = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1),
-                nn.BatchNorm2d(out_channels)
-            )
+            self.down = nn.Sequential(nn.Conv2d(in_channels, out_channels, kernel_size=1), nn.BatchNorm2d(out_channels))
         else:
             self.down = None
 
@@ -386,12 +566,7 @@ class UnitTCN(nn.Module):
     def __init__(self, channels, kernel_size=9, stride=1, dropout=0.35):
         super().__init__()
         pad = (kernel_size - 1) // 2
-        self.conv = nn.Conv2d(
-            channels, channels,
-            kernel_size=(kernel_size, 1),
-            padding=(pad, 0),
-            stride=(stride, 1)
-        )
+        self.conv = nn.Conv2d(channels, channels, kernel_size=(kernel_size, 1), padding=(pad, 0), stride=(stride, 1))
         self.bn = nn.BatchNorm2d(channels)
         self.relu = nn.ReLU(inplace=True)
         self.dropout = nn.Dropout(dropout)
@@ -410,10 +585,7 @@ class STGCNBlock(nn.Module):
         self.gcn = UnitGCN(in_channels, out_channels, A, dropout=dropout)
         self.tcn = UnitTCN(out_channels, stride=stride, dropout=dropout)
         if in_channels != out_channels or stride != 1:
-            self.residual = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(stride, 1)),
-                nn.BatchNorm2d(out_channels)
-            )
+            self.residual = nn.Sequential(nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(stride, 1)), nn.BatchNorm2d(out_channels))
         else:
             self.residual = nn.Identity()
         self.drop_path = DropPath(drop_path)
@@ -437,14 +609,7 @@ class STGCNStream(nn.Module):
         dpr = np.linspace(0, drop_path_rate, len(num_blocks))
         blocks = []
         for i in range(len(num_blocks)):
-            blocks.append(
-                STGCNBlock(
-                    channels[i], channels[i + 1], A,
-                    stride=strides[i],
-                    dropout=dropout,
-                    drop_path=float(dpr[i])
-                )
-            )
+            blocks.append(STGCNBlock(channels[i], channels[i + 1], A, stride=strides[i], dropout=dropout, drop_path=float(dpr[i])))
         self.blocks = nn.ModuleList(blocks)
         self.out_channels = num_blocks[-1]
 
@@ -466,13 +631,7 @@ class TransformerBlock(nn.Module):
         self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
         self.drop_path1 = DropPath(drop_path)
         self.norm2 = nn.LayerNorm(embed_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
-            nn.Dropout(dropout)
-        )
+        self.mlp = nn.Sequential(nn.Linear(embed_dim, int(embed_dim * mlp_ratio)), nn.GELU(), nn.Dropout(dropout), nn.Linear(int(embed_dim * mlp_ratio), embed_dim), nn.Dropout(dropout))
         self.drop_path2 = DropPath(drop_path)
 
     def forward(self, x):
@@ -484,8 +643,7 @@ class TransformerBlock(nn.Module):
 
 
 class TransformerBranch(nn.Module):
-    def __init__(self, patch_dim, seq_len, embed_dim=80, num_heads=5, num_layers=3,
-                 mlp_ratio=4.0, dropout=0.1, drop_path_rate=0.1):
+    def __init__(self, patch_dim, seq_len, embed_dim=80, num_heads=5, num_layers=3, mlp_ratio=4.0, dropout=0.1, drop_path_rate=0.1):
         super().__init__()
         self.patch_embed = nn.Linear(patch_dim, embed_dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -493,11 +651,7 @@ class TransformerBranch(nn.Module):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         dpr = np.linspace(0, drop_path_rate, num_layers)
-        self.blocks = nn.ModuleList([
-            TransformerBlock(
-                embed_dim, num_heads, mlp_ratio, dropout, float(dpr[i])
-            ) for i in range(num_layers)
-        ])
+        self.blocks = nn.ModuleList([TransformerBlock(embed_dim, num_heads, mlp_ratio, dropout, float(dpr[i])) for i in range(num_layers)])
         self.norm = nn.LayerNorm(embed_dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -517,14 +671,7 @@ class TransformerBranch(nn.Module):
 class Expert(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, dropout_rate=0.35):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, output_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate)
-        )
+        self.net = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU(inplace=True), nn.Dropout(dropout_rate), nn.Linear(hidden_dim, output_dim), nn.ReLU(inplace=True), nn.Dropout(dropout_rate))
 
     def forward(self, x):
         return self.net(x)
@@ -545,10 +692,7 @@ class MixtureOfExpertsLayer(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.k = k
-        self.experts = nn.ModuleList([
-            Expert(input_dim, hidden_dim, input_dim, dropout_rate)
-            for _ in range(num_experts)
-        ])
+        self.experts = nn.ModuleList([Expert(input_dim, hidden_dim, input_dim, dropout_rate) for _ in range(num_experts)])
         self.router = Router(input_dim, num_experts)
         self.noise_std = 0.05
 
@@ -562,10 +706,7 @@ class MixtureOfExpertsLayer(nn.Module):
         top_k_probs, top_k_indices = torch.topk(router_probs, self.k, dim=-1)
         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
         all_expert_outputs = torch.stack([expert(x_flat) for expert in self.experts], dim=1)
-        gathered = torch.gather(
-            all_expert_outputs, 1,
-            top_k_indices.unsqueeze(-1).expand(-1, -1, input_dim)
-        )
+        gathered = torch.gather(all_expert_outputs, 1, top_k_indices.unsqueeze(-1).expand(-1, -1, input_dim))
         output = (gathered * top_k_probs.unsqueeze(-1)).sum(dim=1)
         output = output.view(batch_size, seq_len, input_dim)
         aux_loss = self._calculate_aux_loss(router_probs)
@@ -581,23 +722,11 @@ def rotate_tensor_3d(tensor, ang, axis):
     B, C, T, V = tensor.shape
     assert C == 6
     if axis == 0:
-        R = torch.tensor([
-            [1, 0, 0],
-            [0, np.cos(ang), -np.sin(ang)],
-            [0, np.sin(ang), np.cos(ang)]
-        ], dtype=tensor.dtype, device=tensor.device)
+        R = torch.tensor([[1, 0, 0], [0, np.cos(ang), -np.sin(ang)], [0, np.sin(ang), np.cos(ang)]], dtype=tensor.dtype, device=tensor.device)
     elif axis == 1:
-        R = torch.tensor([
-            [np.cos(ang), 0, np.sin(ang)],
-            [0, 1, 0],
-            [-np.sin(ang), 0, np.cos(ang)]
-        ], dtype=tensor.dtype, device=tensor.device)
+        R = torch.tensor([[np.cos(ang), 0, np.sin(ang)], [0, 1, 0], [-np.sin(ang), 0, np.cos(ang)]], dtype=tensor.dtype, device=tensor.device)
     else:
-        R = torch.tensor([
-            [np.cos(ang), -np.sin(ang), 0],
-            [np.sin(ang), np.cos(ang), 0],
-            [0, 0, 1]
-        ], dtype=tensor.dtype, device=tensor.device)
+        R = torch.tensor([[np.cos(ang), -np.sin(ang), 0], [np.sin(ang), np.cos(ang), 0], [0, 0, 1]], dtype=tensor.dtype, device=tensor.device)
     xyz = tensor[:, :3].permute(0, 2, 3, 1).reshape(-1, 3)
     xyz = xyz @ R.T
     xyz = xyz.view(B, T, V, 3)
@@ -610,37 +739,14 @@ def rotate_tensor_3d(tensor, ang, axis):
 
 
 class HandGestureMultiStreamBackbone(nn.Module):
-    def __init__(self, A, num_blocks, transformer_embed_dim=80, transformer_heads=5,
-                 transformer_layers=3, transformer_mlp_ratio=4.0, dropout=0.35,
-                 drop_path_rate=0.2, output_dim=384):
+    def __init__(self, A, num_blocks, transformer_embed_dim=80, transformer_heads=5, transformer_layers=3, transformer_mlp_ratio=4.0, dropout=0.35, drop_path_rate=0.2, output_dim=384):
         super().__init__()
-        self.landmark_branch = STGCNStream(
-            in_channels=6, A=A, num_blocks=num_blocks,
-            drop_path_rate=drop_path_rate, dropout=dropout
-        )
-        self.norm_branch = STGCNStream(
-            in_channels=6, A=A, num_blocks=num_blocks,
-            drop_path_rate=drop_path_rate, dropout=dropout
-        )
-        self.diff_branch = STGCNStream(
-            in_channels=6, A=A, num_blocks=num_blocks,
-            drop_path_rate=drop_path_rate, dropout=dropout
-        )
-        self.feature_branch = TransformerBranch(
-            patch_dim=31, seq_len=81, embed_dim=transformer_embed_dim,
-            num_heads=transformer_heads, num_layers=transformer_layers,
-            mlp_ratio=transformer_mlp_ratio, dropout=dropout,
-            drop_path_rate=drop_path_rate
-        )
+        self.landmark_branch = STGCNStream(in_channels=6, A=A, num_blocks=num_blocks, drop_path_rate=drop_path_rate, dropout=dropout)
+        self.norm_branch = STGCNStream(in_channels=6, A=A, num_blocks=num_blocks, drop_path_rate=drop_path_rate, dropout=dropout)
+        self.diff_branch = STGCNStream(in_channels=6, A=A, num_blocks=num_blocks, drop_path_rate=drop_path_rate, dropout=dropout)
+        self.feature_branch = TransformerBranch(patch_dim=31, seq_len=81, embed_dim=transformer_embed_dim, num_heads=transformer_heads, num_layers=transformer_layers, mlp_ratio=transformer_mlp_ratio, dropout=dropout, drop_path_rate=drop_path_rate)
         fusion_dim = num_blocks[-1] * 3 + transformer_embed_dim
-        self.combiner = nn.Sequential(
-            nn.Linear(fusion_dim, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(512, output_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout)
-        )
+        self.combiner = nn.Sequential(nn.Linear(fusion_dim, 512), nn.ReLU(inplace=True), nn.Dropout(dropout), nn.Linear(512, output_dim), nn.ReLU(inplace=True), nn.Dropout(dropout))
 
     def forward(self, landmark_in, norm_in, diff_in, feat_in):
         l = self.landmark_branch(landmark_in)
@@ -652,24 +758,10 @@ class HandGestureMultiStreamBackbone(nn.Module):
 
 
 class GestureMultiStreamMoEModel(nn.Module):
-    def __init__(self, num_classes, A, num_blocks, transformer_embed_dim=80, transformer_heads=5,
-                 transformer_layers=3, transformer_mlp_ratio=4.0, hidden_size=384, num_experts=10,
-                 k=4, num_moe_layers=2, dropout=0.35, drop_path_rate=0.2):
+    def __init__(self, num_classes, A, num_blocks, transformer_embed_dim=80, transformer_heads=5, transformer_layers=3, transformer_mlp_ratio=4.0, hidden_size=384, num_experts=10, k=4, num_moe_layers=2, dropout=0.35, drop_path_rate=0.2):
         super().__init__()
-        self.backbone = HandGestureMultiStreamBackbone(
-            A=A, num_blocks=num_blocks,
-            transformer_embed_dim=transformer_embed_dim,
-            transformer_heads=transformer_heads,
-            transformer_layers=transformer_layers,
-            transformer_mlp_ratio=transformer_mlp_ratio,
-            dropout=dropout,
-            drop_path_rate=drop_path_rate,
-            output_dim=hidden_size
-        )
-        self.moe_layers = nn.ModuleList([
-            MixtureOfExpertsLayer(hidden_size, hidden_size * 2, num_experts, k, dropout)
-            for _ in range(num_moe_layers)
-        ])
+        self.backbone = HandGestureMultiStreamBackbone(A=A, num_blocks=num_blocks, transformer_embed_dim=transformer_embed_dim, transformer_heads=transformer_heads, transformer_layers=transformer_layers, transformer_mlp_ratio=transformer_mlp_ratio, dropout=dropout, drop_path_rate=drop_path_rate, output_dim=hidden_size)
+        self.moe_layers = nn.ModuleList([MixtureOfExpertsLayer(hidden_size, hidden_size * 2, num_experts, k, dropout) for _ in range(num_moe_layers)])
         self.layer_norm = nn.LayerNorm(hidden_size)
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(hidden_size, num_classes)
@@ -700,14 +792,8 @@ class HandGestureMultiStreamDataset(Dataset):
 
     def __getitem__(self, idx):
         if self.labels is not None:
-            return (
-                self.landmark_in[idx], self.norm_in[idx],
-                self.diff_in[idx], self.feat_in[idx]
-            ), self.labels[idx]
-        return (
-            self.landmark_in[idx], self.norm_in[idx],
-            self.diff_in[idx], self.feat_in[idx]
-        )
+            return (self.landmark_in[idx], self.norm_in[idx], self.diff_in[idx], self.feat_in[idx]), self.labels[idx]
+        return (self.landmark_in[idx], self.norm_in[idx], self.diff_in[idx], self.feat_in[idx])
 
 
 def evaluate(model, loader, criterion, aux_loss_weight):
@@ -732,23 +818,11 @@ def evaluate(model, loader, criterion, aux_loss_weight):
 def rotate_sequence(seq, ang, axis):
     out = seq.copy()
     if axis == 0:
-        R = np.array([
-            [1, 0, 0],
-            [0, np.cos(ang), -np.sin(ang)],
-            [0, np.sin(ang), np.cos(ang)]
-        ], dtype=np.float32)
+        R = np.array([[1, 0, 0], [0, np.cos(ang), -np.sin(ang)], [0, np.sin(ang), np.cos(ang)]], dtype=np.float32)
     elif axis == 1:
-        R = np.array([
-            [np.cos(ang), 0, np.sin(ang)],
-            [0, 1, 0],
-            [-np.sin(ang), 0, np.cos(ang)]
-        ], dtype=np.float32)
+        R = np.array([[np.cos(ang), 0, np.sin(ang)], [0, 1, 0], [-np.sin(ang), 0, np.cos(ang)]], dtype=np.float32)
     else:
-        R = np.array([
-            [np.cos(ang), -np.sin(ang), 0],
-            [np.sin(ang), np.cos(ang), 0],
-            [0, 0, 1]
-        ], dtype=np.float32)
+        R = np.array([[np.cos(ang), -np.sin(ang), 0], [np.sin(ang), np.cos(ang), 0], [0, 0, 1]], dtype=np.float32)
     out = out.reshape(-1, 3)
     out = out @ R.T
     return out.reshape(seq.shape)
@@ -808,184 +882,44 @@ def load_scaler_for_run(run_id):
     return scaler
 
 
-def compute_class_best_runs_automatic():
-    print("\n" + "="*60)
-    print("CALCUL AUTOMATIQUE DES MEILLEURS RUNS PAR CLASSE")
-    print("="*60)
-    
-    train_landmarks, train_labels = load_train_data()
-    train_landmarks = scale_normalize(train_landmarks)
-    
-    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
-    folds = list(skf.split(train_landmarks, train_labels.astype(int)))
-    
-    fold_f1_scores = np.zeros((N_FOLDS, NUM_CLASSES))
-    fold_precision = np.zeros((N_FOLDS, NUM_CLASSES))
-    fold_recall = np.zeros((N_FOLDS, NUM_CLASSES))
-    
-    for fold_idx in range(N_FOLDS):
-        run_id = fold_idx + 1
-        model_path = f"best_model_run{run_id}.pth"
-        if not os.path.exists(model_path):
-            print(f"  ⚠️  Run {run_id} non trouvé, skip...")
-            continue
-        
-        print(f"\n  Évaluation Run {run_id} sur son set de validation...")
-        model = load_model_for_run(run_id)
-        scaler = load_scaler_for_run(run_id)
-        
-        _, val_idx = folds[fold_idx]
-        val_landmarks = train_landmarks[val_idx]
-        val_labels = train_labels[val_idx].astype(int)
-        
-        all_preds = []
-        all_targets = []
-        
-        for i in tqdm(range(0, len(val_landmarks), 32), desc=f"    Run {run_id}", leave=False):
-            batch = val_landmarks[i:i+32]
-            batch_labels = val_labels[i:i+32]
-            
-            probs_list = []
-            for angle in [0, np.pi/18, -np.pi/18]:
-                aug = batch.copy()
-                if angle != 0:
-                    for j in range(len(aug)):
-                        aug[j] = rotate_sequence(aug[j], angle, 2)
-                
-                lm, norm, diff_, feat = create_features(aug, with_normalized=True)
-                feat = scaler.transform(feat.reshape(-1, 31)).reshape(feat.shape)
-                
-                landmark_in = torch.FloatTensor(prepare_graph_stream(lm)).to(device)
-                norm_in = torch.FloatTensor(prepare_graph_stream(norm)).to(device)
-                diff_in = torch.FloatTensor(prepare_graph_stream(diff_)).to(device)
-                feat_in = torch.FloatTensor(feat).to(device)
-                
-                with torch.no_grad():
-                    outputs, _ = model(landmark_in, norm_in, diff_in, feat_in)
-                    probs_list.append(F.softmax(outputs, dim=1).cpu().numpy())
-            
-            avg_probs = np.mean(probs_list, axis=0)
-            preds = np.argmax(avg_probs, axis=1)
-            
-            all_preds.extend(preds)
-            all_targets.extend(batch_labels - 1)
-        
-        all_preds = np.array(all_preds)
-        all_targets = np.array(all_targets)
-        
-        for cls in range(NUM_CLASSES):
-            tp = np.sum((all_preds == cls) & (all_targets == cls))
-            fp = np.sum((all_preds == cls) & (all_targets != cls))
-            fn = np.sum((all_preds != cls) & (all_targets == cls))
-            
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-            
-            fold_f1_scores[fold_idx, cls] = f1
-            fold_precision[fold_idx, cls] = precision
-            fold_recall[fold_idx, cls] = recall
-        
-        acc = (all_preds == all_targets).mean() * 100
-        print(f"    Accuracy globale: {acc:.2f}%")
-    
-    class_best_runs_weighted = {}
-    
-    print("\n" + "="*60)
-    print("MEILLEURS RUNS PAR CLASSE (AVEC POIDS)")
-    print("="*60)
-    
-    for cls in range(NUM_CLASSES):
-        f1_scores = fold_f1_scores[:, cls]
-        sorted_folds = np.argsort(f1_scores)[::-1]
-        
-        runs_with_weights = []
-        total_f1 = f1_scores.sum()
-        
-        for fold_idx in sorted_folds:
-            run_id = fold_idx + 1
-            f1 = f1_scores[fold_idx]
-            
-            if f1 > 0:
-                weight = f1 / total_f1 if total_f1 > 0 else 1.0
-                runs_with_weights.append((run_id, weight))
-        
-        class_best_runs_weighted[cls + 1] = runs_with_weights
-        
-        print(f"\n  Classe {cls+1:2d}:")
-        for run_id, weight in runs_with_weights:
-            f1 = fold_f1_scores[run_id-1, cls]
-            prec = fold_precision[run_id-1, cls]
-            rec = fold_recall[run_id-1, cls]
-            print(f"    Run {run_id}: F1={f1:.4f}, Prec={prec:.4f}, Rec={rec:.4f}, Poids={weight:.4f}")
-    
-    class_best_runs_simple = {cls: [r[0] for r in runs] 
-                              for cls, runs in class_best_runs_weighted.items()}
-    
-    print("\n" + "="*60)
-    print("DICTIONNAIRE CLASS_BEST_RUNS (simple) :")
-    print("="*60)
-    print("CLASS_BEST_RUNS = {")
-    for cls in range(1, NUM_CLASSES+1):
-        runs = class_best_runs_simple[cls]
-        print(f"    {cls}: {runs},")
-    print("}")
-    
-    return class_best_runs_weighted, class_best_runs_simple
-
-
 def get_ambiguous_samples(probs_matrix, margin_threshold=CONFIDENCE_MARGIN_THRESHOLD, top_k=TOP_K_CANDIDATES):
     sorted_probs = np.sort(probs_matrix, axis=1)[:, ::-1]
     top1 = sorted_probs[:, 0]
     top2 = sorted_probs[:, 1]
     margin = top1 - top2
     is_ambiguous = margin < margin_threshold
-
     ambiguous_info = []
     for idx in np.where(is_ambiguous)[0]:
         top_k_classes = np.argsort(probs_matrix[idx])[::-1][:top_k] + 1
-        ambiguous_info.append({
-            'sample_idx': int(idx),
-            'candidates': top_k_classes.tolist(),
-            'margin': float(margin[idx])
-        })
+        ambiguous_info.append({'sample_idx': int(idx), 'candidates': top_k_classes.tolist(), 'margin': float(margin[idx])})
     return ambiguous_info
 
 
 def predict_single_sample_with_weighted_runs(landmarks_sample, run_ids_with_weights, use_tta=True):
     batch = landmarks_sample[np.newaxis, ...]
-    
     all_probs = []
     all_weights = []
-    
     for run_id, weight in run_ids_with_weights:
         model = load_model_for_run(run_id)
         scaler = load_scaler_for_run(run_id)
-        
         configs = TTA_CONFIGS_INFERENCE if use_tta else [{"angle": 0.0, "axis": 2, "scale": 1.0}]
         probs_tta = []
-        
         for cfg_tta in configs:
             aug = batch.copy()
             aug[0] = rotate_sequence(aug[0], cfg_tta["angle"], cfg_tta["axis"])
             aug[0] = scale_sequence(aug[0], cfg_tta["scale"])
-            
             lm, norm, diff_, feat = create_features(aug, with_normalized=True)
             feat = scaler.transform(feat.reshape(-1, 31)).reshape(feat.shape)
-            
             landmark_in = torch.FloatTensor(prepare_graph_stream(lm)).to(device)
             norm_in = torch.FloatTensor(prepare_graph_stream(norm)).to(device)
             diff_in = torch.FloatTensor(prepare_graph_stream(diff_)).to(device)
             feat_in = torch.FloatTensor(feat).to(device)
-            
             with torch.no_grad():
                 outputs, _ = model(landmark_in, norm_in, diff_in, feat_in)
                 probs_tta.append(F.softmax(outputs, dim=1).cpu().numpy())
-        
         avg_tta = np.mean(probs_tta, axis=0)
         all_probs.append(avg_tta[0] * weight)
         all_weights.append(weight)
-    
     ensemble_probs = np.sum(all_probs, axis=0) / np.sum(all_weights)
     return ensemble_probs
 
@@ -994,25 +928,19 @@ def run_first_pass_ensemble_with_probs(test_landmarks):
     print("\n" + "="*60)
     print("PREMIÈRE PASSE : ENSEMBLE GLOBAL")
     print("="*60)
-    
     available_runs = []
     for run_id in range(1, 6):
         if os.path.exists(f"best_model_run{run_id}.pth"):
             available_runs.append(run_id)
-    
     print(f"Runs disponibles : {available_runs}")
-    
     models = [load_model_for_run(r) for r in available_runs]
     scalers = [load_scaler_for_run(r) for r in available_runs]
-    
     batch_size = 32
     all_preds = []
     all_probs = []
-    
     for start in tqdm(range(0, len(test_landmarks), batch_size), desc="First pass"):
         batch_landmarks = test_landmarks[start:start + batch_size]
         model_probs = []
-        
         for model, scaler in zip(models, scalers):
             probs_tta = []
             for cfg_tta in TTA_CONFIGS_INFERENCE:
@@ -1020,126 +948,79 @@ def run_first_pass_ensemble_with_probs(test_landmarks):
                 for i in range(len(aug)):
                     aug[i] = rotate_sequence(aug[i], cfg_tta["angle"], cfg_tta["axis"])
                     aug[i] = scale_sequence(aug[i], cfg_tta["scale"])
-                
                 lm, norm, diff_, feat = create_features(aug, with_normalized=True)
                 feat = scaler.transform(feat.reshape(-1, 31)).reshape(feat.shape)
-                
                 landmark_in = torch.FloatTensor(prepare_graph_stream(lm)).to(device)
                 norm_in = torch.FloatTensor(prepare_graph_stream(norm)).to(device)
                 diff_in = torch.FloatTensor(prepare_graph_stream(diff_)).to(device)
                 feat_in = torch.FloatTensor(feat).to(device)
-                
                 with torch.no_grad():
                     outputs, _ = model(landmark_in, norm_in, diff_in, feat_in)
                     probs_tta.append(F.softmax(outputs, dim=1))
-            
             model_probs.append(torch.stack(probs_tta).mean(0))
-        
         ensemble_probs = torch.stack(model_probs).mean(0)
         pred = ensemble_probs.argmax(1)
         all_preds.extend(pred.cpu().numpy())
         all_probs.append(ensemble_probs.cpu().numpy())
-    
     all_probs = np.concatenate(all_probs, axis=0)
     return np.array(all_preds) + 1, all_probs
 
 
-def run_second_pass_weighted_disambiguation(test_landmarks, first_pass_predictions, 
-                                             first_pass_probs, class_best_runs_weighted):
+def run_second_pass_weighted_disambiguation(test_landmarks, first_pass_predictions, first_pass_probs, class_best_runs_weighted):
     print("\n" + "="*60)
     print("SECONDE PASSE : DÉSAMBIGUÏSATION PONDÉRÉE")
     print("="*60)
-    
     ambiguous_info = get_ambiguous_samples(first_pass_probs)
-    print(f"Échantillons ambigus : {len(ambiguous_info)} / {len(test_landmarks)} "
-          f"({100 * len(ambiguous_info) / len(test_landmarks):.2f}%)")
-    
+    print(f"Échantillons ambigus : {len(ambiguous_info)} / {len(test_landmarks)} ({100 * len(ambiguous_info) / len(test_landmarks):.2f}%)")
     corrected_predictions = first_pass_predictions.copy()
     n_changed = 0
     change_log = []
-    
     for info in tqdm(ambiguous_info, desc="Disambiguation"):
         idx = info['sample_idx']
         candidates = info['candidates']
         original_pred = int(first_pass_predictions[idx])
-        
         expert_runs_with_weights = []
         seen_runs = set()
-        
         for cls in candidates:
             if cls in class_best_runs_weighted:
                 for run_id, weight in class_best_runs_weighted[cls]:
                     if run_id not in seen_runs:
                         expert_runs_with_weights.append((run_id, weight))
                         seen_runs.add(run_id)
-        
         if not expert_runs_with_weights:
             continue
-        
-        probs = predict_single_sample_with_weighted_runs(
-            test_landmarks[idx], expert_runs_with_weights, use_tta=True
-        )
-        
+        probs = predict_single_sample_with_weighted_runs(test_landmarks[idx], expert_runs_with_weights, use_tta=True)
         candidate_mask = np.zeros(NUM_CLASSES, dtype=bool)
         for cls in candidates:
             candidate_mask[cls - 1] = True
-        
         restricted_probs = np.where(candidate_mask, probs, -1)
         new_pred = int(np.argmax(restricted_probs)) + 1
-        
         if new_pred != original_pred:
             n_changed += 1
-            change_log.append({
-                'sample_idx': idx,
-                'original_pred': original_pred,
-                'corrected_pred': new_pred,
-                'candidates': candidates,
-                'margin_pass1': info['margin'],
-                'experts_consulted': [r for r, _ in expert_runs_with_weights],
-                'confidence_new': float(probs[new_pred - 1])
-            })
+            change_log.append({'sample_idx': idx, 'original_pred': original_pred, 'corrected_pred': new_pred, 'candidates': candidates, 'margin_pass1': info['margin'], 'experts_consulted': [r for r, _ in expert_runs_with_weights], 'confidence_new': float(probs[new_pred - 1])})
             corrected_predictions[idx] = new_pred
-    
     print(f"\nÉchantillons corrigés : {n_changed} / {len(ambiguous_info)}")
-    
     if change_log:
         change_df = pd.DataFrame(change_log)
         print("\nDétail des corrections :")
         print(change_df.to_string(index=False))
         change_df.to_csv('second_pass_weighted_disambiguation.csv', index=False)
-    
     return corrected_predictions
 
 
 BASE = {
-    'batch_size': 32,
-    'epochs': 150,
-    'patience': 15,
-    'learning_rate': 7e-5,
-    'weight_decay': 8e-4,
-    'dropout': 0.35,
-    'drop_path_rate': 0.2,
-    'aux_loss_weight': 0.02,
+    'batch_size': 32, 'epochs': 150, 'patience': 15,
+    'learning_rate': 7e-5, 'weight_decay': 8e-4,
+    'dropout': 0.35, 'drop_path_rate': 0.2, 'aux_loss_weight': 0.02,
     'num_blocks': [64, 64, 128, 128, 256, 384],
-    'transformer_embed_dim': 80,
-    'transformer_heads': 4,
-    'transformer_layers': 3,
-    'transformer_mlp_ratio': 4.0,
-    'hidden_size': 384,
-    'num_experts': 10,
-    'k': 4,
-    'num_moe_layers': 2,
-    'focal_gamma': 2.2,
-    'label_smoothing': 0.08,
-    'ema_decay': 0.999,
-    'T_0': 25,
-    'target_count': 650,
-    'seed': 42,
+    'transformer_embed_dim': 80, 'transformer_heads': 4,
+    'transformer_layers': 3, 'transformer_mlp_ratio': 4.0,
+    'hidden_size': 384, 'num_experts': 10, 'k': 4, 'num_moe_layers': 2,
+    'focal_gamma': 2.2, 'label_smoothing': 0.08,
+    'ema_decay': 0.999, 'T_0': 25, 'target_count': 650, 'seed': 42,
 }
 
-CONFIGS = [
-    {**BASE, 'name': 'fixed_v2', 'learning_rate': 1e-4, 'target_count': 800},
-]
+CONFIGS = [{**BASE, 'name': 'fixed_v2', 'learning_rate': 1e-4, 'target_count': 800}]
 
 
 if __name__ == "__main__":
@@ -1149,53 +1030,26 @@ if __name__ == "__main__":
         print(f"train_landmarks shape: {train_landmarks.shape}")
     else:
         print("\n" + "="*60)
-        print("MODE INFÉRENCE - DÉSAMBIGUÏSATION PONDÉRÉE AUTOMATIQUE")
+        print("MODE INFÉRENCE - DÉSAMBIGUÏSATION PONDÉRÉE MANUELLE")
         print("="*60)
-        
-        class_best_runs_weighted, class_best_runs_simple = compute_class_best_runs_automatic()
-        
-        print("\n" + "="*60)
-        print("CHARGEMENT DES DONNÉES DE TEST")
-        print("="*60)
+        print("Loading test data...")
         test_landmarks = load_test_data()
         test_landmarks = scale_normalize(test_landmarks)
-        print(f"Échantillons de test : {len(test_landmarks)}")
-        
         first_pass_predictions, first_pass_probs = run_first_pass_ensemble_with_probs(test_landmarks)
-        
-        submission_v1 = pd.DataFrame({
-            'Id': range(len(first_pass_predictions)),
-            'Gesture': first_pass_predictions
-        })
+        submission_v1 = pd.DataFrame({'Id': range(len(first_pass_predictions)), 'Gesture': first_pass_predictions})
         submission_v1.to_csv('submission_first_pass.csv', index=False)
         print("\n✓ Première passe sauvegardée : submission_first_pass.csv")
         print("Distribution première passe :")
         print(pd.Series(first_pass_predictions).value_counts().sort_index())
-        
-        corrected_predictions = run_second_pass_weighted_disambiguation(
-            test_landmarks, first_pass_predictions, first_pass_probs, 
-            class_best_runs_weighted
-        )
-        
-        submission_final = pd.DataFrame({
-            'Id': range(len(corrected_predictions)),
-            'Gesture': corrected_predictions
-        })
+        corrected_predictions = run_second_pass_weighted_disambiguation(test_landmarks, first_pass_predictions, first_pass_probs, CLASS_BEST_RUNS_WEIGHTED)
+        submission_final = pd.DataFrame({'Id': range(len(corrected_predictions)), 'Gesture': corrected_predictions})
         submission_final.to_csv('submission_final_weighted.csv', index=False)
-        
         print("\n" + "="*60)
         print("RÉSULTATS FINAUX")
         print("="*60)
         print("✓ Submission finale : submission_final_weighted.csv")
         print("\nDistribution finale :")
         print(pd.Series(corrected_predictions).value_counts().sort_index())
-        
         diff_count = (first_pass_predictions != corrected_predictions).sum()
-        print(f"\nTotal échantillons modifiés : {diff_count} / {len(test_landmarks)} "
-              f"({100*diff_count/len(test_landmarks):.2f}%)")
-        
-        with open('class_best_runs_weighted.pkl', 'wb') as f:
-            pickle.dump(class_best_runs_weighted, f)
-        print("✓ Dictionnaire des experts sauvegardé : class_best_runs_weighted.pkl")
-    
+        print(f"\nTotal échantillons modifiés : {diff_count} / {len(test_landmarks)} ({100*diff_count/len(test_landmarks):.2f}%)")
     wandb.finish()
